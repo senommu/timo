@@ -1,0 +1,339 @@
+import AppKit
+import SwiftUI
+
+enum TabTooltipLayout {
+    static func width(title: String, hint: String? = "Double-click to rename", shortcut: String? = nil,
+                      compact: Bool = false) -> CGFloat {
+        let titleWidth = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold)]).width
+        let hintWidth = ((hint ?? "") as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium)]).width
+        let shortcutWidth = shortcut.map {
+            ($0 as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium)]).width + 22
+        } ?? 0
+        return min(compact ? 240 : 300, ceil(max(titleWidth + shortcutWidth, hintWidth)) + 20)
+    }
+
+    static func frame(anchor: CGRect, size: CGSize, screen: CGRect, centered: Bool = false) -> CGRect {
+        let safe = screen.insetBy(dx: 8, dy: 8)
+        let width = min(size.width, safe.width)
+        let height = min(size.height, safe.height)
+        let below = anchor.minY - height - 4
+        let y = below >= safe.minY ? below : anchor.maxY + 4
+        let x = centered ? anchor.midX - width / 2 : anchor.minX + 32
+        return CGRect(x: min(max(x, safe.minX), safe.maxX - width),
+                      y: min(max(y, safe.minY), safe.maxY - height), width: width, height: height)
+    }
+}
+
+/// A single passive tooltip for tabs and controls, outside clipped scroll views. Its anchor never
+/// receives clicks, and its panel never takes focus from a page or an inline rename field.
+@MainActor final class TabTooltip {
+    static let shared = TabTooltip()
+    private let mouseLocation: () -> NSPoint
+    private weak var anchor: TabTooltipAnchorView?
+    private weak var owner: NSWindow?
+    private var pending: Task<Void, Never>?
+    private var panel: NSPanel?
+    private var monitor: Any?
+    private var observers: [NSObjectProtocol] = []
+    private let hovered = NSHashTable<TabTooltipAnchorView>.weakObjects()
+    var isPending: Bool { pending != nil }
+    var isVisible: Bool { panel != nil }
+
+    init(mouseLocation: @escaping () -> NSPoint = { NSEvent.mouseLocation }) {
+        self.mouseLocation = mouseLocation
+    }
+
+    func schedule(for anchor: TabTooltipAnchorView) {
+        guard anchor.enabled else { return }
+        dismissPresentation()
+        self.anchor = anchor
+        owner = anchor.window
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown,
+            .otherMouseDown, .leftMouseDragged, .rightMouseDragged, .scrollWheel, .keyDown]) {
+                [weak self] event in self?.handle(event) ?? event
+            }
+        watch(NSApplication.didResignActiveNotification, object: nil)
+        if let owner {
+            for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification,
+                         NSWindow.didMoveNotification, NSWindow.didResizeNotification] {
+                watch(name, object: owner)
+            }
+        }
+        pending = Task { [weak self, weak anchor] in
+            do { try await Task.sleep(for: .milliseconds(550)) } catch { return }
+            guard let self, let anchor, self.anchor === anchor else { return }
+            self.pending = nil
+            self.show(for: anchor)
+        }
+    }
+
+    func handle(_ event: NSEvent) -> NSEvent {
+        // Keep hover membership so moving off a clicked control can re-arm its row,
+        // without reopening a tooltip while the pointer stays still after input.
+        dismissPresentation()
+        return event
+    }
+
+    func enter(for anchor: TabTooltipAnchorView) {
+        guard anchor.enabled else { return }
+        hovered.add(anchor)
+        guard let target = bestHovered(in: anchor.window) else { return }
+        if self.anchor === target && (isPending || isVisible) { return }
+        schedule(for: target)
+    }
+
+    private func bestHovered(in window: NSWindow?) -> TabTooltipAnchorView? {
+        // SwiftUI backgrounds are siblings in AppKit's tree. Compare target sizes,
+        // rather than ancestry, so a small control wins over its containing row in
+        // either tracking-event order.
+        hovered.allObjects.filter {
+            $0.enabled && $0.window === window && !$0.isHiddenOrHasHiddenAncestor && !$0.tooltipRect.isEmpty
+        }.min {
+            $0.tooltipRect.width * $0.tooltipRect.height < $1.tooltipRect.width * $1.tooltipRect.height
+        }
+    }
+
+    private func watch(_ name: Notification.Name, object: AnyObject?) {
+        observers.append(NotificationCenter.default.addObserver(forName: name, object: object,
+            queue: .main) { [weak self] _ in MainActor.assumeIsolated { self?.dismiss() } })
+    }
+
+    private func show(for anchor: TabTooltipAnchorView) {
+        guard anchor.enabled, let owner = anchor.window, owner.isKeyWindow, NSApp.isActive,
+              !anchor.isHiddenOrHasHiddenAncestor, !anchor.tooltipRect.isEmpty,
+              let screen = owner.screen else { dismiss(); return }
+        let pointer = anchor.convert(owner.convertPoint(fromScreen: mouseLocation()), from: nil)
+        guard anchor.tooltipRect.contains(pointer) else { dismiss(); return }
+        let surface = TabTooltipSurface(title: anchor.title, hint: anchor.hint,
+                                        shortcut: anchor.shortcut, compact: anchor.centered, theme: anchor.theme)
+        let hosting = NSHostingView(rootView: surface)
+        let size = hosting.fittingSize
+        let rect = owner.convertToScreen(anchor.convert(anchor.tooltipRect, to: nil))
+        let frame = TabTooltipLayout.frame(anchor: rect, size: size, screen: screen.visibleFrame,
+                                           centered: anchor.centered)
+        let panel = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.isReleasedWhenClosed = false
+        panel.isExcludedFromWindowsMenu = true
+        panel.hidesOnDeactivate = true
+        panel.contentView = hosting
+        self.panel = panel
+        panel.alphaValue = Motion.reduced ? 1 : 0
+        owner.addChildWindow(panel, ordered: .above)
+        panel.orderFront(nil)
+        if !Motion.reduced {
+            WindowMotion.animate(panel, alpha: 1, duration: Look.appearDuration)
+        }
+    }
+
+    func refresh(for anchor: TabTooltipAnchorView) {
+        guard self.anchor === anchor, let panel, let owner = anchor.window,
+              let screen = owner.screen,
+              let hosting = panel.contentView as? NSHostingView<TabTooltipSurface> else { return }
+        guard !anchor.tooltipRect.isEmpty else { dismiss(for: anchor); return }
+        // Keep the mounted surface when a title or copy confirmation changes under the
+        // pointer. Replacing its native host repeats setup and discards view identity.
+        hosting.rootView = TabTooltipSurface(title: anchor.title,
+            hint: anchor.hint, shortcut: anchor.shortcut, compact: anchor.centered, theme: anchor.theme)
+        let rect = owner.convertToScreen(anchor.convert(anchor.tooltipRect, to: nil))
+        panel.setFrame(TabTooltipLayout.frame(anchor: rect, size: hosting.fittingSize,
+                                              screen: screen.visibleFrame, centered: anchor.centered), display: false)
+    }
+
+    func dismiss(for anchor: TabTooltipAnchorView) {
+        hovered.remove(anchor)
+        guard self.anchor === anchor else { return }
+        dismissPresentation()
+        if let target = bestHovered(in: anchor.window) { schedule(for: target) }
+    }
+
+    func exit(for anchor: TabTooltipAnchorView) {
+        let wasHovered = hovered.contains(anchor)
+        dismiss(for: anchor)
+        // Only a pointer exit may re-arm a tooltip canceled by input. Disabled or
+        // dismantled sibling controls must not silently undo that cancellation.
+        if self.anchor == nil && wasHovered, let target = bestHovered(in: anchor.window) {
+            schedule(for: target)
+        }
+    }
+
+    func dismiss() {
+        hovered.removeAllObjects()
+        dismissPresentation()
+    }
+
+    private func dismissPresentation() {
+        pending?.cancel()
+        pending = nil
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
+        if let panel {
+            WindowMotion.cancel(panel)
+            owner?.removeChildWindow(panel)
+            panel.close()
+            panel.contentView = nil
+        }
+        panel = nil
+        owner = nil
+        anchor = nil
+    }
+}
+
+private struct TabTooltipSurface: View {
+    let title: String
+    let hint: String?
+    let shortcut: String?
+    let compact: Bool
+    let theme: SpaceChromeTheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.94))
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let shortcut {
+                    Text(shortcut).font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.72))
+                        .padding(.horizontal, 5).padding(.vertical, 2)
+                        .background(.white.opacity(0.1), in: .rect(cornerRadius: 4))
+                        .fixedSize()
+                }
+            }
+            if let hint {
+                Text(hint)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(theme.bubbleHint)
+                    .lineLimit(compact ? 2 : 3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(width: TabTooltipLayout.width(title: title, hint: hint, shortcut: shortcut,
+                                             compact: compact), alignment: .leading)
+        .background(theme.bubble, in: .rect(cornerRadius: 9))
+        .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(.white.opacity(0.14), lineWidth: 1) }
+        .animation(Motion.reduced ? nil : Look.quick, value: theme)
+        .accessibilityHidden(true)
+    }
+}
+
+final class TabTooltipAnchorView: NSView {
+    let tooltip: TabTooltip
+    private(set) var theme = SpaceChromeTheme()
+    private(set) var title = ""
+    private(set) var hint: String? = "Double-click to rename"
+    private(set) var shortcut: String?
+    private(set) var centered = false
+    private(set) var enabled = true
+    // SwiftUI can report an ancestor's clip beyond this representable's bounds.
+    // Position and admit tooltips only within the control's own visible portion.
+    var tooltipRect: NSRect { bounds.intersection(visibleRect) }
+    private var tracking: NSTrackingArea?
+    private let rebuildTracking = ProcessInfo.processInfo.environment["TIMO_DIAG_REBUILD_TOOLTIP_TRACKING"] == "1"
+
+    init(tooltip: TabTooltip = .shared) {
+        self.tooltip = tooltip
+        super.init(frame: .zero)
+        setAccessibilityElement(false)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(title: String, hint: String? = "Double-click to rename", shortcut: String? = nil,
+                   centered: Bool = false, enabled: Bool, theme: SpaceChromeTheme = SpaceChromeTheme()) {
+        let changed = self.title != title || self.hint != hint || self.shortcut != shortcut
+            || self.centered != centered || self.theme != theme
+        self.theme = theme
+        self.title = title
+        self.hint = hint
+        self.shortcut = shortcut
+        self.centered = centered
+        self.enabled = enabled
+        if !enabled { tooltip.dismiss(for: self) }
+        else if changed { tooltip.refresh(for: self) }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        // AppKit recomputes .inVisibleRect as clipping and geometry change; the
+        // registration's owner and options stay constant throughout this view's life.
+        // Keep the old path available for an independent same-binary measurement.
+        if tracking != nil && !rebuildTracking { return }
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if enabled { tooltip.enter(for: self) }
+    }
+    override func mouseExited(with event: NSEvent) { tooltip.exit(for: self) }
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if window !== newWindow { tooltip.dismiss(for: self) }
+        super.viewWillMove(toWindow: newWindow)
+    }
+}
+
+private struct TabTooltipAnchor: NSViewRepresentable {
+    let title: String
+    let hint: String?
+    let shortcut: String?
+    let centered: Bool
+    let enabled: Bool
+    @Environment(\.spaceChromeTheme) private var theme
+    func makeNSView(context: Context) -> TabTooltipAnchorView { TabTooltipAnchorView() }
+    func updateNSView(_ view: TabTooltipAnchorView, context: Context) {
+        view.configure(title: title, hint: hint, shortcut: shortcut, centered: centered, enabled: enabled, theme: theme)
+    }
+    static func dismantleNSView(_ view: TabTooltipAnchorView, coordinator: ()) {
+        view.tooltip.dismiss(for: view)
+    }
+}
+
+private struct TabTooltipModifier: ViewModifier {
+    let title: String
+    var hint: String? = "Double-click to rename"
+    var shortcut: String? = nil
+    var centered = false
+    let enabled: Bool
+    @Environment(\.isEnabled) private var controlEnabled
+    @ObservedObject private var dragging = Dragging.shared
+    func body(content: Content) -> some View {
+        // The anchor draws nothing. Without the window's Space tint, SwiftUI skips building a
+        // tinted NSAppearance for it on every environment change, which is every frame of a
+        // folder disclosure.
+        content.background(TabTooltipAnchor(title: title, hint: hint, shortcut: shortcut, centered: centered,
+            enabled: enabled && controlEnabled && dragging.tab == nil && dragging.folder == nil)
+            .tint(nil).accentColor(nil))
+    }
+}
+
+extension View {
+    func tabTooltip(_ title: String, enabled: Bool) -> some View {
+        modifier(TabTooltipModifier(title: title, enabled: enabled))
+    }
+
+    /// Custom chrome hints share the tabs' passive panel and cancellation rules.
+    func timoTooltip(_ title: String, hint: String? = nil, shortcut: String? = nil,
+                     enabled: Bool = true) -> some View {
+        let shortcut = shortcut == "" || shortcut == Keybinding.unassigned.display ? nil : shortcut
+        return modifier(TabTooltipModifier(title: title, hint: hint,
+            shortcut: shortcut,
+            centered: true, enabled: enabled))
+            .accessibilityHint([title, hint, shortcut].compactMap { $0 }.joined(separator: ". "))
+    }
+}

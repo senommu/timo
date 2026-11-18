@@ -1,0 +1,1274 @@
+import AppKit
+import SwiftUI
+
+/// Timo's look, in one place, so views built in parallel come out matching. Every number a
+/// view would otherwise invent lives here. The numbers are Arc's, measured off the reference
+/// screenshots at 2x (scratchpad `ARC-LOOK.md`): fills are white-over-ground alphas, type
+/// sizes were matched by rendering the same strings with SF and comparing widths.
+enum Look {
+    /// The hazard tape round a Developer Mode page, and its "DEV" tag.
+    static let developerYellow = Color(red: 1.0, green: 0.82, blue: 0.0)
+    static let sidebarWidth: CGFloat = 228
+    /// Settings cards, the find bar, and compact popovers. Arc's card corner is tight —
+    /// 5–6pt fitted to the 2x corner profile — while their rows are round; they are not one
+    /// family.
+    static let cardRadius: CGFloat = 6
+    /// Floating sidebar and page are sibling surfaces with matching corners.
+    static let floatingSidebarRadius: CGFloat = pageRadius
+    /// Equal clearance from the window edges, independent of the page card spacing.
+    static let floatingSidebarGap: CGFloat = 5
+    /// A defined rim separates the floating Space surface from the page beneath it.
+    static let floatingSidebarStroke = Color.white.opacity(0.4)
+    static let floatingSidebarStrokeWidth: CGFloat = 1
+    /// The page card — the sheet a page is drawn on, and the outline standing where one will
+    /// go. Its own number, and a generous one: it is the only corner in the window that is
+    /// read *against* the window's own, which macOS 26 rounds hard, and a settings card's
+    /// 6pt inside that reads as a pinch rather than as a corner. Arc's is 8–10.
+    static let pageRadius: CGFloat = 10
+    /// A dark rim stays visible over even the brightest Space wash. The soft outline
+    /// shadow belongs to the card shape, so empty and loaded pages have the same edge.
+    static let pageRim = Color.black.opacity(0.12)
+    static let pageShadow = Color.black.opacity(0.24)
+    static let pageShadowRadius: CGFloat = 3
+    /// The address pill, favourites tiles, sidebar rows, buttons. Fitted at 12 (a 24px arc
+    /// at 2x); 10 undershot every sample.
+    static let pillRadius: CGFloat = 12
+    /// The sidebar's three heights, one family: a row, the address pill above it, and a
+    /// favourites tile — Arc's, measured off the reference at 2x (36 on a 41 pitch, 36, 46).
+    static let rowHeight: CGFloat = 36
+    /// Between rows, so a selected fill never touches its neighbour's. `rowHeight + rowGap`
+    /// is the 41pt pitch the whole sidebar is laid out on (Vesta 474 → NoNote 556 → … every
+    /// row 82px apart in ref 1).
+    static let rowGap: CGFloat = 5
+    static let pillHeight: CGFloat = 36
+    static let tileHeight: CGFloat = 46
+    /// The sidebar's side padding, and the gap between a pill's edge and the card.
+    static let inset: CGFloat = 8
+    /// Clearance around the page card on its top, trailing and bottom edges.
+    static let cardGap: CGFloat = 11
+    /// Inside a row: from its fill to the favicon, and from the favicon to the title.
+    static let rowInset: CGFloat = 10
+    static let rowSpacing: CGFloat = 11
+    /// A wandered pin's Return tile draws around the ordinary favicon slot.
+    static let returnTileSize: CGFloat = rowHeight
+    static let returnMarkerGap: CGFloat = 3
+    static let returnMarkerWidth: CGFloat = 4
+    /// From a row's fill to its trailing edge: the close ×'s target on a tab row, and simply
+    /// where the title's box stops on the rows that have no glyph at all — New Tab, and the
+    /// Space preview's rows in `SpacesUI`. Left where it was when the × grew a target
+    /// (`rowTarget`), which is a square around a much smaller glyph: the × now reads a few
+    /// points further in than it did, and buying that back by trimming the inset would move
+    /// the trailing edge of every row in the app, including the ones with nothing in it.
+    static let rowTrailingInset: CGFloat = 12
+    /// Tab controls sit near the pill edge while keeping their full press target.
+    static let tabRowTrailingInset: CGFloat = 6
+    /// A row's trailing glyphs — the speaker and the close × — are pressable squares, not
+    /// bare glyphs. `rowGlyph` draws an × 15×13 in a 36pt row: a third of the row's height
+    /// to aim at, and a near miss is not nothing, because the row answers a click of its
+    /// own by *showing* the tab. Missing the × switches to the tab you were closing, which
+    /// is why "the × doesn't really work" is what it feels like. A control's worth of square
+    /// is the target; the glyph is only what you can see of it.
+    static let rowTarget: CGFloat = control
+    /// From the address pill's fill to its host text.
+    static let pillInset: CGFloat = 14
+    /// Between the pill's glyphs and the host between them. An action badge is sized against
+    /// it: a badge wider than its icon plus this gap would touch the glyph beside it.
+    static let pillGlyphGap: CGFloat = 8
+    /// The Tidy | Clear divider row, with half of `sectionGap` on either side.
+    static let tidyRow: CGFloat = 13
+    /// How many Today tabs a Space has to hold before Tidy and Clear are offered at all.
+    /// Below it there is no pile: five tabs fit in the strip and the one you want is the one
+    /// you can already see, so two housekeeping actions over them are noise on every new
+    /// Space, every window, every morning. Arc's number, and the same six `TidyTabs`
+    /// defaults its own threshold to.
+    ///
+    /// A count, not a size, but it lives here because it is a rule about what the sidebar
+    /// *shows* — the row's height above is meaningless without it.
+    static let tidyThreshold = 6
+    /// The spinner that stands in for the word "Tidy" while the model is grouping. AppKit's
+    /// smallest indeterminate spinner is 16pt across and this row is 13pt tall, so it is
+    /// scaled to sit inside the line rather than pushing the list down by three points.
+    static let tidySpinnerScale: CGFloat = 0.7
+    static let sectionGap: CGFloat = 18
+
+    // The command bar. The one surface allowed rows taller than `rowHeight`: it is a
+    // centred sheet the user is typing into, not a dense list they are scanning. The
+    // numbers are Arc's, measured off the reference screenshots at 2x.
+    static let barWidth: CGFloat = 760
+    /// The address editor opens over the sidebar and extends a little into the page.
+    static let sidebarSearchWidth: CGFloat = 350
+    static let barRadius: CGFloat = 12
+    /// Rows are `barRowHeight` tall on a `barRowHeight + barRowGap` pitch, so a selection
+    /// fill has a sliver of ground on every side instead of touching its neighbours.
+    static let barRowHeight: CGFloat = 46
+    static let barRowGap: CGFloat = 4
+    /// How many rows the bar draws before the rest are a scroll away.
+    static let barVisibleRows = 8
+    /// Search Settings can show more or fewer rows; never fewer than the bar at rest needs.
+    static let barVisibleRowsKey = "searchBarVisibleRows"
+    static let barVisibleRowsRange = (barEmptyTabs + 1)...12
+    static func clampedVisibleRows(_ n: Int) -> Int {
+        min(max(n, barVisibleRowsRange.lowerBound), barVisibleRowsRange.upperBound)
+    }
+    /// Where the search bar's top edge sits, as a fraction of the window's height. A
+    /// quarter down is where a full list of `barVisibleRows` used to centre itself.
+    static let barTopKey = "searchBarTop"
+    /// Off makes the bar change at once: rows, height and scope chips stop easing.
+    static let barAnimationsKey = "searchBarAnimations"
+    static let barTop = 0.25
+    static let barTopRange = 0.05...0.5
+    static func clampedBarTop(_ f: Double) -> CGFloat {
+        CGFloat(min(max(f, barTopRange.lowerBound), barTopRange.upperBound))
+    }
+    /// How many of this window's tabs the bar lists with nothing typed. Arc's ⌘T opens on a
+    /// short most-recently-used list rather than the whole strip: the tab you want is nearly
+    /// always the one you were just on, and anything further back is one typed letter away.
+    ///
+    /// A count, not a size, but it is a rule about what the bar *shows* — and it has to be
+    /// read against the row count above, which is the only reason either number is a number.
+    static let barEmptyTabs = 5
+    /// The text field's row, which is deliberately taller than any result row.
+    static let barFieldHeight: CGFloat = 62
+    /// From the bar's edge to a row's fill, and to the ends of the field's divider.
+    static let barInset: CGFloat = 9
+    /// From a row fill's edge to its icon. `barInset + barRowInset + rowIcon / 2` is the
+    /// icon column's centre line (30), which the field's own icon sits on too.
+    static let barRowInset: CGFloat = 13
+    /// From a bar row's icon to its title.
+    static let barRowSpacing: CGFloat = 13
+    /// Favicon / symbol slot at the leading edge of a row. Sidebar artwork is inset
+    /// within this slot; command bar icons keep their own sizing.
+    static let rowIcon: CGFloat = 16
+    /// Arc lets site artwork draw slightly beyond the sidebar's 16pt alignment slot.
+    /// The slot stays fixed so larger favicons do not move row titles or controls.
+    static let sidebarFaviconScale: CGFloat = 18.0 / 16.0
+    /// The site's initial, standing in a favicon's box while a tab has none — a fraction of
+    /// the box rather than a point size, because that box is 16 in a row and 16 in a tile.
+    /// Short of the full box, so a letter and an icon read as one size.
+    static let letterScale: CGFloat = 0.72
+    /// That letter's type, for a box of `box` points. Rounded and semibold: it is standing in
+    /// for an icon, so it has to read as a mark rather than as a word that got cut off.
+    static func letterFont(box: CGFloat) -> Font {
+        .system(size: box * letterScale, weight: .semibold, design: .rounded)
+    }
+    /// The "→" square on a row that has a trailing label: what Return will press.
+    static let chip: CGFloat = 24
+    static let chipRadius: CGFloat = 6
+    /// The field's type. Larger than body because it is the one thing being typed into.
+    static let barFontSize = Typography.input.size
+    /// The magnifying glass beside it, and the symbols standing in for favicons on rows —
+    /// Arc's are small (24px at 2x) and regular weight.
+    static let fieldIcon = Font.system(size: 13)
+
+    // Find bar. A strip over the page card rather than a sheet: small type, a field wide
+    // enough for a phrase, and a fixed slot for "128 of 250" so stepping through the
+    // matches never shuffles the buttons beside it a pixel at a time.
+    static let findFontSize = Typography.secondary.size
+    static let findFieldWidth: CGFloat = 180
+    static let findCountWidth: CGFloat = 64
+
+    // Split view. Arc's panes are separate sheets inside the one card with a hairline down
+    // the gap between them, and the gap is what there is to aim the divider drag at: a 1pt
+    // target between two web views is not a target.
+    static let splitDivider: CGFloat = 1
+    static let splitGap: CGFloat = 9
+    /// A pane's own corner: the page card's, one step tighter, because it sits inside it.
+    static let paneRadius: CGFloat = pageRadius - 2
+    /// The frame round the pane the keyboard is in, and the band a drop will land in. The
+    /// accent rather than `ink`: it is the one thing on the page that is the app talking.
+    static let paneFrame = Color.accentColor.opacity(0.5)
+    static let paneFrameWidth: CGFloat = 2
+    /// How much of the card's edge takes a dragged tab as a new pane.
+    static let splitDropBand: CGFloat = 0.25
+
+    // Settings. Arc's rows are 43 (86px), its link rows 34, its list rows 32 on a 40 pitch.
+    static let settingsRow: CGFloat = 43
+    /// Settings fields and search share a comfortable height, independently of compact browser chrome.
+    static let settingsControl: CGFloat = 32
+    static let settingsSearch: CGFloat = 36
+    static let settingsPicker: CGFloat = 200
+    /// From a card's edge to its row content, and where its dividers start and stop.
+    static let cardInset: CGFloat = inset + 6
+    /// A row that is only a title and an arrow ("Your Data and Settings").
+    static let linkRow: CGFloat = 34
+    /// A row of the Profiles list: its fill, and the vertical margin that makes the pitch.
+    static let listRow: CGFloat = 32
+    static let listRowGap: CGFloat = 4
+    /// The coloured glyph square on a link row.
+    static let iconTile: CGFloat = 24
+    static let iconTileRadius: CGFloat = 6
+    /// Side margin of a settings pane, and the Profiles pane's list column.
+    static let paneMargin: CGFloat = inset * 4
+    static let profileListWidth: CGFloat = 230
+    /// The saved-account list under a login form's username field, for when the field is
+    /// narrower than the usernames it holds.
+    static let chooserWidth: CGFloat = 280
+    static let passwordChooserHeader: CGFloat = 52
+    static let passwordChooserRow: CGFloat = 56
+    static let passwordChooserFooter: CGFloat = 40
+    static let passwordChooserInset: CGFloat = 4
+    /// The save-password card at the top of the page. Fixed, so a long host does not make
+    /// the card breathe in and out between one site and the next.
+    static let offerWidth: CGFloat = 340
+
+    /// The sidebar's two fixed strips: traffic lights and navigation above, library and
+    /// spaces below. Arc's top strip is 45 tall with the lights and glyphs centred at 22.5;
+    /// its footer glyphs sit 24 above the window's bottom edge.
+    static let topRow: CGFloat = 28
+    /// Above the top row, so its centre line is `lightsCentre` below the window's edge — the
+    /// line the traffic lights are brought down to in `TimoWindow`. The lights move to the
+    /// row, not the row to the lights.
+    static let topInset: CGFloat = 9
+    /// The traffic lights' centre line, and so the top row's.
+    static let lightsCentre: CGFloat = 23
+    /// A light's disc: AppKit's own, which fills its 14pt button edge to edge. Ours is laid
+    /// exactly over it — a point smaller and the grey underneath shows as a halo.
+    static let lightDisc: CGFloat = 14
+    /// The ring around a resting light: the window's one-point line, in the light's colour.
+    static let lightRing: CGFloat = 1
+    /// Little Arc: a small floating window with one page and one row of chrome. Arc's is
+    /// roughly 1000×700 and it is a size, not a proportion — the point is that it is
+    /// obviously not your browser window.
+    static let littleWidth: CGFloat = 1000
+    static let littleHeight: CGFloat = 700
+    /// The biggest window a page can ask `window.open` for and still be read as a popup
+    /// rather than as another page — a sign-in sheet, a share dialog, a payment frame. Every
+    /// OAuth popup on the web is well inside this: Google's is 451×600, Microsoft's 483×600,
+    /// Apple's 600×600, Stripe's 450×700. Anything larger is a page, and pages are tabs.
+    /// See Popups.swift.
+    ///
+    /// Preserve the established dialog-versus-page threshold. Website dialog windows
+    /// honor their requested dimensions, clamped to the visible screen.
+    static let popupWidth: CGFloat = 800
+    static let popupHeight: CGFloat = littleHeight
+    /// Above Little Arc's bar. Its row is the address pill's own height rather than the
+    /// sidebar's `topRow`, so the padding that puts that row's centre on the traffic
+    /// lights' line is a different number — the same line, arrived at from a taller row.
+    static let littleTopInset: CGFloat = lightsCentre - pillHeight / 2
+    static let footer: CGFloat = 28
+    /// Matching end controls keep the Space strip centered in the sidebar.
+    static let footerControl: CGFloat = 32
+    /// Under the footer.
+    static let footerInset: CGFloat = 10
+    /// A favourite tile's icon slot: the same 16pt as a row's.
+    static let tileIcon: CGFloat = 16
+    /// A space dot in the footer.
+    static let dot: CGFloat = 8
+    /// The line a drop will land on: before or after a tile, above or below a row.
+    static let dropLine: CGFloat = 2
+    /// The half of a row a dropped tab will take when the two go side by side. The same
+    /// accent as `paneFrame` and well down from it: this one is painted behind a row's title,
+    /// which still has to be readable through it, and the ring round the row is what says
+    /// "split" — this only says which half.
+    static let dropHalf = Color.accentColor.opacity(0.22)
+    /// How far a folder's contents step in from the rows around them. Enough to read as
+    /// nesting at a glance, and small enough that three levels still leave a title room in
+    /// a 250pt sidebar — which is the same reason `Pins.maxDepth` stops where it does.
+    static let folderIndent: CGFloat = 14
+
+    /// Arc's 340pt square pad, with a 24pt preset row below it.
+    static let themeWidth: CGFloat = 356
+    static let themeCanvas: CGFloat = 340
+    static let themeGrid: CGFloat = 4.25
+    static let themeGridDot: CGFloat = 0.5
+    static let swatch: CGFloat = 24
+    static let swatchPage = 9
+    /// The grain dial: the knob, the dotted ring round it, and how many dots the ring has.
+    static let themeDial: CGFloat = 46
+    static let themeDialRing: CGFloat = 74
+    static let themeDialDots = 32
+    /// Its pointer: a pill out on the dotted ring, at the angle the knob is turned to.
+    static let themeMarker = CGSize(width: 14, height: 7)
+    /// The slider's thumb and the dial's pointer. `ink`, not white: Arc's popover is
+    /// always dark, and a white pill on a Space pinned to light is a thumb nobody can see.
+    static let themeThumbInk = ink(0.9)
+    /// A popover's own ground. NSPopover hands its content a translucent material, so a panel
+    /// that draws nothing of its own has the window's wash streaking through it. Opaque and
+    /// appearance-following, which no `ink` alpha over nothing can be.
+    static let panelFill = Color(nsColor: .windowBackgroundColor)
+
+    /// The card that asks whether a link may leave for another app: “Open “Zoom”?”.
+    /// Wide enough for Cancel, Always Allow and Allow on one line beside a `paneMargin`
+    /// on each side, which is what stops the three buttons stacking.
+    static let appPrompt: CGFloat = 400
+    /// The handler’s icon on it, at the size macOS draws an app icon in a dialog of its own.
+    static let appIcon: CGFloat = 48
+    /// What AppKit's bezel adds around a push button's title. Nothing is drawn with it —
+    /// the card's buttons are system buttons and AppKit sizes them — it is what `check`
+    /// needs in order to say whether a row of them fits `appPrompt` before anyone has to
+    /// look at a screenshot of them stacked into a column.
+    static let buttonPadding: CGFloat = 26
+
+    /// The Site Control Center popover. Wide enough for "Picture in Picture" and its switch
+    /// on one line, and no wider — it hangs off the address pill, not off the window.
+    static let siteWidth: CGFloat = 300
+    /// The mark on the pill's site glyph when the site holds a permission, and how far
+    /// outside the glyph's box it sits: a badge on the lock, not a second glyph beside it.
+    static let badge: CGFloat = 5
+    static let badgeOffset: CGFloat = 3
+    /// An extension action's badge — a count drawn *on* its icon rather than a glyph beside
+    /// it, so a pinned extension costs the pill one glyph's width and not two. Never taller
+    /// than `rowIcon` and never wider than the gap to the next glyph, so "99+" cannot reach
+    /// its neighbour; the type shrinks inside that width instead of the capsule growing.
+    static let badgeHeight: CGFloat = 11
+    static let badgeInset: CGFloat = 3
+    static let badgeWidth: CGFloat = 20
+    static let badgeShrink: Double = 0.6
+    /// A live folder's source mark, in the corner of the folder's own glyph: the GitHub mark
+    /// on a folder, so a folded folder still says where its contents come from. Smaller than
+    /// the glyph it sits on, and pushed out by less than its own width, so it reads as a
+    /// badge *on* the folder rather than as a second glyph beside it.
+    static let sourceBadge: CGFloat = 9
+    static let sourceBadgeOffset: CGFloat = 3
+    /// Arc's "Live Folder Created" card, hanging off the folder that was just made: wide
+    /// enough for its two lines of explanation, and gone again after this long.
+    static let calloutWidth: CGFloat = 250
+    static let calloutDuration: Double = 6
+    /// What a button that is drawn but cannot be pressed fades to: an extension action its
+    /// own extension has disabled for this page, or a pinned glyph on a pill with no tab.
+    static let dimmed: Double = 0.4
+    /// Between a title and the caption under it — a site row and the popover's header.
+    static let captionGap: CGFloat = 2
+    /// A site row's vertical padding. Derived so a row with one line of title is exactly
+    /// `rowHeight` tall with a `control` in it, and a row with a caption grows from there.
+    static let rowPadding: CGFloat = (rowHeight - control) / 2
+    /// The zoom stepper: a square −/+ a step inside `control` so it is never taller than
+    /// the popup buttons beside it, the gap around the label, and the label's own width,
+    /// fixed at "100%" so stepping does not shift the buttons under the pointer.
+    static let step: CGFloat = control - 4
+    static let stepGap: CGFloat = 2
+    static let stepLabel: CGFloat = 38
+
+    /// Text uses the same system face and metrics in SwiftUI and AppKit. Keep SF Symbols
+    /// separate: their optical size and weight belong to the icon, not to its label.
+    enum Typography {
+        struct Style {
+            let size: CGFloat
+            let weight: NSFont.Weight
+
+            var native: NSFont { .systemFont(ofSize: size, weight: weight) }
+            var font: Font { Font(native) }
+        }
+
+        static let body = Style(size: 13, weight: .regular)
+        static let sidebar = Style(size: 14, weight: .regular)
+        static let sidebarHeading = Style(size: 14, weight: .semibold)
+        static let caption = Style(size: 11, weight: .regular)
+        static let section = Style(size: 11, weight: .semibold)
+        static let secondary = Style(size: 12, weight: .regular)
+        static let heading = Style(size: 13, weight: .semibold)
+        static let result = Style(size: 13, weight: .medium)
+        /// The sidebar URL editor keeps the sidebar's scale inside its compact field row.
+        static let addressInput = Style(size: 14, weight: .medium)
+        static let input = Style(size: 18, weight: .medium)
+        static let featureHeading = Style(size: 16, weight: .semibold)
+        static let compactCaption = Style(size: 10, weight: .semibold)
+        static let dialog = Style(size: 20, weight: .semibold)
+        static let shortcut = Style(size: 12, weight: .semibold)
+        static let badge = Style(size: 8, weight: .semibold)
+        static let tileLabel = Style(size: 10, weight: .medium)
+    }
+
+    static let text = Typography.body.font
+    /// A sidebar row's title and New Tab: Arc sets these a point larger than
+    /// body ("Vesta macOS Terminal" is 288px wide at 2x — 14 regular to the pixel).
+    static let rowTitle = Typography.sidebar.font
+    /// Space headers are compact; folder names keep the row size. Both are semibold.
+    static let spaceTitle = Typography.heading.font
+    static let folderTitle = Typography.sidebarHeading.font
+    static let caption = Typography.caption.font
+    /// A mark in the corner of another glyph — a live folder's source. Small enough that
+    /// the glyph it sits on still reads as itself.
+    static let badgeGlyph = Font.system(size: 9, weight: .semibold)
+    /// Tidy | Clear: caption-sized but heavy, the way Arc sets them.
+    static let sectionCaption = Typography.section.font
+    /// A settings footnote. Arc's are 12, a step under the rows they explain.
+    static let footnote = Typography.secondary.font
+    static let heading = Typography.heading.font
+    static let dialogTitle = Typography.dialog.font
+    static let shortcut = Typography.shortcut.font
+    /// Secondary type: the find field, a download's name, the current space's dot.
+    static let small = Typography.secondary.font
+    /// The sidebar's symbol buttons: the top row and the footer (16 medium: sidebar.left
+    /// 37×29px, arrow.left 30×24, plus 28×28).
+    static let icon = Font.system(size: 16, weight: .medium)
+    /// The address pill's two glyphs, a step smaller than the top row's (link 29×29px).
+    static let pillGlyph = Font.system(size: 14, weight: .medium)
+    /// A split's row: one row-height container with a pill per pane in it. The inset is what
+    /// makes the pills read as things *in* a row rather than rows of their own, and the
+    /// nested radius follows from it — a corner inside a corner is the outer one less the
+    /// gap between them, or the two curves fight.
+    static let paneInset: CGFloat = 4
+    static let paneGap: CGFloat = 6
+    static var panePillRadius: CGFloat { pillRadius - paneInset }
+
+    /// The space's icon at the head of the list (cloud 32×22px).
+    static let spaceIcon = Font.system(size: 14)
+    /// A symbol standing in a `rowIcon` box where a favicon would be: bar rows, pickers.
+    static let symbol = Font.system(size: 13)
+    /// The digits in an extension action's badge. Small enough that "99+" still leaves the
+    /// icon under it recognisable.
+    static let badgeText = Typography.badge.font
+    /// A glyph inside a small tile: a link row's coloured square.
+    static let glyph = Font.system(size: 12, weight: .semibold)
+    /// The "→" in a chip.
+    static let chipGlyph = Font.system(size: 13, weight: .medium)
+    /// The glyphs a row grows on hover — the close "×", the speaker (xmark 20×20px = 13).
+    static let rowGlyph = Font.system(size: 13)
+    /// Command bar rows: a step heavier than body, the way Arc sets them, so a title reads
+    /// at a glance against the grey trailing label.
+    static let rowText = Typography.result.font
+
+    /// White in dark, black in light, at one strength. Keyed off the *window's* appearance
+    /// rather than SwiftUI's colour scheme, so a space pinned to dark gets white ink even
+    /// when the system is light. `Color.primary.opacity(x)` was not this: primary is itself
+    /// 85 % white, so every fill came out 15 % weaker than its number said.
+    static func ink(_ alpha: Double) -> Color { Color(nsColor: nsInk(alpha)) }
+
+    /// The same ink as AppKit's own colour. The traffic lights are drawn with `NSBezierPath`
+    /// in a view of AppKit's titlebar, where there is no SwiftUI to hand a `Color` to.
+    static func nsInk(_ alpha: Double) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let dark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            return NSColor(white: dark ? 1 : 0, alpha: alpha)
+        }
+    }
+
+    /// Arc's four strengths of type on the sidebar: a tab title (#D4D5D4 on its ground),
+    /// the glyphs and the host, the space name and New Tab, and Tidy | Clear.
+    static let inkPrimary = ink(0.80)
+    static let inkSecondary = ink(0.60)
+    static let inkTertiary = ink(0.45)
+    static let inkQuiet = ink(0.30)
+    /// A disabled glyph (Arc's forward arrow with nowhere to go: 115 on 66).
+    static let inkDisabled = ink(0.26)
+
+    /// One surface at graded strengths, so the pill, a tile, a hovered row and a selected row
+    /// read as the same material rather than four different greys. Arc: rest and hover are
+    /// one step (84 on 66), the selection two (102 on 66), and a hovered pill or tile takes
+    /// the selection's step because it is a button, not a row among rows.
+    static let hoveredAlpha = 0.10
+    static let hovered = ink(hoveredAlpha)
+    static let pillFill = ink(hoveredAlpha)
+    static let selectedAlpha = 0.19
+    static let selected = ink(selectedAlpha)
+    /// A selection that belongs to the user's accent rather than to the surface: the
+    /// Profiles list, where the selected row is the one whose controls are shown. Arc's is
+    /// a whisper of blue (29,34,46 on 27).
+    static let accentSelected = Color.accentColor.opacity(0.10)
+    /// Multi-select: every ticked row wears `selected`, so the one actually being shown
+    /// needs something the others do not have. A hairline in the accent rather than a
+    /// brighter fill — a third step of grey between `selected` and white would read as a
+    /// different material, while the accent is already the window's word for "this one".
+    static let selectedEdge = Color.accentColor.opacity(0.55)
+
+    /// Something is wrong with the page rather than with the chrome: a connection that is
+    /// not secure. The one colour in the window that is not `ink` or the user's accent,
+    /// because a warning set in the same grey as everything else is not a warning.
+    static let warning = Color.orange
+
+    /// The one-pixel lines: dividers, field borders.
+    static let hairline = ink(0.08)
+    /// Settings cards: barely lifted from the window (30 on 27), with a stroke that does the
+    /// separating (52 on 27).
+    static let cardFillAlpha = 0.015
+    static let cardFill = ink(cardFillAlpha)
+    static let cardStroke = ink(0.11)
+    /// The page area with no page in it. Arc still draws the sheet a page will land on —
+    /// the same corner and the same gap as a live card — so a window with nothing open
+    /// shows you where the next thing goes instead of a flat wall of sidebar colour. A tone
+    /// over the ground rather than a panel: lifted further than a settings card so it reads
+    /// on the space's own wash, quieter than a hovered row so it is never mistaken for one.
+    static let emptyPaneFillAlpha = 0.05
+    static let emptyPaneFill = ink(emptyPaneFillAlpha)
+    /// The loading pill: a small capsule near the top of the page card, not a rule across
+    /// the whole of it. A proportion needs a beginning and an end to be read as one, and a
+    /// bar the width of the window has neither — it reads as the edge of the page rather
+    /// than as a thing filling up. Wide enough to show a quarter apart from a half, short
+    /// enough to sit on the page without dividing it, and inset from the corner so it clears
+    /// the card's own radius.
+    static let loadingPill = CGSize(width: 160, height: 5)
+    /// The plus that fills at the sidebar's edge during a pull past the last Space.
+    static let pullPlus: CGFloat = 32
+    static let loadingInset: CGFloat = 8
+    /// The unfilled part of it. A shade under a hovered row, so the pill is visible on the
+    /// page for the whole of a load without being something you look at.
+    static let loadingTrack = ink(0.10)
+
+    /// What the page area is before a page has painted anything of its own. A WKWebView
+    /// shows white until its first paint, so on a dark Space every switch and every load
+    /// flashed headlights.
+    ///
+    /// Not the Space's ground. `ground` is the Space's own colour — hue kept, tinted by its
+    /// slider — laid over the blurred desktop at `groundOpacity` with the grain on top, so
+    /// it is translucent, coloured and textured. This one is a flat opaque grey: neutral,
+    /// no tint, no grain, nothing behind it. It borrows only `ground`'s two brightnesses,
+    /// 14 % in dark and 96 % in light, so the two read as the same room. A page is opaque
+    /// the moment it paints, so anything translucent under it would be a frame of one thing
+    /// and then another; and the colour goes onto the web view itself, which has no Space to
+    /// ask. Ceiling: a heavily tinted Space shows a hair of neutral for that one frame.
+    static let pageGround = NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        return NSColor(white: dark ? 0.14 : 0.96, alpha: 1)
+    }
+
+    /// A settings button or popup's fill (45 on 30), 24 tall.
+    static let controlFill = ink(0.08)
+    static let control: CGFloat = 24
+    /// A footer dot for a space that is not the current one (101 on 66, 16px).
+    static let dotFill = ink(0.20)
+
+    /// An app icon in the Settings picker. Big enough that the glass, the shadow and the
+    /// difference between the two fills are all visible — which is the whole reason the
+    /// choice is shown as pictures rather than as a popup of two words.
+    static let appIconPreview: CGFloat = 48
+
+    /// The traffic lights have three faces, and these are the two Timo draws itself.
+    ///
+    /// At rest in the key window: a disc barely lifted off the chrome behind it — a hair
+    /// above a settings card, under a hovered row — with a ring of its own colour at
+    /// `lightRingOpacity`, enough to tell × from − from ⤢ and no more. Ink, so the disc
+    /// takes the space's own wash the way every other surface in the window does.
+    static let lightRestAlpha = 0.09
+    static let lightRest = nsInk(lightRestAlpha)
+    static let lightRingOpacity = 0.25
+    /// In a window that has not got the keyboard: the system's own plain grey, and no
+    /// colour at all. A background window's lights are not a control you are aiming at, so
+    /// they neither wear their colours nor take one from a pointer passing over them.
+    static let lightInactiveAlpha = 0.16
+    static let lightInactive = nsInk(lightInactiveAlpha)
+    static let lightInactiveRingOpacity = 0.0
+    /// The third face is AppKit's own buttons at full strength — the red, yellow and green
+    /// with their glyphs, every other Mac app's — which the two above are faded out to
+    /// reveal the moment the pointer reaches any of the three.
+    static let lightHoverAlpha = 1.0
+    /// Close, minimise, zoom — in AppKit's own button order, so the ring on each disc is
+    /// the colour that light comes up in. macOS's own three.
+    static let lightColours = [
+        NSColor(srgbRed: 1.00, green: 0.37, blue: 0.34, alpha: 1),
+        NSColor(srgbRed: 1.00, green: 0.74, blue: 0.18, alpha: 1),
+        NSColor(srgbRed: 0.16, green: 0.78, blue: 0.25, alpha: 1),
+    ]
+
+    /// Arc's four pages, converted from its colour catalog into Display P3. Hex keys are
+    /// compatibility fallbacks only; the editor and saved palette keep the unclipped values.
+    static let themeSwatches = [
+        "#F2EAE4", "#F29BBB", "#A6729D", "#F25E6B", "#FF8558", "#F8D558", "#34E895", "#6CBAD9", "#666789", "#FEFBFA", "#FFE9F3", "#F1D1EC", "#FFCBD1", "#FFE0D3", "#FFF9E5", "#DEFDEB", "#DCF3FC", "#C5C6E5", "#4E3A5A", "#693558", "#8F4042", "#B16D40", "#D7B35D", "#CDCCA4", "#7AA982", "#226149", "#26456B", "#FFFFFF", "#E6E6E6", "#CCCCCC", "#B2B2B2", "#808080", "#666666", "#333333", "#1A1A1A", "#000000"
+    ]
+    static let themePresetColors: [String: ThemeColor] = [
+        "#F2EAE4": ThemeColor(red: 0.9444217085838318, green: 0.9190871715545654, blue: 0.8967581987380981),
+        "#F29BBB": ThemeColor(red: 0.9014095664024353, green: 0.6234707236289978, blue: 0.7293687462806702),
+        "#A6729D": ThemeColor(red: 0.6209162473678589, green: 0.45569396018981934, blue: 0.6063727736473083),
+        "#F25E6B": ThemeColor(red: 0.8808955550193787, green: 0.4071536660194397, blue: 0.4333076477050781),
+        "#FF8558": ThemeColor(red: 0.9377320408821106, green: 0.5472549796104431, blue: 0.3847135007381439),
+        "#F8D558": ThemeColor(red: 0.949999988079071, green: 0.8399999737739563, blue: 0.42800000309944153),
+        "#34E895": ThemeColor(red: 0.45100000500679016, green: 0.8970000147819519, blue: 0.6119999885559082),
+        "#6CBAD9": ThemeColor(red: 0.4959999918937683, green: 0.7210000157356262, blue: 0.8379999995231628),
+        "#666789": ThemeColor(red: 0.4009999930858612, green: 0.40400001406669617, blue: 0.5270000100135803),
+        "#FEFBFA": ThemeColor(red: 0.9940000176429749, green: 0.984000027179718, blue: 0.9810000061988831),
+        "#FFE9F3": ThemeColor(red: 0.9850000143051147, green: 0.9169999957084656, blue: 0.9509999752044678),
+        "#F1D1EC": ThemeColor(red: 0.9240000247955322, green: 0.824999988079071, blue: 0.9179999828338623),
+        "#FFCBD1": ThemeColor(red: 0.9679999947547913, green: 0.8040000200271606, blue: 0.8220000267028809),
+        "#FFE0D3": ThemeColor(red: 0.9800000190734863, green: 0.8820000290870667, blue: 0.8339999914169312),
+        "#FFF9E5": ThemeColor(red: 0.9959999918937683, green: 0.9769999980926514, blue: 0.906000018119812),
+        "#DEFDEB": ThemeColor(red: 0.8939999938011169, green: 0.9879999756813049, blue: 0.9259999990463257),
+        "#DCF3FC": ThemeColor(red: 0.8799999952316284, green: 0.949999988079071, blue: 0.984000027179718),
+        "#C5C6E5": ThemeColor(red: 0.7739999890327454, green: 0.7760000228881836, blue: 0.8880000114440918),
+        "#4E3A5A": ThemeColor(red: 0.2939999997615814, green: 0.23100000619888306, blue: 0.3449999988079071),
+        "#693558": ThemeColor(red: 0.3840000033378601, green: 0.2199999988079071, blue: 0.3370000123977661),
+        "#8F4042": ThemeColor(red: 0.5220000147819519, green: 0.2669999897480011, blue: 0.2669999897480011),
+        "#B16D40": ThemeColor(red: 0.6549999713897705, green: 0.4390000104904175, blue: 0.28200000524520874),
+        "#D7B35D": ThemeColor(red: 0.8199999928474426, green: 0.7059999704360962, blue: 0.41600000858306885),
+        "#CDCCA4": ThemeColor(red: 0.8040000200271606, green: 0.800000011920929, blue: 0.6589999794960022),
+        "#7AA982": ThemeColor(red: 0.5180000066757202, green: 0.6589999794960022, blue: 0.5220000147819519),
+        "#226149": ThemeColor(red: 0.20399999618530273, green: 0.37599998712539673, blue: 0.2939999997615814),
+        "#26456B": ThemeColor(red: 0.17599999904632568, green: 0.2669999897480011, blue: 0.40799999237060547),
+        "#FFFFFF": ThemeColor(red: 1.0, green: 1.0, blue: 1.0),
+        "#E6E6E6": ThemeColor(red: 0.8999999761581421, green: 0.8999999761581421, blue: 0.8999999761581421),
+        "#CCCCCC": ThemeColor(red: 0.800000011920929, green: 0.800000011920929, blue: 0.800000011920929),
+        "#B2B2B2": ThemeColor(red: 0.699999988079071, green: 0.699999988079071, blue: 0.699999988079071),
+        "#808080": ThemeColor(red: 0.5, green: 0.5, blue: 0.5),
+        "#666666": ThemeColor(red: 0.4000000059604645, green: 0.4000000059604645, blue: 0.4000000059604645),
+        "#333333": ThemeColor(red: 0.20000000298023224, green: 0.20000000298023224, blue: 0.20000000298023224),
+        "#1A1A1A": ThemeColor(red: 0.10000000149011612, green: 0.10000000149011612, blue: 0.10000000149011612),
+        "#000000": ThemeColor(red: 0.0, green: 0.0, blue: 0.0),
+    ]
+
+    /// The strength a space's colour has before anyone touches the slider.
+    static let defaultTint = 0.8
+
+    // MARK: The ground
+
+    /// The usual glass wash, with a smooth stronger range at the slider's upper end.
+    /// A fixed 62% ceiling visibly muted colours compared with Arc at maximum intensity.
+    static func groundOpacity(dark: Bool, strength: Double = defaultTint) -> Double {
+        let base = dark ? 0.62 : 0.78
+        return base + (0.9 - base) * ThemeIntensity.boost(strength)
+    }
+
+    /// Intensity mixes the selected colour with a neutral wash. The strongest settings
+    /// additionally increase opacity, with a small dark-appearance shade correction.
+    nonisolated static func ground(hex: String, dark: Bool, strength: Double = defaultTint)
+        -> (r: Double, g: Double, b: Double)? {
+        guard let h = hsb(hex: hex) else { return nil }
+        let c = rgb(h: h.h, s: h.s, b: h.b)
+        let v = min(max(strength, 0), 1)
+        let shade = dark ? 1 - 0.075 * ThemeIntensity.boost(v) : 1
+        return ((0.5 + (c.r - 0.5) * v) * shade, (0.5 + (c.g - 0.5) * v) * shade,
+                (0.5 + (c.b - 0.5) * v) * shade)
+    }
+
+    static func groundColor(hex: String, dark: Bool, strength: Double) -> Color {
+        guard let c = ground(hex: hex, dark: dark, strength: strength) else { return .clear }
+        return Color(.sRGB, red: c.r, green: c.g, blue: c.b)
+    }
+
+    /// Two grounds mixed, `fraction` of the way from the first to the second. Straight linear
+    /// interpolation in sRGB rather than through hue: the two washes are both nearly black
+    /// (or nearly white), so the arc a hue interpolation takes between them is a detour
+    /// through colours neither Space wears.
+    /// Pure, so `selfcheck --pure` can prove the ends and the middle.
+    nonisolated static func mixed(_ a: (r: Double, g: Double, b: Double),
+                                  _ b: (r: Double, g: Double, b: Double),
+                                  _ fraction: Double) -> (r: Double, g: Double, b: Double) {
+        let f = min(max(fraction, 0), 1)
+        return (a.r + (b.r - a.r) * f, a.g + (b.g - a.g) * f, a.b + (b.b - a.b) * f)
+    }
+
+    /// The window's ground part-way between two Spaces, for the tint cross-fade under a live
+    /// swipe: the sidebar has to already be wearing some of the Space the fingers are pulling
+    /// in, or the colour arrives after the content and the switch reads as two events.
+    /// At `fraction` 0 this is exactly `groundColor(hex:dark:strength:)`.
+    static func groundColor(hex: String, towards other: String, fraction: Double,
+                            dark: Bool, strength: Double) -> Color {
+        guard let a = ground(hex: hex, dark: dark, strength: strength),
+              let b = ground(hex: other, dark: dark, strength: strength)
+        else { return groundColor(hex: hex, dark: dark, strength: strength) }
+        let c = mixed(a, b, fraction)
+        return Color(.sRGB, red: c.r, green: c.g, blue: c.b)
+    }
+
+    /// A Space's ground as gradient stops. One colour is one stop — a flat wash, bit for bit
+    /// what every Space had before the editor could hold more than one — and several are the
+    /// diagonal Arc mixes across the window. Pure.
+    nonisolated static func stops(_ colors: [String], dark: Bool, strength: Double = defaultTint)
+        -> [(r: Double, g: Double, b: Double)] {
+        colors.compactMap { ground(hex: $0, dark: dark, strength: strength) }
+    }
+
+    static func groundStops(_ a: [ThemeColor], towards b: [ThemeColor], fraction: Double,
+                            dark: Bool, strength: Double) -> [Color] {
+        guard !a.isEmpty else { return [] }
+        let f = min(max(fraction, 0), 1)
+        let to = b.isEmpty ? a : b
+        return (0..<max(a.count, to.count)).map { i in
+            let x = a[min(i, a.count - 1)].ground(strength: strength, dark: dark)
+            let y = to[min(i, to.count - 1)].ground(strength: strength, dark: dark)
+            return ThemeColor(red: x.red + (y.red - x.red) * f,
+                              green: x.green + (y.green - x.green) * f,
+                              blue: x.blue + (y.blue - x.blue) * f).color
+        }
+    }
+
+    /// The same, dragged `fraction` of the way towards the Space a swipe is pulling in. The
+    /// shorter palette repeats its last colour rather than losing a stop: a two-colour Space
+    /// swiped into a one-colour one arrives as a flat wash, instead of the gradient
+    /// collapsing to half its length halfway through the gesture.
+    nonisolated static func stops(_ a: [String], towards b: [String], fraction: Double,
+                                  dark: Bool, strength: Double)
+        -> [(r: Double, g: Double, b: Double)] {
+        let from = stops(a, dark: dark, strength: strength)
+        let to = stops(b, dark: dark, strength: strength)
+        guard !from.isEmpty, !to.isEmpty, fraction != 0 else { return from }
+        let f = min(max(fraction, 0), 1)
+        return (0..<max(from.count, to.count)).map {
+            mixed(from[min($0, from.count - 1)], to[min($0, to.count - 1)], f)
+        }
+    }
+
+    /// `stops`, as colours a gradient can be built from.
+    static func groundStops(_ a: [String], towards b: [String], fraction: Double,
+                            dark: Bool, strength: Double) -> [Color] {
+        stops(a, towards: b, fraction: fraction, dark: dark, strength: strength)
+            .map { Color(.sRGB, red: $0.r, green: $0.g, blue: $0.b) }
+    }
+
+    /// A tile of static noise, laid over the ground at `grain` × `grainMax`. Arc's themes
+    /// have a faint film grain over the wash; this is that, and nothing else.
+    ///
+    /// ponytail: one 256pt tile of white pixels at a fixed pseudo-random alpha, generated
+    /// once and tiled by the image view. Deliberately *static* — a per-frame shader would be
+    /// a real graphics project, and grain that crawls is a distraction rather than a texture.
+    /// 256 and not 64: a 64pt tile repeated across a window reads as a pattern — the eye
+    /// finds the same clump every 64pt — and at 256pt it does not.
+    @MainActor static let grain: NSImage = {
+        let n = 256
+        // The context owns its own buffer: a Swift array's pointer is only valid inside
+        // `withUnsafeMutableBytes`, and `makeImage()` reads it after that closure returns.
+        guard let ctx = CGContext(data: nil, width: n, height: n, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let pixels = ctx.data?.bindMemory(to: UInt8.self, capacity: ctx.bytesPerRow * n)
+        else { return NSImage() }
+        // A fixed seed, so the tile is the same every launch and never flickers between two
+        // windows drawing it at once.
+        var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
+        for y in 0..<n {
+            for x in 0..<n {
+                // splitmix64, not a bare LCG: an LCG's neighbouring outputs are correlated
+                // enough that the noise showed faint diagonal streaks.
+                seed &+= 0x9E37_79B9_7F4A_7C15
+                var z = seed
+                z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+                z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+                z ^= z >> 31
+                let v = UInt8(truncatingIfNeeded: z >> 56)
+                // Premultiplied white: the alpha is the noise, so the tile lightens the
+                // ground where it is bright and leaves it alone where it is not.
+                for c in 0..<4 { pixels[y * ctx.bytesPerRow + x * 4 + c] = v }
+            }
+        }
+        guard let image = ctx.makeImage() else { return NSImage() }
+        return NSImage(cgImage: image, size: CGSize(width: n, height: n))
+    }()
+
+    /// How much of the noise a `grain` of 1 actually shows. Past this it stops reading as a
+    /// texture on the wash and starts reading as a broken screen.
+    static let grainMax: Double = 0.05
+
+    /// `#RRGGBB` → hue (0…1), saturation, brightness. Nil for anything else.
+    nonisolated static func hsb(hex: String) -> (h: Double, s: Double, b: Double)? {
+        var v: UInt64 = 0
+        let digits = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        guard digits.count == 6, Scanner(string: digits).scanHexInt64(&v) else { return nil }
+        let r = Double((v >> 16) & 0xFF) / 255, g = Double((v >> 8) & 0xFF) / 255, b = Double(v & 0xFF) / 255
+        let hi = max(r, g, b), lo = min(r, g, b), d = hi - lo
+        guard hi > 0, d > 0 else { return (0, 0, hi) }
+        var h: Double
+        if hi == r { h = (g - b) / d } else if hi == g { h = 2 + (b - r) / d } else { h = 4 + (r - g) / d }
+        h /= 6
+        if h < 0 { h += 1 }
+        return (h, d / hi, hi)
+    }
+
+    nonisolated static func rgb(h: Double, s: Double, b: Double) -> (r: Double, g: Double, b: Double) {
+        let i = Int(h * 6) % 6, f = h * 6 - Double(Int(h * 6))
+        let p = b * (1 - s), q = b * (1 - s * f), t = b * (1 - s * (1 - f))
+        switch i {
+        case 0: return (b, t, p)
+        case 1: return (q, b, p)
+        case 2: return (p, b, t)
+        case 3: return (p, q, b)
+        case 4: return (t, p, b)
+        default: return (b, p, q)
+        }
+    }
+
+    // MARK: Floating surfaces
+
+    /// Dims the page behind the command bar, so what is being typed reads as the only live
+    /// thing on screen. Black rather than a material: it must darken, not blur again.
+    /// Light: Arc hardly dims the page, and the bar's own shadow does most of the lifting.
+    static let scrimOpacity = 0.12
+    static let scrim = Color.black.opacity(scrimOpacity)
+    /// The bar's ground: Arc's is #141414 and all but opaque (20 over a black page, 23 over
+    /// a (22,22,24) one). Always dark, whatever the appearance — the bar forces its colour
+    /// scheme — so these are plain white alphas, not `ink`.
+    static let barFill = Color(white: 0.08).opacity(0.96)
+    /// The one blur allowed on a floating surface, *under* `barFill`. Arc's bar is flat —
+    /// no Liquid Glass, no specular rim, no refraction — but the page behind it is still
+    /// softened rather than merely dimmed, which is what this does and all it does.
+    static let barMaterial = AnyShapeStyle(Material.regular)
+    /// The bar's stroke (74 on 20): brighter than a hairline because it sits on the darkest
+    /// surface in the app and has a shadow outside it to hold against.
+    static let barStroke = Color.white.opacity(0.22)
+    /// Command bar row fills (42 on 20). Quieter than the sidebar's: the bar's ground is
+    /// already dark, and a strong grey block there reads as a button, not a highlight.
+    static let barSelected = Color.white.opacity(0.10)
+    static let barHovered = Color.white.opacity(0.05)
+    /// The "→" chip (32 on 20). On the selected row Arc's chip is the row's own fill; one
+    /// step over whatever it sits on says the same thing.
+    static let chipFill = Color.white.opacity(0.05)
+    /// The bar's type: a title (208 on 20), the placeholder (149), a trailing verb (97), and
+    /// the selected row's, which is white.
+    static let barText = Color.white.opacity(0.80)
+    static let barPlaceholder = Color.white.opacity(0.55)
+    static let barTrailing = Color.white.opacity(0.33)
+    static let barGlyph = Color.white.opacity(0.68)
+    static let barSelectedText = Color.white
+    static let barShadow = Color.black.opacity(0.5)
+    static let barShadowRadius: CGFloat = 30
+    static let barShadowY: CGFloat = 12
+    /// The small floaters inside the card — find, the save-password prompt. Lighter and
+    /// tighter than the bar's: they sit on the page, not over the whole window.
+    static let floatShadow = Color.black.opacity(0.3)
+    static let floatShadowRadius: CGFloat = 12
+    static let floatShadowY: CGFloat = 4
+    /// How far down the slot a lifted row leaves goes: still a row, plainly not the one in
+    /// your hand.
+    static let lifted: Double = 0.3
+    // Motion. Short and easing out: a fill should arrive under the pointer, never chase it.
+    /// Hover and selection fills.
+    static var quick: Animation { .easeOut(duration: UIAnimation.feedback.duration(0.15)) }
+    /// The address pill crossfades its host while the search prompt slides in from the left.
+    static var pillChange: Animation { .easeOut(duration: UIAnimation.feedback.duration(0.18)) }
+    static let pillPromptTravel: CGFloat = 16
+    /// Frequent pointer feedback should finish before the next action begins.
+    static var feedback: Animation { .easeOut(duration: UIAnimation.feedback.duration(0.12)) }
+    /// A floating surface appearing: scale from `appearScale` and fade, together. The
+    /// duration is spelled out because a surface that is a *window* of its own — a Peek —
+    /// has to stay alive for exactly as long as its own fade, and `Animation` will not say.
+    static var appearDuration: Double { UIAnimation.surfaces.duration(0.15) }
+    static var appear: Animation { .easeOut(duration: appearDuration) }
+    /// Peek keeps its opening spring while following the floating-panel speed.
+    static var peekAppear: Animation {
+        .spring(duration: UIAnimation.surfaces.duration(0.28), bounce: 0.12)
+    }
+    static var sidebarAnimation: Animation { .easeOut(duration: UIAnimation.sidebar.duration(0.2)) }
+    /// Keep a small spring on reveal and dismissal without the pronounced edge rebound.
+    static var floatingSidebarAnimation: Animation {
+        .spring(duration: UIAnimation.sidebar.duration(0.18), bounce: 0.08)
+    }
+    static let appearScale: CGFloat = 0.97
+    /// The tab list changing shape: a row arriving, leaving, or moving between sections. A
+    /// touch of spring, the way Arc's rows settle, but short enough that ⌘W ⌘W ⌘W never
+    /// queues up behind itself.
+    /// The duration is spelled out because the row you are dragging glides into its slot
+    /// when you let go, and the real row can only come back once it has arrived.
+    static let defaultListSeconds: Double = 0.28
+    static var listSeconds: Double { UIAnimation.tabList.duration(defaultListSeconds) }
+    static var list: Animation { .spring(duration: listSeconds, bounce: 0.12) }
+    /// Closing should finish near the departing row's fade, without a reorder spring's tail.
+    static var tabClose: Animation { .easeOut(duration: UIAnimation.tabClosing.duration(0.14)) }
+    /// Today rows fade away before their neighbours finish sliding into the gap.
+    static var tabRemovalFade: Animation { .easeOut(duration: UIAnimation.tabClosing.duration(0.08)) }
+    /// The status bar: how long a link is hovered before its url appears, and how fast the
+    /// capsule fades either way.
+    static let statusDelay: Double = 1.5
+    static var statusFade: Animation { .easeOut(duration: UIAnimation.status.duration(0.18)) }
+    /// The status capsule's inset from the card's corner, its height, and the longest url it
+    /// shows before the middle is elided.
+    static let statusInset: CGFloat = 8
+    static let statusHeight: CGFloat = 24
+    static let statusMaxChars = 72
+    /// A favourite tile appearing or leaving the grid grows in place rather than sliding.
+    static let tileAppearScale: CGFloat = 0.6
+
+    // The AI rename shimmer: a pinned row's long page title being replaced by the short name
+    // the on-device model came back with. The old name fades and the new one is wiped
+    // in from the left, because a row
+    // that renames itself silently, seconds after the page loaded, reads as the wrong tab.
+    //
+    // Only ever for a *model* answer. An ordinary title change — a page navigating, a
+    // single-page app swapping its `<title>` — is not an event about the row and gets none
+    // of this. See `Tab.noteAITitle`.
+    /// How long the new name takes to be wiped in, left to right.
+    static let shimmerDuration: Double = 0.5
+    static let shimmerSweep = Animation.easeOut(duration: shimmerDuration)
+    /// How soft the wiping edge is, as a fraction of the title's own width: a hard edge
+    /// reads as clipping, a wide one as a fade with no direction in it.
+    static let shimmerEdge: CGFloat = 0.16
+    /// The old name leaving. Shorter than the wipe, so the two overlap rather than queue.
+    static let shimmerFadeDuration: Double = 0.18
+    static let shimmerFade = Animation.easeOut(duration: shimmerFadeDuration)
+
+    // The recent tab switcher (⌃⇥): up to five cards in a row over the page, a favicon
+    // over two lines of title each.
+    static let switcherCard: CGFloat = 120
+    static let switcherCardHeight: CGFloat = 92
+    static let switcherIcon: CGFloat = 24
+    /// ⌃ held shorter than this is a tap — switch, but never draw the row.
+    static let switcherDelay: Double = 0.15
+    /// A press held this long on back or forward opens that direction's history instead of
+    /// stepping once. Long enough that an ordinary click never opens a menu, short enough
+    /// that holding does not feel like waiting for something broken.
+    static let holdDelay: Double = 0.4
+
+    // The mini audio player: a pill above the sidebar's footer, a shade taller than a row
+    // so the artwork and the transport glyphs sit in it without crowding.
+    static let trayHeight: CGFloat = 40
+    /// Its transport glyphs — a step under a row's, because there are three of them in a
+    /// strip the width of a sidebar.
+    static let trayGlyph = Font.system(size: 12, weight: .semibold)
+    /// A title too long for the tray scrolls: points per second, and how long it rests at
+    /// each end before turning round.
+    static let marqueeSpeed: Double = 22
+    static let marqueePause: Double = 1.2
+    /// Smaller than this on screen and a video is a thumbnail, a hero loop or an ad, not
+    /// what the user was watching: auto picture-in-picture leaves those alone rather than
+    /// filling the corner of the screen with junk on every tab switch. Arc's rule by eye.
+    static let minAutoPiP = CGSize(width: 200, height: 120)
+
+    // Toasts: a pill above the sidebar's footer, gone after `Prefs.toastSeconds` —
+    // `toastDuration` is where that starts — unless the pointer is holding it there.
+    static let toastHeight: CGFloat = 32
+    static let toastDuration: Double = 3
+    /// Quit confirmation: a dark glass card, with room outside its hosting view's content
+    /// for the soft shadow to fade instead of being cut at the card's bounds.
+    static let quitDialogWidth: CGFloat = 440
+    static let quitDialogIcon: CGFloat = 48
+    static let quitDialogRadius: CGFloat = 20
+    static let quitShadowInset: CGFloat = 64
+    static let quitCardFill = Color(red: 0.065, green: 0.07, blue: 0.08)
+    /// The scrim under the card: how much it darkens the page, and how far it blurs it.
+    /// The window remains recognizable, while page text recedes behind the question.
+    static let quitScrim: CGFloat = 0.50
+    static let quitBlur: CGFloat = 14
+    /// The scrim blurs a picture of the window rather than the window itself, and takes it
+    /// this much smaller than the window is: a quarter of the pixels is a quarter of the
+    /// work, and the blur drawn back over them hides every one that shrinking lost.
+    static let quitBlurScale: CGFloat = 2
+    /// How much of the space's colour washes over the pill's dark ground.
+    static let toastTint: Double = 0.45
+
+    // Peek: a floating page centered inside the browser's content area.
+    /// Of the content area, each way; a narrow page also leaves room for the button rail.
+    static let peekFraction: CGFloat = 0.8
+    static let peekButtonSize: CGFloat = 36
+    static let peekButtonGap: CGFloat = 10
+    static let peekButtonGlyph = Font.system(size: 16, weight: .semibold)
+    /// Its scrim. Deliberately not `Look.scrim`: that one sits under a 760pt bar in the
+    /// middle of the window, where the page around it is plainly still there. A Peek covers
+    /// four fifths of the window, so the strip left over has to read as *behind* on its own,
+    /// and at 0.12 it read as a page that had simply gone a shade darker.
+    static let peekScrim = Color.black.opacity(0.3)
+    /// How long after a Peek closes Archive ▸ Reopen Last Peek still offers it. Long
+    /// enough for the Escape you did not mean, short enough that it is never a surprise.
+    static let peekReopen: Double = 8
+}
+
+extension Look {
+    /// The chrome's geometry and the ground derivation, proved offline. These are the
+    /// numbers a screenshot is measured against, so a change to one of them should fail
+    /// here before anyone has to look.
+    nonisolated static func check() -> [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        out.append(("the lights' centre line is the sidebar top row's centre line",
+                    lightsCentre == topInset + topRow / 2))
+
+        // The external-app card's three buttons on one line. Measured rather than
+        // eyeballed: the strings are ours, the metrics are the system's, and a row that
+        // does not fit does not overflow — AppKit stacks it into a column and the card
+        // stops looking like a card. Text measurement needs fonts, not a window server, so
+        // it is fair game in the pure pass.
+        let titles = ["Cancel", "Always Allow", "Allow"]
+        let font = Typography.body.native
+        let words = titles.reduce(0 as CGFloat) {
+            $0 + NSAttributedString(string: $1, attributes: [.font: font]).size().width
+        }
+        let row = words + CGFloat(titles.count) * buttonPadding
+            + CGFloat(titles.count - 1) * inset
+        out.append(("Cancel, Always Allow and Allow fit the app-prompt card on one line",
+                    row <= appPrompt - paneMargin * 2))
+        // 800 stands for the window's top edge wherever AppKit parented the buttons; only
+        // the offset from it matters, which is what makes the arithmetic testable at all.
+        out.append(("a 14pt light's origin puts its centre on that line",
+                    TimoWindow.lightOriginY(windowTop: 800, buttonHeight: 14) == 800 - lightsCentre - 7))
+        out.append(("the offset is from the top edge, not from the window's height",
+                    TimoWindow.lightOriginY(windowTop: 100, buttonHeight: 14)
+                        == TimoWindow.lightOriginY(windowTop: 800, buttonHeight: 14) - 700))
+        out.append(("a bigger light still centres on the same line",
+                    TimoWindow.lightOriginY(windowTop: 800, buttonHeight: 20)
+                        == TimoWindow.lightOriginY(windowTop: 800, buttonHeight: 14) - 3))
+        out.append(("Little Arc's bar puts its pill on the same lights' line as the sidebar",
+                    littleTopInset + pillHeight / 2 == lightsCentre))
+        out.append(("…so its whole bar is 41pt, the sidebar's row pitch",
+                    littleTopInset + pillHeight == rowHeight + rowGap))
+        // The popup threshold, against the window it opens into. A page asking for a window
+        // bigger than the one it would get is asking for a page, not a dialog.
+        out.append(("the dialog classification stays within the established compact bounds",
+                    popupWidth <= littleWidth && popupHeight <= littleHeight))
+        out.append(("…and every OAuth sheet on the web is inside it: Apple's 600×600 is the widest",
+                    popupWidth >= 600 && popupHeight >= 600))
+        out.append(("the sidebar is laid out on Arc's 41pt row pitch", rowHeight + rowGap == 41))
+        out.append(("the top strip is Arc's 45pt", topInset + topRow + inset == 45))
+        out.append(("the divider and its two gaps occupy 31pt",
+                    tidyRow + sectionGap == 31))
+        out.append(("the footer glyphs sit 24pt above the window's bottom edge",
+                    footer / 2 + footerInset == 24))
+        out.append(("rows and the bar share one radius", pillRadius == barRadius))
+        // The bar with nothing typed: a few recent tabs and one row to report a problem.
+        out.append(("the bar at rest is a glance at the recent tabs, not the whole strip",
+                    barEmptyTabs >= 4 && barEmptyTabs < tidyThreshold))
+        out.append(("…and it never opens scrolling: those tabs and the row under them fit",
+                    barEmptyTabs + 1 <= barVisibleRowsRange.lowerBound
+                        && barVisibleRowsRange.contains(barVisibleRows)
+                        && clampedVisibleRows(0) == barEmptyTabs + 1
+                        && clampedVisibleRows(99) == 12))
+        out.append(("the search bar's top stays on screen at any saved position",
+                    barTopRange.contains(barTop) && clampedBarTop(-1) == 0.05
+                        && clampedBarTop(2) == 0.5))
+        out.append(("a stand-in letter fills a favicon's box without touching its edges",
+                    letterScale > 0.5 && letterScale < 1))
+        out.append(("housekeeping waits for a pile: more tabs than fit in a glance, "
+                    + "fewer than a window nobody could work in",
+                    tidyThreshold >= 4 && tidyThreshold <= 12))
+        out.append(("the tidy spinner fits inside the line it stands in, and is still visible",
+                    tidySpinnerScale > 0.4 && tidySpinnerScale * 16 <= tidyRow))
+        // The AI rename shimmer. Long enough to be seen on a row you are not looking
+        // straight at, short enough that it is over before you have read the new name.
+        out.append(("a renamed row's shimmer is a beat, not an animation to sit through",
+                    shimmerDuration > 0.2 && shimmerDuration < 1))
+        out.append(("the old name is gone before the new one is fully in",
+                    shimmerFadeDuration > 0 && shimmerFadeDuration < shimmerDuration))
+        out.append(("the wiping edge is soft, and still an edge",
+                    shimmerEdge > 0 && shimmerEdge < 0.5))
+        // An extension action's badge, which is drawn over the 16pt icon it belongs to.
+        out.append(("an action badge is shorter than the icon it sits on", badgeHeight < rowIcon))
+        out.append(("…and a full one cannot reach the glyph beside it",
+                    badgeWidth + badgeOffset < rowIcon + pillGlyphGap))
+        out.append(("…so its widest is still narrower than a chip", badgeWidth < chip))
+        out.append(("…and it has room for a digit inside its own height",
+                    badgeWidth > badgeHeight && badgeInset * 2 < badgeHeight))
+        out.append(("badge type is the smallest in the app, and shrinks rather than clipping",
+                    badgeShrink > 0 && badgeShrink < 1))
+        // A live folder's source mark, which is drawn in the corner of the folder's glyph.
+        out.append(("a live folder's mark leaves the folder under it readable as a folder",
+                    sourceBadge < tileIcon))
+        out.append(("…and is a mark rather than the permission dot on the lock",
+                    sourceBadge > badge))
+        out.append(("…and hangs off the glyph's corner rather than floating clear of it",
+                    sourceBadgeOffset > 0 && sourceBadgeOffset < sourceBadge))
+        out.append(("the live folder callout is narrower than the Site Control Center and "
+                    + "stays up longer than a toast",
+                    calloutWidth < siteWidth && calloutDuration > toastDuration))
+        out.append(("a button that cannot be pressed fades without disappearing",
+                    dimmed > 0 && dimmed < 1))
+        out.append(("a pane's pill has room for a favicon and a corner of its own",
+                    panePillRadius > 0 && rowHeight - paneInset * 2 > rowIcon))
+        // The empty page area. It is drawn *inside* the card, so it takes the card's corner
+        // and the card's gap for nothing — which is the point: the first page to arrive
+        // lands exactly where the outline stood, and a pane in a split still tucks inside.
+        out.append(("the empty page area takes the page card's own corner, and a split's panes "
+                    + "sit inside it",
+                    paneRadius < pageRadius && cardGap > inset))
+        out.append(("the page card's corner is the generous one, not a settings card's — it is "
+                    + "the only one read against the window's own",
+                    pageRadius > cardRadius))
+        out.append(("a pane inside a split takes a tighter corner, and it is still a round one",
+                    paneRadius < pageRadius && paneRadius > cardRadius))
+        out.append(("its fill is a tone on the ground, not a panel: above a settings card, "
+                    + "below a hovered row",
+                    emptyPaneFillAlpha > cardFillAlpha && emptyPaneFillAlpha < hoveredAlpha))
+        out.append(("the floating sidebar sits closer to the window than the page card",
+                    floatingSidebarGap > 0 && floatingSidebarGap < cardGap))
+        // The traffic lights at rest: three grey discs, each ringed in its own colour, with
+        // AppKit's full-colour buttons showing through the moment the pointer arrives.
+        out.append(("there is a rest colour for each of the three lights", lightColours.count == 3))
+        out.append(("a light's disc fits the top row it sits on",
+                    lightDisc > 0 && lightDisc < topRow))
+        out.append(("…and its ring is the window's one-point line, well inside that disc",
+                    lightRing == 1 && lightRing < lightDisc / 2))
+        out.append(("the lights at rest are dimmer than their hover fill",
+                    lightRestAlpha < lightHoverAlpha && lightRingOpacity < lightHoverAlpha))
+        out.append(("a resting disc is barely lifted off the chrome: over a card's fill, "
+                    + "under a hovered row",
+                    lightRestAlpha > cardFillAlpha && lightRestAlpha < hoveredAlpha))
+        out.append(("a background window's lights are the system's plain grey, and wear no "
+                    + "colour at all",
+                    lightInactiveRingOpacity == 0 && lightRingOpacity > lightInactiveRingOpacity
+                        && lightInactiveAlpha > lightRestAlpha
+                        && lightInactiveAlpha < selectedAlpha))
+        // A row's × is a button sitting inside a bigger button: the row itself. Anything
+        // smaller than a control is a glyph you have to aim at, and the row catches the miss
+        // by *showing* the tab you were trying to close.
+        out.append(("a row's × is something to aim at: a control, not a bare glyph",
+                    rowTarget >= control && rowTarget < rowHeight))
+        // Two `rowSpacing` gaps sit between a row's title and its trailing glyphs — the
+        // label, the Spacer that can go to nothing, and the glyphs — so a title that
+        // truncates stops clear of the × rather than running under it.
+        out.append(("a long row title stops clear of the ×, not under it",
+                    rowSpacing * 2 >= rowInset
+                        && rowTarget + rowSpacing * 2 + rowTrailingInset < sidebarWidth))
+        out.append(("the quit card starts wider than its margins and shows a real icon",
+                    quitDialogWidth > paneMargin * 4 && quitDialogIcon >= control * 2))
+        out.append(("the quit scrim keeps the window recognizable while softening page text",
+                    quitScrim > 0.2 && quitScrim < 0.6 && quitBlur >= 8 && quitBlur <= 24))
+        out.append(("…on a picture small enough to be cheap, big enough to still blur",
+                    quitBlurScale >= 2 && quitBlurScale <= 4 && quitBlur >= quitBlurScale))
+        // Narrow sidebars place action controls below the toast's sentence.
+        let face = Typography.result.native
+        func measure(_ s: String) -> CGFloat {
+            (s as NSString).size(withAttributes: [.font: face]).width
+        }
+        let column = SidebarWidth.minimum - inset * 2 - pillInset - inset / 2
+        out.append(("a narrow toast's controls fit below its sentence",
+                    measure("Releases") + inset * 3 + rowTarget < column))
+        for sentence in ["Timo v10.10.100 is available", "Restart to update", "Update failed",
+                         "Couldn't move Timo to Applications",
+                         "This copy isn't signed for updates",
+                         "Archived hello world - a long page title"] {
+            out.append(("two lines is enough for “\(sentence)”", column * 2 >= measure(sentence)))
+        }
+        // ...and a short one hugs its words the way Arc's little pill does, rather than
+        // stretching to the sidebar's edge.
+        let oneRow = pillInset + measure("Copied URL") + inset + (measure("Undo") + inset * 2)
+            + inset + rowTarget + inset / 2
+        out.append(("a short toast, its verb and its × sit on one row with room to spare",
+                    oneRow < sidebarWidth - inset * 2))
+        out.append(("a held back button opens its history well after an ordinary click ends",
+                    holdDelay > switcherDelay && holdDelay <= 0.5))
+        out.append(("a dragged row’s default settling time stays brief",
+                    defaultListSeconds > 0 && defaultListSeconds <= 0.4))
+        out.append(("the slot it left is dimmed, not emptied — the list keeps its shape",
+                    lifted > 0 && lifted < 0.5))
+        out.append(("the command bar's rows keep Arc's 50pt pitch", barRowHeight + barRowGap == 50))
+        // The mini audio player. It sits above the footer inside the sidebar's own padding,
+        // so its height is what decides whether the list is ever covered by it.
+        out.append(("the media tray is taller than a row but shorter than a tile",
+                    trayHeight > rowHeight && trayHeight < tileHeight))
+        out.append(("the tray and the footer both fit above the window's bottom edge",
+                    trayHeight + footer + footerInset * 2 + inset < 120))
+        out.append(("a title scrolls at a readable pace and rests at each end",
+                    marqueeSpeed > 10 && marqueeSpeed < 60 && marqueePause >= 1))
+        out.append(("a thumbnail video is below the auto picture-in-picture floor",
+                    minAutoPiP.width >= 200 && minAutoPiP.height >= 120))
+        out.append(("the bar's icon column is centred at 30",
+                    barInset + barRowInset + rowIcon / 2 == 30))
+        // The Library's pane runs to the window's top edge, so its search field's centre is
+        // its own top padding plus half its height — and that has to be the lights' line, or
+        // the top of the window reads as two rows that nearly agree.
+        out.append(("the Library's search field is centred on the traffic lights' line",
+                    libraryHead + libraryField / 2 == lightsCentre))
+        out.append(("…with room above it, so the field is not pushed off the top",
+                    libraryHead > 0))
+        out.append(("a Library row holds its thumbnail with air around it",
+                    libraryRow - libraryThumb >= inset * 2))
+        out.append(("the panel is the sidebar's width and a bit, not the whole window",
+                    libraryRail + libraryList > sidebarWidth
+                        && libraryRail + libraryList < sidebarWidth * 2))
+        out.append(("a Space's card is narrower than the list column beside the rail",
+                    spaceCard < libraryList))
+        out.append(("the media masonry's two columns and their gaps fill the list column",
+                    mediaColumn * CGFloat(mediaColumns) + inset * 3 == libraryList))
+        out.append(("a rail tile fits inside the rail with its margins",
+                    libraryTile + inset * 2 <= libraryRail))
+
+        // The ground. Tolerances are ±2/255: what a screenshot can be measured to.
+        func near(_ v: Double, _ want: Double) -> Bool { abs(v * 255 - want) <= 2 }
+        let blue = ground(hex: "#5A9BD5", dark: true)
+        out.append(("intensity zero is a neutral wash", ground(hex: "#5A9BD5", dark: true, strength: 0).map { $0 == (0.5, 0.5, 0.5) } == true))
+        out.append(("light intensity one retains the selected colour", ground(hex: "#5A9BD5", dark: false, strength: 1).map { near($0.r, 90) && near($0.g, 155) && near($0.b, 213) } == true))
+        out.append(("the slider changes brightness as well as saturation", blue.map { $0.b > 0.5 && $0.r < 0.5 } == true))
+        out.append(("invalid colours have no ground", ground(hex: "sky", dark: true) == nil))
+
+        // The tint cross-fade a live Space swipe drags the ground through.
+        let red = ground(hex: "#D9564F", dark: true), green = ground(hex: "#4CAF6E", dark: true)
+        /// The two grounds and a fraction, or false if either colour failed to resolve —
+        /// which is itself worth failing on, and beats a force-unwrap in a check.
+        func mixing(_ f: Double, _ ok: (_ m: (r: Double, g: Double, b: Double),
+                                        _ a: (r: Double, g: Double, b: Double),
+                                        _ b: (r: Double, g: Double, b: Double)) -> Bool) -> Bool {
+            red.map { a in green.map { b in ok(mixed(a, b, f), a, b) } == true } == true
+        }
+        func same(_ a: (r: Double, g: Double, b: Double),
+                  _ b: (r: Double, g: Double, b: Double)) -> Bool {
+            near(a.r, b.r * 255) && near(a.g, b.g * 255) && near(a.b, b.b * 255)
+        }
+        out.append(("no swipe means the space's own ground, untouched",
+                    mixing(0) { m, a, _ in m == a }))
+        out.append(("a completed swipe means the neighbour's",
+                    mixing(1) { m, _, b in same(m, b) }))
+        out.append(("half way is half way on every channel", mixing(0.5) { m, a, b in
+            near(m.r, (a.r + b.r) / 2 * 255) && near(m.g, (a.g + b.g) / 2 * 255)
+                && near(m.b, (a.b + b.b) / 2 * 255)
+        }))
+        out.append(("a rubber band past the end cannot push the ground past the neighbour",
+                    mixing(4) { m, _, b in same(m, b) } && mixing(-4) { m, a, _ in m == a }))
+        // Several colours: the gradient the theme editor's extra dots make.
+        out.append(("one colour is one stop, and it is the flat wash it always was",
+                    stops(["#5A9BD5"], dark: true).count == 1
+                        && stops(["#5A9BD5"], dark: true).first.map { s in
+                            blue.map { same(s, $0) } == true } == true))
+        out.append(("each colour brings its own stop, in the order they were picked",
+                    stops(["#D9564F", "#4CAF6E"], dark: true).count == 2
+                        && red.map { a in same(stops(["#D9564F", "#4CAF6E"], dark: true)[0], a) } == true))
+        out.append(("a colour that is not #RRGGBB is not a stop",
+                    stops(["#4CAF6E", "sky"], dark: true).count == 1))
+        out.append(("a space with no colours has no stops and so no ground",
+                    stops([], dark: true).isEmpty))
+        out.append(("no swipe leaves every stop exactly where it was",
+                    stops(["#D9564F", "#4CAF6E"], towards: ["#5A9BD5"], fraction: 0,
+                          dark: true, strength: defaultTint).count == 2))
+        out.append(("a completed swipe into a one-colour space is that one colour, twice",
+                    blue.map { b in
+                        let s = stops(["#D9564F", "#4CAF6E"], towards: ["#5A9BD5"], fraction: 1,
+                                      dark: true, strength: defaultTint)
+                        return s.count == 2 && same(s[0], b) && same(s[1], b)
+                    } == true))
+        out.append(("swiping the other way pads the short palette rather than dropping a stop",
+                    stops(["#5A9BD5"], towards: ["#D9564F", "#4CAF6E"], fraction: 0.5,
+                          dark: true, strength: defaultTint).count == 2))
+        out.append(("half a swipe is half way on every stop",
+                    red.map { a in blue.map { b in
+                        let s = stops(["#D9564F"], towards: ["#5A9BD5"], fraction: 0.5,
+                                      dark: true, strength: defaultTint)
+                        return s.count == 1 && near(s[0].r, (a.r + b.r) / 2 * 255)
+                    } == true } == true))
+        out.append(("a rubber band past the end cannot push the stops past the neighbour",
+                    blue.map { b in
+                        let s = stops(["#D9564F"], towards: ["#5A9BD5"], fraction: 9,
+                                      dark: true, strength: defaultTint)
+                        return s.count == 1 && same(s[0], b)
+                    } == true))
+        out.append(("hsb round-trips a pure red", {
+            guard let h = hsb(hex: "#FF0000") else { return false }
+            let c = rgb(h: h.h, s: h.s, b: h.b)
+            return near(c.r, 255) && near(c.g, 0) && near(c.b, 0)
+        }()))
+        return out
+    }
+
+    /// The saturation of an rgb triple, for the checks above.
+    nonisolated private static func hsbOf(_ c: (r: Double, g: Double, b: Double)) -> (s: Double, b: Double) {
+        let hi = max(c.r, c.g, c.b), lo = min(c.r, c.g, c.b)
+        return (hi > 0 ? (hi - lo) / hi : 0, hi)
+    }
+}
+
+extension Color {
+    /// `#RRGGBB` as written in a Profile or a Space. ponytail: no alpha, no short form — the
+    /// only producers of these strings are `Look.themeSwatches` and `ProfileManager.palette`.
+    init?(hex: String) {
+        var v: UInt64 = 0
+        let digits = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        guard digits.count == 6, Scanner(string: digits).scanHexInt64(&v) else { return nil }
+        self.init(.sRGB,
+                  red: Double((v >> 16) & 0xFF) / 255,
+                  green: Double((v >> 8) & 0xFF) / 255,
+                  blue: Double(v & 0xFF) / 255)
+    }
+}
+
+/// Behind-window blur for the window and floating sidebar — the desktop shows through
+/// either sidebar presentation. This is the only blur treatment in the window chrome:
+/// every control on top of it is a flat fill from `Look`, the way Arc's are. Floating
+/// surfaces add `Look.barMaterial` under `Look.barFill`, never Liquid Glass.
+/// `.fullScreenUI` because it is the most transparent material AppKit has (44 % opaque in a
+/// probe over white and black; `.underWindowBackground` read as good as opaque), and the
+/// whole point is the wallpaper reading through `Look.groundColor` on top of it.
+struct WindowGlass: NSViewRepresentable {
+    var material: NSVisualEffectView.Material = .fullScreenUI
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = material
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) { v.material = material }
+}
+
+/// A one-pixel horizontal rule in the hairline colour. `Divider()` picks its own colour
+/// and the card stroke would not match it.
+struct Hairline: View {
+    var body: some View { Rectangle().fill(Look.hairline).frame(height: 1) }
+}
+
+extension View {
+    /// The 1px line around a card, a field, the command bar. `strokeBorder` keeps the whole
+    /// pixel inside the shape, so it never blurs against the fill's antialiased edge.
+    func hairline(radius: CGFloat, _ color: Color = Look.hairline) -> some View {
+        overlay { RoundedRectangle(cornerRadius: radius).strokeBorder(color, lineWidth: 1) }
+    }
+}

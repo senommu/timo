@@ -1,0 +1,278 @@
+import AppKit
+import Combine
+import UniformTypeIdentifiers
+
+struct BackupCandidate: Identifiable, Sendable {
+    var id: UUID { archive.id }
+    var archive: BackupArchive
+    var incoming: BackupPreview
+    var current: BackupPreview?
+    var currentError: String?
+}
+
+@MainActor final class BackupController: ObservableObject {
+    static let shared = BackupController(library: BackupLibrary(directory: Store.directory,
+        defaults: .timo, domain: UserDefaults.timoDomain), flush: {
+            await flushPersistence(allowDamagedOriginals: false)
+        }, restart: BackupRestart.run, finalDrain: flushPersistence)
+
+    /// Drain accepted edits before capturing the final session. An unreadable original
+    /// with no admitted edit can be preserved for repair; a failed write cannot.
+    private static func flushPersistence(allowDamagedOriginals: Bool) async -> Bool {
+        await ImportOperations.drain()
+        await PendingSessionTransactions.drain()
+        await ProfileManager.shared.waitForTransactions()
+        await Library.waitForMoves()
+        let profiles = ProfileManager.shared.retryProfileSave()
+        do {
+            if allowDamagedOriginals { try await EaselStore.drainAllPendingWrites(directory: Store.directory) }
+            else { try await EaselStore.flushAll(directory: Store.directory) }
+            try await Store.flushAllPendingWrites()
+        } catch { return false }
+        do { try await Passwords.flushPendingOperations() } catch { return false }
+        guard await AppIcon.flushPersistence() else { return false }
+        let captured = Session.enqueueSave()
+        let persisted = await Session.flushPersistence()
+        let failures = ProfileManager.shared.saveFailures
+        let originalsOnly = allowDamagedOriginals && !ProfileManager.shared.hasUnsavedProfileChanges
+            && failures.allSatisfy { $0.id == .profiles && !$0.canRetry }
+        return profiles && captured && persisted && !ImportOperations.hasPendingOperations
+            && !Passwords.hasPendingOperations && (failures.isEmpty || originalsOnly)
+    }
+
+    @Published private(set) var busy = false
+    @Published private(set) var progress = ""
+    @Published private(set) var status: String?
+    @Published private(set) var error: String?
+    @Published private(set) var recoveryError: String?
+    @Published private(set) var points: [BackupPoint] = []
+    @Published private(set) var preview: BackupCandidate?
+    private let library: BackupLibrary
+    private let flush: @MainActor () async -> Bool
+    private let worker: BackupWorker
+    private let finalDrain: @MainActor (Bool) async -> Bool
+    private let restart: @MainActor () throws -> Void
+    private var timer: Timer?
+    private var lastAttempt: Date?
+    private var restorePending = false
+
+    init(library: BackupLibrary, flush: @escaping @MainActor () async -> Bool, restart: @escaping @MainActor () throws -> Void,
+         worker: BackupWorker = .shared, finalDrain: (@MainActor (Bool) async -> Bool)? = nil) {
+        self.library = library; self.flush = flush; self.restart = restart; self.worker = worker
+        self.finalDrain = finalDrain ?? { _ in await flush() }
+    }
+    func begin() {
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.automaticRecovery() }
+        }
+        Task { await automaticRecovery() }
+    }
+    func reloadPoints() { Task { await reloadPointsAsync() } }
+    private func reloadPointsAsync() async {
+        let repository = BackupRecovery(library: library)
+        do { points = try await worker.run { try repository.points() } }
+        catch { recoveryError = error.localizedDescription }
+    }
+    private func start(_ label: String) -> Bool {
+        guard !busy, !restorePending else { return false }
+        Motion.list { busy = true; progress = label; error = nil }
+        return true
+    }
+    private func finish() { Motion.list { busy = false; progress = "" } }
+    func export(to url: URL, password: String? = nil) async {
+        guard start("Saving backup…") else { return }
+        defer { finish() }
+        do {
+            guard await flush() else { throw BackupError.saveFailed }
+            let library = library
+            try await worker.run {
+                let archive = try library.capture(reason: .manual)
+                try BackupCodec.write(archive, to: url, password: password)
+            }
+            Motion.list { status = "Backup saved to \(url.lastPathComponent)." }
+        } catch { self.error = error.localizedDescription }
+    }
+    func previewRestore(from url: URL, password: String? = nil,
+                        passwordPrompt: (@MainActor (String?) -> String?)? = nil) async {
+        guard start("Checking backup…") else { return }
+        Motion.list { preview = nil }
+        defer { finish() }
+        do {
+            let saved = await flush()
+            let library = library
+            // Freeze the bounded source bytes before asking for a password. A
+            // replacement on disk cannot swap the candidate during an unlock retry.
+            let data = try await worker.run { try BackupIO.read(url) }
+            var password = password
+            while true {
+                let attempt = password
+                do {
+                    let candidate = try await worker.run {
+                        let archive = try BackupCodec.decode(data, password: attempt)
+                        let incoming = try library.validate(archive)
+                        var current: BackupPreview?, currentError: String?
+                        do {
+                            guard saved else { throw BackupError.saveFailed }
+                            current = try library.validate(library.capture(reason: .manual))
+                        }
+                        catch { currentError = error.localizedDescription }
+                        return BackupCandidate(archive: archive, incoming: incoming, current: current, currentError: currentError)
+                    }
+                    Motion.list { preview = candidate }
+                    return
+                } catch BackupError.passwordRequired {
+                    guard let passwordPrompt else { throw BackupError.passwordRequired }
+                    guard let value = passwordPrompt(nil) else { return }
+                    password = value
+                } catch BackupError.unlockFailed {
+                    guard let passwordPrompt else { throw BackupError.unlockFailed }
+                    guard let value = passwordPrompt(BackupError.unlockFailed.localizedDescription) else { return }
+                    password = value
+                }
+            }
+        } catch { self.error = error.localizedDescription }
+    }
+    func cancelPreview() { guard !busy else { return }; Motion.list { preview = nil } }
+    func restorePreview() async {
+        guard let candidate = preview, start("Preserving a recovery point…") else { return }
+        defer { finish() }
+        let library = library
+        var staged = false
+        var quiescent = false
+        var repairingDamagedOriginals = false
+        defer { if quiescent { AppLifecycle.shared.endPersistenceExit() } }
+        do {
+            if !(await flush()) {
+                // A healthy library with unsaved changes must not be silently discarded.
+                // Damaged disk originals must still be repairable with a valid backup.
+                let current = try await worker.run { try library.capture(reason: .manual, allowDamaged: true) }
+                guard current.damage != nil else { throw BackupError.saveFailed }
+                repairingDamagedOriginals = true
+            }
+            try await worker.run { try BackupRestore(library: library).prepare(candidate.archive) }
+            staged = true
+            restorePending = true
+            guard AppLifecycle.shared.beginPersistenceExit() else { throw BackupError.saveFailed }
+            quiescent = true
+            await ICloudController.suspendIfRunning()
+            Motion.list { progress = "Finishing saved changes…" }
+            var drained = false
+            for _ in 0..<3 {
+                guard await finalDrain(repairingDamagedOriginals) else { throw BackupError.saveFailed }
+                // Accepted pre-gate intents have finished. Capture the last durable
+                // generation; native input and external ingress stay closed.
+                try await worker.run {
+                    let original = try library.capture(reason: .beforeRestore, allowDamaged: true)
+                    let recovery = BackupRecovery(library: library)
+                    _ = try recovery.beforeRestorePointIfChanged(original)
+                }
+                // This clean restore handoff may confirm health; ordinary backup
+                // flushes leave rollback available through the startup grace period.
+                await Updater.markHealthyLaunchAsync()
+                // Late page callbacks can queue history behind the Store admission
+                // pause. Recheck on the same actor turn as restart's process exit.
+                if !Store.hasUnflushedWrites && !ImportOperations.hasPendingOperations && !Passwords.hasPendingOperations {
+                    drained = true; break
+                }
+            }
+            guard drained else { throw BackupError.saveFailed }
+            try restart()
+            Motion.list { preview = nil; status = "Restore prepared. Timo is restarting." }
+        } catch {
+            if staged {
+                do { try await worker.run { try BackupRestore(library: library).cancelPending() }; restorePending = false }
+                catch { self.error = "Restart failed, and the pending restore could not be cancelled: \(error.localizedDescription)"; return }
+            }
+            self.error = error.localizedDescription
+            await reloadPointsAsync()
+        }
+    }
+    func clearHistory(_ history: Store, since: Date?) async throws {
+        guard start("Clearing history and recovery points…") else {
+            throw BackupError.storage("A backup or restore is running. Wait for it to finish before clearing history.")
+        }
+        defer { finish() }
+        guard history.clearHistory(since: since), await history.flushPendingWrites() else {
+            throw BackupError.storage(history.lastHistoryError ?? "Browsing history could not be cleared.")
+        }
+        // A partial clear keeps recovery points: they also hold other profiles' bookmarks
+        // and Easels, and wiping every backup for "last hour" is a worse loss.
+        // ponytail: scrub visits from points instead of keeping them, if partial clears must reach backups.
+        guard since == nil else { return }
+        // Capture and publication share this worker, including iCloud's pre-sync point.
+        // Purge after the live clear commits, so an older capture cannot publish later.
+        let recovery = BackupRecovery(library: library)
+        try await worker.run { try recovery.removeAllPoints() }
+        Motion.list { points = []; preview = nil; recoveryError = nil }
+    }
+
+    func retryRecovery() async { await automaticRecovery(force: true) }
+    func automaticRecovery(force: Bool = false, now: Date = .now) async {
+        guard !busy, !restorePending, force || BackupSchedule.isDue(lastAttempt: lastAttempt, now: now) else { return }
+        busy = true; lastAttempt = now
+        defer { finish() }
+        do {
+            guard await flush() else { throw BackupError.saveFailed }
+            let library = library
+            _ = try await worker.run {
+                let archive = try library.capture(reason: .automatic)
+                return try BackupRecovery(library: library).automaticPointIfChanged(archive)
+            }
+            recoveryError = nil
+        } catch { recoveryError = error.localizedDescription }
+        await reloadPointsAsync()
+    }
+    func showExportPanel() {
+        guard !busy, !restorePending else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Timo Backup"
+        panel.nameFieldStringValue = "Timo Backup \(Date.now.formatted(.iso8601.year().month().day().dateSeparator(.dash))).timobackup"
+        panel.allowedContentTypes = [.data]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        switch BackupPasswordPrompt.export() {
+        case .encrypted(let password): Task { await export(to: url, password: password) }
+        case .unencrypted: Task { await export(to: url) }
+        case .cancelled: break
+        }
+    }
+    func showRestorePanel() {
+        guard !busy, !restorePending else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Preview Timo Backup"
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await previewRestore(from: url, passwordPrompt: BackupPasswordPrompt.unlock) }
+    }
+    func reportLaunch(_ result: BackupRestore.Result) {
+        switch result {
+        case .restored: status = "Backup restored. Your previous data is in recovery points."
+        case .rolledBack: status = "An interrupted restore was rolled back. Your previous data is safe."
+        case .none: break
+        }
+    }
+}
+
+/// Launch the exact executable, including isolated test copies, after this process
+/// exits. Successful helper creation is required before bypassing termination saves.
+@MainActor enum BackupRestart {
+    static func run() throws {
+        let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw BackupError.storage("Timo could not locate its executable. Restart manually to apply the prepared restore.")
+        }
+        func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = ["-c", "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.1; done; exec " + quote(executable.path)]
+        helper.environment = ProcessInfo.processInfo.environment
+        helper.standardInput = FileHandle.nullDevice
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        try helper.run()
+        // Only this restore path uses exit: normal termination would save the old
+        // session once more. The helper preserves TIMO_DATA_DIR and bundle identity.
+        exit(0)
+    }
+}

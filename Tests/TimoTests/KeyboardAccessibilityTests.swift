@@ -1,0 +1,809 @@
+import AppKit
+import SwiftUI
+import WebKit
+import XCTest
+@testable import timo
+
+private final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    // XCTest's application may remain inactive; still deliver the fixture's click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+@MainActor private final class DisabledKeyboardFixture: ObservableObject {
+    @Published var disabled = false
+    @Published var requestFocus = false
+    var focused = false
+    var presses = 0
+}
+
+private struct DisabledKeyboardSurface: View {
+    @ObservedObject var state: DisabledKeyboardFixture
+
+    var body: some View {
+        Text("Sidebar row")
+            .frame(width: 200, height: 40)
+            .timoKeyboardAction(requestFocus: $state.requestFocus,
+                                focusChanged: { state.focused = $0 }) { state.presses += 1 }
+            .disabled(state.disabled)
+    }
+}
+
+@MainActor final class KeyboardAccessibilityTests: XCTestCase {
+    private var nativeProfiles: Set<UUID> = []
+
+    override func tearDown() async throws {
+        let profiles = nativeProfiles
+        nativeProfiles.removeAll()
+        try await NativeFixtureProfileCleanup.release(profiles)
+    }
+
+    private func fixture(isPrivate: Bool = true) -> (TabStore, NSWindow, WKWebView) {
+        let (store, window, web, retire) = makeFixture(isPrivate: isPrivate)
+        addTeardownBlock { @MainActor in retire() }
+        return (store, window, web)
+    }
+
+    private func makeFixture(isPrivate: Bool) -> (TabStore, NSWindow, WKWebView, @MainActor () -> Void) {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        let store = TabStore(isPrivate: isPrivate, profileID: UUID())
+        let tab = store.newBlankTab(focus: false)
+        store.current = tab.id
+        store.palette = nil
+        let web = tab.web
+        if !store.isPrivate { nativeProfiles.insert(store.profileID) }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        store.window = window
+        window.contentView = web
+        window.makeKeyAndOrderFront(nil)
+        let retire: @MainActor () -> Void = {
+            window.contentView = nil
+            store.window = nil
+            window.close()
+            store.dropStashes()
+            TabStore.all.removeAll { $0 === store }
+            SharedTabs.release(store.tabs)
+        }
+        return (store, window, web, retire)
+    }
+
+    /// Admit the native loop and exact mounted page owner before the handoff deadline,
+    /// keeping the target page cold. Retire the fixture before closing its owned loop.
+    private func withNativePageFixture(
+        isPrivate: Bool = true,
+        _ body: @MainActor (TabStore, NSWindow, WKWebView) async throws -> Void
+    ) async throws {
+        TestEnvironment.prepare()
+        let app = NSApplication.shared
+        let policy = app.activationPolicy()
+        defer { app.setActivationPolicy(policy) }
+        let loop = try await NativeFixtureApplicationLoop.acquire(activationPolicy: .accessory)
+        var failure: (any Error)?
+        do {
+            let (store, window, web, retire) = makeFixture(isPrivate: isPrivate)
+            defer { retire() }
+            window.makeKeyAndOrderFront(nil)
+            app.activate(ignoringOtherApps: true)
+            try await compatibilityWait {
+                app.isRunning && app.isActive && window.isKeyWindow && app.keyWindow === window
+                    && window.isVisible && window.occlusionState.contains(.visible)
+                    && app.modalWindow == nil && window.attachedSheet == nil
+                    && web.window === window && store.activePageResponder === web
+            }
+            try await body(store, window, web)
+        } catch { failure = error }
+        do { try await loop.close() }
+        catch {
+            if failure == nil { failure = error }
+            else { XCTFail("Keyboard fixture AppKit loop cleanup also failed: \(error)") }
+        }
+        if let failure { throw failure }
+    }
+
+    private func key(_ text: String, code: UInt16, in window: NSWindow) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                        timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: window.windowNumber, context: nil,
+                        characters: text, charactersIgnoringModifiers: text,
+                        isARepeat: false, keyCode: code)!
+    }
+
+    func testWebsitePriorityDoesNotRunBrowserThroughMenuFallback() throws {
+        let (store, window, web) = fixture()
+        let oldMenu = NSApp.mainMenu
+        let oldActions = Keybindings.actions
+        defer { NSApp.mainMenu = oldMenu; Keybindings.actions = oldActions }
+        try XCTUnwrap(Keybindings.withScratchDefaults("keyboard-menu") {
+            Keybindings.setPriority(.page, for: .toggleSidebar)
+            rebuild()
+            window.makeKeyAndOrderFront(nil)
+            XCTAssertTrue(window.makeFirstResponder(web))
+            XCTAssertTrue(window.firstResponder === web)
+            let event = key("s", code: 1, in: window)
+            let before = store.sidebarShown
+            XCTAssertFalse(Keybindings.handle(event))
+            XCTAssertFalse(NSApp.mainMenu!.performKeyEquivalent(with: event),
+                           "The main menu must also leave the website's shortcut alone")
+            XCTAssertEqual(store.sidebarShown, before)
+            // Explicit menu activation remains available regardless of website priority.
+            let viewMenu = NSApp.mainMenu!.items.first { $0.title == "View" }!.submenu!
+            let index = viewMenu.items.firstIndex { $0.title == "Toggle Sidebar" }!
+            viewMenu.performActionForItem(at: index)
+            XCTAssertEqual(store.sidebarShown, !before)
+        })
+    }
+
+    func testWebsitePriorityStillRunsWhileBrowserFieldHasFocus() throws {
+        let (_, window, _) = fixture()
+        let field = NSTextField(string: "hello")
+        window.contentView = field
+        window.makeFirstResponder(field)
+        let oldActions = Keybindings.actions
+        defer { Keybindings.actions = oldActions }
+        try XCTUnwrap(Keybindings.withScratchDefaults("keyboard-chrome") {
+            Keybindings.setPriority(.page, for: .find)
+            var fired = false
+            Keybindings.actions[.find] = { fired = true }
+            XCTAssertTrue(Keybindings.handle(key("f", code: 3, in: window)))
+            XCTAssertTrue(fired)
+        })
+    }
+
+    func testDeferredPageFocusDoesNotTakeFocusFromNewPalette() async throws {
+        let (store, window, web) = fixture()
+        window.makeFirstResponder(nil)
+        store.focusPage()
+        store.palette = .all
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(window.firstResponder === web,
+                       "A queued dismissal must not steal focus while a new overlay mounts")
+    }
+
+    func testPageFocusWaitsForPageToMountAfterDismissal() async throws {
+        let (store, window, web) = fixture()
+        window.contentView = NSView()
+        window.makeFirstResponder(nil)
+        store.focusPage()
+        try await Task.sleep(for: .milliseconds(60))
+        window.contentView = web
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertTrue(window.firstResponder === web)
+    }
+
+    func testOpeningFindAgainReturnsFocusToExistingFindField() async throws {
+        let (store, window, web) = fixture()
+        let host = NSHostingView(rootView: FindBar(tab: store.active!).environmentObject(store))
+        let container = NSView(frame: window.contentView!.frame)
+        container.addSubview(web)
+        host.frame = NSRect(x: 0, y: 0, width: 500, height: 80)
+        container.addSubview(host)
+        window.contentView = container
+        store.openFind()
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        window.makeFirstResponder(web)
+        XCTAssertTrue(window.firstResponder === web)
+        store.openFind()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(window.firstResponder is NSTextView,
+                      "Command-F must refocus a find field that is already open")
+    }
+
+    func testClosingClickedPinKeepsOutlineHiddenAndKeyboardActivationRestoresIt() async throws {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        let store = TabStore(isPrivate: true, profileID: UUID())
+        store.newTab(URL(string: "about:blank"))
+        let tab = try XCTUnwrap(store.active)
+        store.move(tab.id, to: .pinned)
+        defer {
+            store.dropStashes()
+            SharedTabs.release(store.tabs)
+            TabStore.all.removeAll { $0 === store }
+        }
+        var presses = 0
+        let previousPolicy = NSApp.activationPolicy()
+        NSApp.setActivationPolicy(.accessory)
+        defer { NSApp.setActivationPolicy(previousPolicy) }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 250, height: 150),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let host = FirstMouseHostingView(rootView: SidebarRow(icon: "globe", title: "Example",
+                                                      selected: false) {
+            presses += 1
+            store.current = tab.id
+        }.accentColor(.blue)
+            .transaction { $0.disablesAnimations = true })
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 150))
+        host.frame = NSRect(x: 0, y: 80, width: 250, height: 50)
+        let field = NSTextField(string: "Typing")
+        field.frame = NSRect(x: 10, y: 10, width: 200, height: 30)
+        container.addSubview(host)
+        container.addSubview(field)
+        window.contentView = container
+        defer { window.contentView = nil; window.close() }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        func clickRow() async throws {
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = try XCTUnwrap(NSEvent.mouseEvent(
+                    with: type, location: NSPoint(x: 100, y: 105), modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                    clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0))
+                NSApp.sendEvent(event)
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        }
+        try await clickRow()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(presses, 1, "Click still activates the row")
+        func outlinePixels() throws -> Int {
+            host.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            var count = 0
+            for y in 0..<bitmap.pixelsHigh {
+                for x in 0..<bitmap.pixelsWide {
+                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                    if color.blueComponent > color.redComponent + 0.2,
+                       color.blueComponent > color.greenComponent + 0.1 { count += 1 }
+                }
+            }
+            return count
+        }
+        XCTAssertEqual(try outlinePixels(), 0, "Mouse activation must not show the blue focus outline")
+        let close = key("w", code: 13, in: window)
+        NSApp.sendEvent(close)
+        store.closeOrArchive()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(store.current, "Command-W closes the pinned page")
+        XCTAssertTrue(tab.suspended)
+        XCTAssertEqual(tab.kind, .pinned, "Closing the page must keep its pin")
+        XCTAssertTrue(store.tabs.contains { $0 === tab })
+        XCTAssertEqual(try outlinePixels(), 0,
+                       "Closing a clicked pin must not bring back its blue focus outline")
+        let space = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: " ",
+            charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49))
+        NSApp.sendEvent(space)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(presses, 2, "Keyboard activation remains available after a click")
+        XCTAssertGreaterThan(try outlinePixels(), 50, "Keyboard input must restore the focus outline")
+        NSApp.sendEvent(close)
+        store.closeOrArchive()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertGreaterThan(try outlinePixels(), 50,
+                             "A shortcut must preserve an outline already shown by keyboard activation")
+        try await clickRow()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(presses, 3)
+        XCTAssertEqual(try outlinePixels(), 0, "A click must hide the outline on an already focused row")
+    }
+
+    func testSidebarRowCanBeFocusedAndActivatedWithoutPointer() async throws {
+        _ = NSApplication.shared
+        var presses = 0
+        let previousPolicy = NSApp.activationPolicy()
+        NSApp.setActivationPolicy(.accessory)
+        defer { NSApp.setActivationPolicy(previousPolicy) }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 250, height: 150),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: SidebarRow(icon: "globe", title: "Example",
+                                                      selected: false) { presses += 1 })
+        window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        window.makeFirstResponder(nil)
+        window.selectNextKeyView(nil)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(window.firstResponder === window, "Tab must reach the sidebar row")
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                    timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                    characters: " ", charactersIgnoringModifiers: " ",
+                                    isARepeat: false, keyCode: 49)!
+        window.sendEvent(event)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(presses, 1, "Space activates the focused row")
+    }
+
+    func testDisabledSidebarControlLeavesKeyboardNavigationAndRejectsActivation() async throws {
+        _ = NSApplication.shared
+        let previousPolicy = NSApp.activationPolicy()
+        NSApp.setActivationPolicy(.accessory)
+        defer { NSApp.setActivationPolicy(previousPolicy) }
+        let state = DisabledKeyboardFixture()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 250, height: 150),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: DisabledKeyboardSurface(state: state))
+        window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        state.requestFocus = true
+        try await compatibilityWait { state.focused }
+        func pressSpace() throws {
+            window.sendEvent(try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: " ",
+                charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49)))
+        }
+        try pressSpace()
+        XCTAssertEqual(state.presses, 1)
+        state.disabled = true
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(state.focused, "A hidden sidebar must release its focused control")
+        window.makeFirstResponder(nil)
+        window.selectNextKeyView(nil)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(state.focused, "Tab must skip disabled sidebar controls")
+        state.requestFocus = true
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(state.focused, "A queued focus request must not enter a hidden sidebar")
+        try pressSpace()
+        XCTAssertEqual(state.presses, 1, "A hidden row cannot activate")
+        state.requestFocus = false
+        state.disabled = false
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        window.makeFirstResponder(nil)
+        window.selectNextKeyView(nil)
+        try await compatibilityWait { state.focused }
+        try pressSpace()
+        XCTAssertEqual(state.presses, 2, "Revealing the sidebar restores keyboard navigation")
+    }
+
+
+    func testOptionLetterShortcutLeavesTextEditingWithTheField() throws {
+        let (_, window, _) = fixture()
+        let field = NSTextField(string: "hello")
+        window.contentView = field
+        window.makeFirstResponder(field)
+        let oldActions = Keybindings.actions
+        let oldMenu = NSApp.mainMenu
+        defer { NSApp.mainMenu = oldMenu; Keybindings.actions = oldActions }
+        try XCTUnwrap(Keybindings.withScratchDefaults("keyboard-option") {
+            rebuild()
+            var fired = false
+            Keybindings.actions[.toggleDeveloperMode] = { fired = true }
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .option,
+                                        timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                        characters: "∂", charactersIgnoringModifiers: "d",
+                                        isARepeat: false, keyCode: 2)!
+            XCTAssertFalse(Keybindings.handle(event), "Option-D must still type in a text field")
+            XCTAssertFalse(fired)
+            XCTAssertFalse(NSApp.mainMenu!.performKeyEquivalent(with: event),
+                           "The menu fallback must preserve Option typing too")
+        })
+    }
+
+    func testShadowRootEditorKeepsCommandArrowForItsCaret() async throws {
+        let (store, window, web) = fixture()
+        web.loadHTMLString("<div id='editor'></div>", baseURL: nil)
+        let deadline = Date.now.addingTimeInterval(5)
+        while web.isLoading, Date.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertFalse(web.isLoading)
+        _ = try await web.evaluateJavaScript("""
+            const root = document.getElementById('editor').attachShadow({mode: 'open'});
+            root.innerHTML = '<input value="typing">';
+            root.querySelector('input').focus();
+            """)
+        window.makeFirstResponder(web)
+        try await Task.sleep(for: .milliseconds(150))
+        let oldActions = Keybindings.actions
+        defer { Keybindings.actions = oldActions }
+        var navigated = false
+        Keybindings.actions[.back] = { navigated = true }
+        let event = key("\u{F702}", code: 123, in: window)
+        XCTAssertFalse(Keybindings.handle(event), "Command-Left belongs to the editor's caret")
+        XCTAssertFalse(navigated)
+        XCTAssertTrue(store.active!.editableFocused)
+    }
+
+
+    func testFirstSearchResultReceivesFocusWhenTabIsCreatedOnNextTurn() async throws {
+        try await withNativePageFixture { store, window, web in
+            @MainActor func identity(_ object: AnyObject?) -> String {
+                object.map { "\(type(of: $0))@\(ObjectIdentifier($0))" } ?? "nil"
+            }
+            @MainActor func diagnose(_ phase: String) {
+                let page = store.activePageResponder
+                print("FIRST_SEARCH_FOCUS \(phase) running=\(NSApp.isRunning) active=\(NSApp.isActive) policy=\(NSApp.activationPolicy().rawValue) key=\(identity(NSApp.keyWindow)) window=\(identity(window)) isKey=\(window.isKeyWindow) visible=\(window.isVisible) modal=\(identity(NSApp.modalWindow)) sheet=\(identity(window.attachedSheet)) holder=\(identity(window.firstResponder)) page=\(identity(page)) web=\(identity(web)) pageWindow=\(identity(page?.window)) palette=\(String(describing: store.palette)) library=\(store.libraryOpen)")
+            }
+            diagnose("created")
+            XCTAssertTrue(NSApp.isRunning && NSApp.isActive && window.isKeyWindow && NSApp.keyWindow === window,
+                          "The focus fixture must own a running foreground AppKit window before the action")
+            XCTAssertNil(web.url, "The first-search handoff must still exercise a cold page")
+            let selected = store.current
+            store.current = nil
+            XCTAssertTrue(window.makeFirstResponder(nil))
+            XCTAssertTrue(window.firstResponder === window, "The handoff must start without a page holding focus")
+            diagnose("before-action")
+            store.focusPage()
+            DispatchQueue.main.async { store.current = selected; diagnose("selected") }
+            try await Task.sleep(for: .milliseconds(350))
+            diagnose("outcome")
+            XCTAssertTrue(window.firstResponder === web,
+                          "Opening the first search result must leave the page ready for the keyboard")
+        }
+    }
+
+
+    func testF6MovesBetweenPageAndBrowserControls() async throws {
+        try await withNativePageFixture { store, window, web in
+            let oldMenu = NSApp.mainMenu
+            let oldActions = Keybindings.actions
+            defer { NSApp.mainMenu = oldMenu; Keybindings.actions = oldActions }
+            rebuild()
+            let host = NSHostingView(rootView: AddressPill(tab: store.active).environmentObject(store))
+            let container = NSView(frame: window.contentView!.frame)
+            host.frame = NSRect(x: 0, y: 520, width: 250, height: 80)
+            web.frame = NSRect(x: 250, y: 0, width: 550, height: 600)
+            container.addSubview(host)
+            container.addSubview(web)
+            window.contentView = container
+            try await compatibilityWait {
+                host.layoutSubtreeIfNeeded()
+                window.displayIfNeeded()
+                CATransaction.flush()
+                return store.mountedAddressEndpoint?.window === window
+                    && (store.mountedAddressEndpoint?.bounds.width ?? 0) > 0
+                    && web.window === window && NSApp.isRunning && NSApp.isActive
+                    && window.isKeyWindow && NSApp.keyWindow === window
+                    && !host.needsDisplay && host.layer?.presentation() != nil
+            }
+            XCTAssertTrue(window.makeFirstResponder(web))
+            XCTAssertTrue(window.firstResponder === web)
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                        timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                        characters: "\u{F709}", charactersIgnoringModifiers: "\u{F709}",
+                                        isARepeat: false, keyCode: 97)!
+            XCTAssertEqual(Keybindings.command(for: Keybinding(event: event)!), .nextFocusArea)
+            XCTAssertNotNil(Keybindings.actions[.nextFocusArea])
+            store.focusNextArea()
+            try await Task.sleep(for: .milliseconds(150))
+            XCTAssertFalse(window.firstResponder === web)
+            XCTAssertFalse(window.firstResponder === window)
+            store.focusNextArea()
+            try await Task.sleep(for: .milliseconds(150))
+            XCTAssertTrue(window.firstResponder === web)
+            XCTAssertNil(store.palette)
+        }
+    }
+
+    func testPaletteDismissalReturnsFocusWhenFindRemainsOpen() async throws {
+        let (store, window, web) = fixture()
+        store.openFind()
+        store.palette = .all
+        // The palette removes its field on Escape while the existing Find bar stays mounted.
+        window.makeFirstResponder(nil)
+        store.palette = nil
+        store.focusPage()
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(store.findOpen)
+        XCTAssertTrue(window.firstResponder === web)
+    }
+
+    /// Use the original Easel/pill admission and ownership; never render after F6.
+    private func withAdmittedEaselPillForHandoffContract(
+        _ body: @MainActor (TabStore, NSWindow, EaselHostingView) async throws -> Void
+    ) async throws {
+        try await withNativePageFixture(isPrivate: false) { store, window, _ in
+            let opened = await store.openEaselAsync(create: true)
+            let tab = try XCTUnwrap(opened)
+            let session = try XCTUnwrap(tab.easelSession)
+            let page = EaselHostingView(rootView: EaselWorkspace(session: session, browser: store))
+            let chrome = NSHostingView(rootView: AddressPill(tab: tab).environmentObject(store))
+            let container = NSView(frame: window.contentView!.frame)
+            page.frame = NSRect(x: 250, y: 0, width: 550, height: 600)
+            chrome.frame = NSRect(x: 0, y: 520, width: 250, height: 80)
+            container.addSubview(chrome)
+            container.addSubview(page)
+            window.contentView = container
+            chrome.layoutSubtreeIfNeeded()
+            @MainActor func pillAnchors(in view: NSView) -> [NativeSidebarNavigationControl.Anchor] {
+                (view as? NativeSidebarNavigationControl.Anchor).map { [$0] } ?? view.subviews.flatMap { pillAnchors(in: $0) }
+            }
+            // Attachment can precede the first SwiftUI render. Admit the actual
+            // pill control and painted surfaces before the unchanged 150ms F6
+            // deadline; do not request or await the desired focus during setup.
+            try await compatibilityWait {
+                page.layoutSubtreeIfNeeded()
+                chrome.layoutSubtreeIfNeeded()
+                window.displayIfNeeded()
+                CATransaction.flush()
+                let registeredPill = pillAnchors(in: chrome).contains {
+                    $0.token != nil && $0.refresh != nil && $0.navigation == nil
+                        && $0.window === window && !$0.isHiddenOrHasHiddenAncestor
+                        && $0.bounds.width > 0 && $0.bounds.height > 0
+                }
+                return NSApp.isRunning && NSApp.isActive && window.isKeyWindow && NSApp.keyWindow === window
+                    && window.isVisible && window.occlusionState.contains(.visible)
+                    && NSApp.modalWindow == nil && window.attachedSheet == nil
+                    && page.window === window && chrome.window === window
+                    && store.activePageResponder === page
+                    && registeredPill && !page.needsDisplay && !chrome.needsDisplay
+                    && page.layer?.presentation() != nil && chrome.layer?.presentation() != nil
+            }
+            XCTAssertTrue(window.makeFirstResponder(page))
+            try await body(store, window, page)
+        }
+    }
+
+    /// Mutation caught: moving mounted-control delivery behind a main-queue
+    /// publication or SwiftUI onChange leaves the page holding the keyboard.
+    func testF6MountedPillLeavesPageBeforeQueuedMainWork() async throws {
+        try await withAdmittedEaselPillForHandoffContract { store, window, page in
+            var queuedWorkRan = false
+            DispatchQueue.main.async { queuedWorkRan = true }
+
+            store.focusNextArea()
+            // No await or run-loop pumping: queued work and published-state
+            // consumption cannot perform the proposed mounted fast path for us.
+            XCTAssertFalse(queuedWorkRan)
+            XCTAssertFalse(window.firstResponder === page,
+                           "A mounted F6 target must acquire native ownership before queued work")
+            XCTAssertFalse(window.firstResponder === window)
+            try await Task.sleep(for: .milliseconds(150))
+            XCTAssertFalse(window.firstResponder === page, "F6 must leave the canvas for the address pill")
+            XCTAssertFalse(window.firstResponder === window)
+            store.focusNextArea()
+            XCTAssertTrue(window.firstResponder === page)
+        }
+    }
+
+    /// Mutation caught: taking an enclosing host as a successful handoff while
+    /// the actual address control still cannot receive the next keyboard action.
+    func testF6MountedPillRoutesSpaceToAddressAtOriginalDeadline() async throws {
+        try await withAdmittedEaselPillForHandoffContract { store, window, _ in
+            store.focusNextArea()
+            try await Task.sleep(for: .milliseconds(150))
+            let space = try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, characters: " ",
+                charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49))
+            window.sendEvent(space)
+            XCTAssertTrue(store.palette == .address,
+                          "F6 must route the next Space action to the real address pill at its original deadline")
+        }
+    }
+
+    func testF6EndpointRejectsWrongOwnerAndUnavailableTargets() async throws {
+        try await withAdmittedEaselPillForHandoffContract { store, window, page in
+            let endpoint = try XCTUnwrap(store.mountedAddressEndpoint)
+            XCTAssertFalse(endpoint.takeFocus(from: window), "A different input responder must retire the request")
+            XCTAssertTrue(window.firstResponder === page)
+            endpoint.isHidden = true
+            XCTAssertFalse(endpoint.takeFocus(from: page))
+            endpoint.isHidden = false
+            endpoint.isEnabled = false
+            XCTAssertFalse(endpoint.takeFocus(from: page))
+            endpoint.isEnabled = true
+            store.profileVisible = false
+            XCTAssertFalse(endpoint.takeFocus(from: page), "Parked profiles cannot take the keyboard")
+            store.profileVisible = true
+            store.sidebarShown = false
+            XCTAssertFalse(endpoint.takeFocus(from: page))
+            store.sidebarPeeking = true
+            XCTAssertTrue(endpoint.takeFocus(from: page), "Hover-revealed chrome must retain its address actions")
+            XCTAssertTrue(window.firstResponder === endpoint)
+            XCTAssertTrue(window.makeFirstResponder(page))
+            store.sidebarPeeking = false
+            store.sidebarShown = true
+            let other = NSWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: false)
+            other.isReleasedWhenClosed = false
+            store.window = other
+            XCTAssertFalse(endpoint.takeFocus(from: page), "A store cannot borrow another window's endpoint")
+            store.window = window
+            other.close()
+            store.palette = .all
+            store.focusNextArea()
+            XCTAssertTrue(window.firstResponder === page)
+            XCTAssertFalse(endpoint.takeFocus(from: page))
+            store.palette = nil
+            XCTAssertTrue(endpoint.takeFocus(from: page))
+            XCTAssertTrue(window.firstResponder === endpoint, "Commit means the exact registered native control")
+            window.contentView = nil
+            XCTAssertNil(store.mountedAddressEndpoint, "Detachment must revoke the store's weak target")
+            XCTAssertFalse(endpoint.takeFocus(from: page))
+        }
+    }
+
+    func testLittleAddressEndpointRemainsAvailableWithoutSidebar() async throws {
+        try await withNativePageFixture(isPrivate: false) { owner, window, _ in
+            let store = LittleArc.floatingStore(URL(string: "about:blank"), profileID: owner.profileID)
+            store.window = window
+            defer {
+                store.window = nil
+                store.dropStashes()
+                SharedTabs.release(store.tabs)
+                TabStore.all.removeAll { $0 === store }
+            }
+            let host = NSHostingView(rootView: LittleArcBar()
+                .environmentObject(store).environmentObject(ProfileManager.shared))
+            host.frame = try XCTUnwrap(window.contentView).frame
+            window.contentView = host
+            try await compatibilityWait {
+                host.layoutSubtreeIfNeeded()
+                window.displayIfNeeded()
+                CATransaction.flush()
+                return store.mountedAddressEndpoint?.window === window
+                    && (store.mountedAddressEndpoint?.bounds.width ?? 0) > 0
+                    && !host.needsDisplay && host.layer?.presentation() != nil
+            }
+            let endpoint = try XCTUnwrap(store.mountedAddressEndpoint)
+            XCTAssertFalse(store.sidebarShown)
+            XCTAssertTrue(endpoint.takeFocus(from: window.firstResponder))
+            XCTAssertTrue(window.firstResponder === endpoint)
+            XCTAssertTrue(endpoint.accessibilityPerformPress())
+            XCTAssertTrue(store.palette == .address)
+        }
+    }
+
+    func testF6SharedBrowserHostCommitsExactAddressAndNativeActions() async throws {
+        try await withNativePageFixture(isPrivate: false) { store, window, _ in
+            let opened = await store.openEaselAsync(create: true)
+            _ = try XCTUnwrap(opened)
+            let shown = ShownStore(store)
+            let host = BrowserWindowHost(shown: shown)
+            host.frame = try XCTUnwrap(window.contentView).frame
+            window.contentView = host
+            try await compatibilityWait {
+                host.layoutSubtreeIfNeeded()
+                window.displayIfNeeded()
+                CATransaction.flush()
+                return store.mountedAddressEndpoint?.window === window
+                    && (store.mountedAddressEndpoint?.bounds.width ?? 0) > 0
+                    && store.activePageResponder?.window === window
+                    && window.isKeyWindow && NSApp.keyWindow === window && NSApp.isActive
+                    && !host.needsDisplay && host.layer?.presentation() != nil
+            }
+            let endpoint = try XCTUnwrap(store.mountedAddressEndpoint)
+            let page = try XCTUnwrap(store.activePageResponder)
+            XCTAssertTrue(window.makeFirstResponder(page))
+            var queuedWorkRan = false
+            DispatchQueue.main.async { queuedWorkRan = true }
+            store.focusNextArea()
+            XCTAssertFalse(queuedWorkRan)
+            XCTAssertTrue(window.firstResponder === endpoint,
+                          "The shared browser root must commit the registered address endpoint, never its ancestor")
+            try await Task.sleep(for: .milliseconds(150))
+            XCTAssertTrue(window.firstResponder === endpoint)
+            XCTAssertTrue(endpoint.isAccessibilityFocused())
+            store.focusNextArea()
+            XCTAssertTrue(window.firstResponder === page)
+            store.focusNextArea()
+            XCTAssertTrue(window.firstResponder === endpoint)
+            XCTAssertEqual(Set(endpoint.accessibilityCustomActions()?.map(\.name) ?? []),
+                           Set(["Copy Link", "Site Controls", "Actual Size"]))
+            let modifiedSpace = try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: .shift, timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: " ",
+                charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49))
+            endpoint.keyDown(with: modifiedSpace)
+            XCTAssertNil(store.palette, "Modified Space must not activate the address")
+            XCTAssertTrue(endpoint.accessibilityPerformPress())
+            XCTAssertTrue(store.palette == .address, "The actual native AX action must open the existing address palette")
+        }
+    }
+
+    func testF6LeavesTheLocalEaselForBrowserControls() async throws {
+        try await withNativePageFixture(isPrivate: false) { store, window, _ in
+            let opened = await store.openEaselAsync(create: true)
+            let tab = try XCTUnwrap(opened)
+            let session = try XCTUnwrap(tab.easelSession)
+            let page = EaselHostingView(rootView: EaselWorkspace(session: session, browser: store))
+            let chrome = NSHostingView(rootView: AddressPill(tab: tab).environmentObject(store))
+            let container = NSView(frame: window.contentView!.frame)
+            page.frame = NSRect(x: 250, y: 0, width: 550, height: 600)
+            chrome.frame = NSRect(x: 0, y: 520, width: 250, height: 80)
+            container.addSubview(chrome)
+            container.addSubview(page)
+            window.contentView = container
+            chrome.layoutSubtreeIfNeeded()
+            @MainActor func pillAnchors(in view: NSView) -> [NativeSidebarNavigationControl.Anchor] {
+                (view as? NativeSidebarNavigationControl.Anchor).map { [$0] } ?? view.subviews.flatMap { pillAnchors(in: $0) }
+            }
+            // Attachment can precede the first SwiftUI render. Admit the actual
+            // pill control and painted surfaces before the unchanged 150ms F6
+            // deadline; do not request or await the desired focus during setup.
+            try await compatibilityWait {
+                page.layoutSubtreeIfNeeded()
+                chrome.layoutSubtreeIfNeeded()
+                window.displayIfNeeded()
+                CATransaction.flush()
+                let registeredPill = pillAnchors(in: chrome).contains {
+                    $0.token != nil && $0.refresh != nil && $0.navigation == nil
+                        && $0.window === window && !$0.isHiddenOrHasHiddenAncestor
+                        && $0.bounds.width > 0 && $0.bounds.height > 0
+                }
+                return NSApp.isRunning && NSApp.isActive && window.isKeyWindow && NSApp.keyWindow === window
+                    && window.isVisible && window.occlusionState.contains(.visible)
+                    && NSApp.modalWindow == nil && window.attachedSheet == nil
+                    && page.window === window && chrome.window === window
+                    && store.activePageResponder === page
+                    && registeredPill && !page.needsDisplay && !chrome.needsDisplay
+                    && page.layer?.presentation() != nil && chrome.layer?.presentation() != nil
+            }
+            XCTAssertTrue(window.makeFirstResponder(page))
+            print("F6_EASEL before-action running=\(NSApp.isRunning) active=\(NSApp.isActive) policy=\(NSApp.activationPolicy().rawValue) key=\(window.isKeyWindow) visible=\(window.isVisible) pageOwner=\(store.activePageResponder === page) holder=\(String(describing: window.firstResponder))")
+            XCTAssertTrue(NSApp.isRunning && NSApp.isActive && window.isKeyWindow && NSApp.keyWindow === window,
+                          "F6 must start in an admitted foreground AppKit window")
+            store.focusNextArea()
+            try await Task.sleep(for: .milliseconds(150))
+            XCTAssertFalse(window.firstResponder === page, "F6 must leave the canvas for the address pill")
+            XCTAssertFalse(window.firstResponder === window)
+            store.focusNextArea()
+            XCTAssertTrue(window.firstResponder === page)
+        }
+    }
+
+    func testSearchResultHandsFocusFromOldPageToNewTab() async throws {
+        let (store, window, oldPage) = fixture()
+        window.makeFirstResponder(oldPage)
+        let next = store.newBlankTab()
+        let newPage = next.web
+        store.focusPage(from: oldPage)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            window.contentView = newPage
+        }
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertTrue(window.firstResponder === newPage,
+                      "Submitting another tab must not strand the keyboard on the old page")
+    }
+
+    func testPageFocusWaitsForDismissedFieldToLeaveTheWindow() async throws {
+        let (store, window, web) = fixture()
+        let field = NSTextField(string: "search")
+        let container = NSView(frame: window.contentView!.frame)
+        container.addSubview(web)
+        field.frame = NSRect(x: 0, y: 0, width: 250, height: 30)
+        container.addSubview(field)
+        window.contentView = container
+        window.makeFirstResponder(field)
+        let editor = try XCTUnwrap(field.currentEditor())
+        store.focusPage()
+        // Dismiss on the main queue's timer clock, the same one that paces focusPage's
+        // retries, so the field leaves within their budget however the runner stalls.
+        // A test-side sleep resumes through a separate enqueue and can overtake overdue
+        // main-queue timers after a stall, so wait for the handoff itself instead.
+        var heldWhileMounted: Bool?
+        var handedOffPromptly: Bool?
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            heldWhileMounted = window.firstResponder === editor
+            field.removeFromSuperview()
+            window.makeFirstResponder(nil)
+            // Same clock again: the pending 50 ms retry fires first even after a stall.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
+                handedOffPromptly = window.firstResponder === web
+            }
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while handedOffPromptly == nil || window.firstResponder !== web, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(heldWhileMounted, true, "Page focus must not take the keyboard from a still-mounted field")
+        XCTAssertEqual(handedOffPromptly, true, "Page focus must follow the dismissal within a retry or two")
+        XCTAssertTrue(window.firstResponder === web,
+                      "Dismissal can leave its field editor mounted until the transition finishes")
+    }
+
+}

@@ -1,0 +1,399 @@
+import Foundation
+import WebKit
+
+struct SiteBoost: Codable, Equatable, Sendable {
+    var enabled = true
+    var font = ""
+    var textScale = 1.0
+    var background = ""
+    var textColor = ""
+    var linkColor = ""
+    var hidden: [String] = []
+    var css = ""
+    var script = ""
+    var scriptEnabled = false
+
+    static let fonts = ["", "Georgia", "Helvetica Neue", "Avenir Next", "Menlo", "Palatino", "Times New Roman"]
+
+    var sanitized: Self {
+        var copy = self
+        if !Self.fonts.contains(font) { copy.font = "" }
+        copy.textScale = textScale.isFinite ? min(2, max(0.75, textScale)) : 1
+        for key in [\Self.background, \Self.textColor, \Self.linkColor] {
+            if copy[keyPath: key].range(of: "^#[0-9a-fA-F]{6}$", options: .regularExpression) == nil {
+                copy[keyPath: key] = ""
+            }
+        }
+        var seen = Set<String>()
+        copy.hidden = hidden.filter { !$0.isEmpty && $0.utf8.count <= 4096 && seen.insert($0).inserted }
+        return copy
+    }
+
+    var style: String {
+        guard enabled else { return "" }
+        let value = sanitized
+        var rules: [String] = []
+        if !value.font.isEmpty {
+            // Keep icon fonts and SVG glyphs intact.
+            rules.append("body, body :is(p,h1,h2,h3,h4,h5,h6,a,span,li,td,th,button,input,textarea,label,blockquote) { font-family: '\(value.font)' !important; }")
+        }
+        if !value.background.isEmpty {
+            rules.append("html, body { background-color: \(value.background) !important; } body :is(main,article,section,aside,header,footer,nav) { background-color: \(value.background) !important; }")
+        }
+        if !value.textColor.isEmpty { rules.append("body, body :is(p,h1,h2,h3,h4,h5,h6,span,li,td,th,label,blockquote) { color: \(value.textColor) !important; }") }
+        if !value.linkColor.isEmpty { rules.append("body a, body a * { color: \(value.linkColor) !important; }") }
+        // Each selector is its own rule: one stale selector must not discard the others.
+        rules += value.hidden.map { "\($0) { display: none !important; }" }
+        rules.append(value.css)
+        return rules.joined(separator: "\n")
+    }
+}
+
+@MainActor final class SiteBoostStore {
+    private struct Cached {
+        var data: Data?
+        var table: [String: SiteBoost]
+    }
+    private final class DefaultsWriter: @unchecked Sendable {
+        let defaults: UserDefaults
+        var results: [UUID: (generation: Int, data: Data?)] = [:] // lane-confined
+        init(_ defaults: UserDefaults) { self.defaults = defaults }
+        func persist(_ table: [String: SiteBoost], profile: UUID, key: String, generation: Int) -> Bool {
+            do {
+                let data = table.isEmpty ? nil : try JSONEncoder().encode(table)
+                if data != defaults.data(forKey: key) {
+                    if let data { defaults.set(data, forKey: key) }
+                    else { defaults.removeObject(forKey: key) }
+                }
+                results[profile] = (generation, data)
+                return true
+            } catch { NSLog("Timo: could not save Boosts: %@", error.localizedDescription); return false }
+        }
+    }
+    private let defaults: UserDefaults
+    private let writer: DefaultsWriter
+    private let background: Bool
+    private let lane = SessionPersistence()
+    private var cache: [UUID: Cached] = [:]
+    private var generations: [UUID: Int] = [:]
+    private var dirty = Set<UUID>()
+    private var debounce: [UUID: Task<Void, Never>] = [:]
+
+    /// Standalone stores remain durable for import/check callers. The application store
+    /// warms asynchronously and coalesces editor keystrokes before worker serialization.
+    init(defaults: UserDefaults, background: Bool = false) {
+        self.defaults = defaults; self.writer = DefaultsWriter(defaults); self.background = background
+    }
+    nonisolated static func key(_ profile: UUID) -> String { ProfileManager.defaultsKey("siteBoosts.v1", profile) }
+    private nonisolated static func decoded(_ data: Data?) -> [String: SiteBoost] {
+        guard let data, let raw = try? JSONDecoder().decode([String: SiteBoost].self, from: data) else { return [:] }
+        return raw.filter { URL(string: $0.key).flatMap(SiteBoosts.origin) == $0.key }.mapValues(\.sanitized)
+    }
+    func prepare(profiles: [UUID]) async {
+        for profile in profiles where cache[profile] == nil {
+            let key = Self.key(profile), writer = writer
+            let loaded = await lane.perform {
+                let data = writer.defaults.data(forKey: key)
+                return (data, Self.decoded(data))
+            }
+            if cache[profile] == nil { cache[profile] = Cached(data: loaded.0, table: loaded.1) }
+        }
+    }
+    func records(profile: UUID) -> [String: SiteBoost] {
+        // Pending local changes own the profile until the ordered publication completes.
+        if dirty.contains(profile) { return cache[profile]?.table ?? [:] }
+        let data = defaults.data(forKey: Self.key(profile))
+        if let cached = cache[profile], cached.data == data { return cached.table }
+        let table = Self.decoded(data)
+        cache[profile] = Cached(data: data, table: table)
+        return table
+    }
+    func get(origin: String, profile: UUID) -> SiteBoost { records(profile: profile)[origin] ?? SiteBoost() }
+    func set(_ value: SiteBoost, origin: String, profile: UUID) {
+        guard URL(string: origin).flatMap(SiteBoosts.origin) == origin else { return }
+        var table = records(profile: profile)
+        let value = value.sanitized
+        guard (table[origin] ?? SiteBoost()) != value else { return }
+        if value == SiteBoost() { table.removeValue(forKey: origin) } else { table[origin] = value }
+        update(table, profile: profile)
+    }
+    private func update(_ table: [String: SiteBoost], profile: UUID) {
+        cache[profile] = Cached(data: cache[profile]?.data, table: table)
+        generations[profile, default: 0] += 1
+        dirty.insert(profile)
+        debounce[profile]?.cancel()
+        if background {
+            debounce[profile] = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
+                self?.submit(profile)
+            }
+        } else {
+            let key = Self.key(profile), generation = generations[profile]!
+            if lane.sync({ writer.persist(table, profile: profile, key: key, generation: generation) }) {
+                acknowledge(profile, generation: generation, data: lane.sync { writer.results[profile]?.data })
+            }
+        }
+    }
+    private func acknowledge(_ profile: UUID, generation: Int, data: Data?) {
+        guard generations[profile] == generation else { return }
+        cache[profile]?.data = data
+        dirty.remove(profile)
+    }
+    private func submit(_ profile: UUID) {
+        debounce.removeValue(forKey: profile)?.cancel()
+        guard dirty.contains(profile), let table = cache[profile]?.table else { return }
+        let key = Self.key(profile), generation = generations[profile]!, writer = writer
+        lane.enqueue(file: URL(fileURLWithPath: "/siteBoosts/" + profile.uuidString)) { [weak self] in
+            let ok = writer.persist(table, profile: profile, key: key, generation: generation)
+            if ok {
+                let data = writer.results[profile]?.data
+                Task { @MainActor [weak self] in self?.acknowledge(profile, generation: generation, data: data) }
+            }
+            return ok
+        }
+    }
+    func flush() async -> Bool {
+        repeat {
+            for profile in Array(dirty) { submit(profile) }
+            guard await lane.flush() else { return false }
+            let writer = writer
+            let results = await lane.perform { writer.results }
+            for (profile, result) in results { acknowledge(profile, generation: result.generation, data: result.data) }
+        } while !dirty.isEmpty
+        return true
+    }
+
+    func forget(profile: UUID) { update([:], profile: profile) }
+}
+
+@MainActor enum SiteBoosts {
+    final class Document {
+        weak var tab: Tab?
+        let tabID: UUID
+        let origin: String
+        let stamp: Double // Captured only for diagnostics; identity uses tokens.
+        let token: String
+        var pageToken: String?
+        var tokenCapture: (id: UUID, task: Task<String?, Never>)?
+        var scriptRan = false
+        init(tab: Tab, origin: String, stamp: Double, token: String) { self.tab = tab; self.tabID = tab.id; self.origin = origin; self.stamp = stamp; self.token = token }
+    }
+    private static let store = SiteBoostStore(defaults: .timo, background: true)
+    private static var privateValues: [UUID: [String: SiteBoost]] = [:]
+    private static var documents: [UUID: Document] = [:]
+
+    nonisolated static func origin(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              var host = url.host()?.lowercased(), !host.isEmpty else { return nil }
+        if host.contains(":"), !host.hasPrefix("[") { host = "[\(host)]" }
+        let port = url.port
+        let suffix = port != nil && port != (scheme == "https" ? 443 : 80) ? ":\(port!)" : ""
+        return "\(scheme)://\(host)\(suffix)"
+    }
+
+    static func prepare(profiles: [UUID]) async { await store.prepare(profiles: profiles) }
+    static func flushPersistence() async -> Bool { await store.flush() }
+    static var synchronizationStore: SiteBoostStore { store }
+
+    static func document(for tab: Tab) -> Document? { documents[tab.id] }
+    static func records(profile: UUID) -> [String: SiteBoost] { store.records(profile: profile) }
+    static func value(origin: String, tab: Tab) -> SiteBoost {
+        tab.isPrivate ? privateValues[tab.id]?[origin] ?? SiteBoost() : store.get(origin: origin, profile: tab.profileID)
+    }
+    static func set(_ boost: SiteBoost, origin: String, tab: Tab) {
+        guard URL(string: origin).flatMap(Self.origin) == origin else { return }
+        let boost = boost.sanitized
+        if !tab.isPrivate {
+            set(boost, origin: origin, profile: tab.profileID)
+            return
+        }
+        if boost == SiteBoost() { privateValues[tab.id]?.removeValue(forKey: origin) }
+        else { privateValues[tab.id, default: [:]][origin] = boost }
+        for doc in documents.values {
+            guard let other = doc.tab, doc.origin == origin, other === tab else { continue }
+            apply(to: other, document: doc)
+        }
+        SiteChanges.shared.bump()
+    }
+
+    /// Library actions also work when the boosted site has no open tab.
+    static func set(_ boost: SiteBoost, origin: String, profile: UUID) {
+        guard URL(string: origin).flatMap(Self.origin) == origin else { return }
+        store.set(boost, origin: origin, profile: profile)
+        for doc in documents.values {
+            guard let tab = doc.tab, doc.origin == origin,
+                  !tab.isPrivate, tab.profileID == profile else { continue }
+            apply(to: tab, document: doc)
+        }
+        SiteChanges.shared.bump()
+    }
+
+    static func receive(_ message: WKScriptMessage, tab: Tab) {
+        guard message.webView === tab.existingWeb, message.frameInfo.isMainFrame,
+              let body = message.body as? [String: Any], let origin = body["origin"] as? String,
+              let stamp = body["stamp"] as? Double, stamp.isFinite,
+              let token = body["token"] as? String, validToken(token),
+              let frameURL = message.frameInfo.request.url, Self.origin(frameURL) == origin,
+              let url = tab.currentURL, Self.origin(url) == origin else { return }
+        switch body["kind"] as? String {
+        case "ready", "restored":
+            let doc = Document(tab: tab, origin: origin, stamp: stamp, token: token)
+            documents[tab.id] = doc
+            apply(to: tab, document: doc)
+            if body["kind"] as? String == "restored" {
+                // BFCache restoration does not run document-end scripts again.
+                doc.scriptRan = true
+                Task { _ = await pageToken(document: doc) }
+            }
+        case "loaded":
+            guard let doc = documents[tab.id], doc.token == token, !doc.scriptRan else { return }
+            Task {
+                guard await pageToken(document: doc) != nil, documents[doc.tabID] === doc, !doc.scriptRan else { return }
+                doc.scriptRan = true
+                applyCurrent(doc)
+                let result = await runScript(document: doc)
+                if documents[doc.tabID] === doc, let tab = doc.tab { SiteBoostEditor.report(result, tab: tab) }
+            }
+        case "pick":
+            guard let doc = documents[tab.id], doc.token == token,
+                  let selector = body["selector"] as? String, !selector.isEmpty,
+                  selector.utf8.count <= 4096, SiteBoostEditor.acceptsPick(tab: tab) else { return }
+            SiteBoostEditor.pick(selector, tab: tab)
+        case "done":
+            guard documents[tab.id]?.token == token else { return }
+            SiteBoostEditor.stopZap(tab: tab)
+        default: break
+        }
+    }
+
+    private static func apply(to tab: Tab, document: Document) {
+        guard let web = tab.existingWeb else { return }
+        let boost = value(origin: document.origin, tab: tab)
+        web.callAsyncJavaScript("if (window.__timoBoost?.documentToken === token && location.origin === origin) window.__timoBoost.apply(css, scale);",
+            arguments: ["token": document.token, "origin": document.origin, "css": boost.style, "scale": boost.enabled ? boost.textScale : 1],
+            in: nil, in: SiteBoostScripts.world) { _ in }
+    }
+
+    static func zap(_ on: Bool, tab: Tab) {
+        guard let doc = documents[tab.id], let web = tab.existingWeb else { return }
+        web.callAsyncJavaScript("if (window.__timoBoost?.documentToken === token && location.origin === origin) window.__timoBoost.zap(on);",
+            arguments: ["token": doc.token, "origin": doc.origin, "on": on], in: nil, in: SiteBoostScripts.world) { _ in }
+    }
+
+    private static func validToken(_ token: String) -> Bool {
+        token.utf8.count == 32 && token.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    // Keep strong Tab reads inside synchronous calls. Background document work can
+    // outlive Close while WebKit answers, but must not keep the closed tab alive.
+    private static func currentWeb(_ doc: Document) -> WKWebView? {
+        guard let tab = doc.tab, documents[doc.tabID] === doc else { return nil }
+        return tab.existingWeb
+    }
+
+    private static func currentBoost(_ doc: Document) -> SiteBoost? {
+        guard let tab = doc.tab, documents[doc.tabID] === doc else { return nil }
+        return value(origin: doc.origin, tab: tab)
+    }
+
+    private static func applyCurrent(_ doc: Document) {
+        guard let tab = doc.tab, documents[doc.tabID] === doc else { return }
+        apply(to: tab, document: doc)
+    }
+
+    private static func matches(_ doc: Document, web: WKWebView) async -> Bool {
+        guard currentWeb(doc) === web else { return false }
+        let matches: Bool = await withCheckedContinuation { continuation in
+            web.callAsyncJavaScript("return window.__timoBoost?.documentToken === token && location.origin === origin;",
+                arguments: ["token": doc.token, "origin": doc.origin], in: nil, in: SiteBoostScripts.world) { result in
+                continuation.resume(returning: (try? result.get()) as? Bool ?? false)
+            }
+        }
+        return matches && currentWeb(doc) === web
+    }
+
+    /// timeOrigin can drift in a live WebKit document. Bind the immutable page marker
+    /// to its isolated token, checking both sides of the asynchronous cross-world read.
+    /// Manual and automatic script runs share this capture instead of racing it.
+    private static func pageToken(document doc: Document) async -> String? {
+        guard let web = currentWeb(doc), await matches(doc, web: web) else { return nil }
+        if let token = doc.pageToken { return token }
+        let capture: (id: UUID, task: Task<String?, Never>)
+        if let existing = doc.tokenCapture { capture = existing }
+        else {
+            capture = (UUID(), Task { @MainActor [weak web, weak doc] in
+                guard let web, let doc, await matches(doc, web: web) else { return nil }
+                let token: String? = await withCheckedContinuation { continuation in
+                    web.callAsyncJavaScript("return document.__timoBoostPageToken;", arguments: [:], in: nil, in: .page) { result in
+                        continuation.resume(returning: (try? result.get()) as? String)
+                    }
+                }
+                guard let token, validToken(token), await matches(doc, web: web) else { return nil }
+                return token
+            })
+            doc.tokenCapture = capture
+        }
+        let token = await capture.task.value
+        if doc.tokenCapture?.id == capture.id { doc.tokenCapture = nil }
+        guard let token, currentWeb(doc) === web else { return nil }
+        doc.pageToken = token
+        return token
+    }
+
+    static func runScript(tab: Tab) async -> String {
+        guard let doc = documents[tab.id] else { return "Load a page first." }
+        return await runScript(document: doc)
+    }
+
+    private static func runScript(document doc: Document) async -> String {
+        guard let web = currentWeb(doc), var boost = currentBoost(doc) else { return "Load a page first." }
+        guard boost.enabled, boost.scriptEnabled else { return "Enable JavaScript to run this script." }
+        guard !boost.script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "The script is empty." }
+        guard let token = await pageToken(document: doc) else { return "Page changed. Reload and try again." }
+        // The user's settings can change during token capture. Queue only current code
+        // and current opt-in, with no asynchronous gap after reading either one.
+        guard let current = currentBoost(doc) else { return "Page changed. Reload and try again." }
+        boost = current
+        guard boost.enabled, boost.scriptEnabled else { return "Enable JavaScript to run this script." }
+        guard !boost.script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "The script is empty." }
+        // Compile user code directly through WebKit: page CSP can block JavaScript eval().
+        let source = SiteBoostScripts.guardedScript(boost.script)
+        let result: String = await withCheckedContinuation { continuation in
+            web.callAsyncJavaScript(source, arguments: ["__timoOrigin": doc.origin, "__timoToken": token], in: nil, in: .page) { result in
+                switch result {
+                case .success(let value): continuation.resume(returning: value as? String ?? "Script applied.")
+                case .failure(let error):
+                    let details = (error as NSError).userInfo["WKJavaScriptExceptionMessage"] as? String ?? error.localizedDescription
+                    continuation.resume(returning: String(details.prefix(500)))
+                }
+            }
+        }
+        guard documents[doc.tabID] === doc else { return "Page changed. Reload and try again." }
+        return result
+    }
+
+    /// A provisional load can be cancelled or turn into a download; its old document survives.
+    static func beginNavigation(tab: Tab) { SiteBoostEditor.close(tab: tab) }
+
+    static func navigation(tab: Tab) {
+        SiteBoostEditor.close(tab: tab)
+        documents.removeValue(forKey: tab.id)
+    }
+    static func forget(tab: Tab) {
+        navigation(tab: tab)
+        privateValues.removeValue(forKey: tab.id)
+    }
+    static func forget(host: String, tab: Tab) {
+        let records = tab.isPrivate ? privateValues[tab.id] ?? [:] : store.records(profile: tab.profileID)
+        let matching = records.keys.filter { URL(string: $0)?.host()?.lowercased() == host.lowercased() }
+        for origin in matching { set(SiteBoost(), origin: origin, tab: tab) }
+    }
+
+    static func forget(profile: UUID) {
+        store.forget(profile: profile)
+        for doc in documents.values where doc.tab?.profileID == profile {
+            if let tab = doc.tab { apply(to: tab, document: doc) }
+        }
+        SiteChanges.shared.bump()
+    }
+}

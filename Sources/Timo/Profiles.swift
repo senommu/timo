@@ -1,0 +1,1916 @@
+import Foundation
+import CryptoKit
+import WebKit
+
+// MARK: - Sandbox
+
+/// Remembering a folder the user picked, under the App Sandbox.
+///
+/// A URL that came back from `NSOpenPanel` is readable for exactly one launch: powerbox
+/// hands the process a sandbox extension, and the extension dies with the process. What
+/// survives is *bookmark data* made with `.withSecurityScope`, and the access has to be
+/// re-taken with `startAccessingSecurityScopedResource()` before the path is touched
+/// again. Persisting `folder.path` instead — which is what Timo did before it was
+/// sandboxed — produces a list of strings the app can no longer open.
+///
+/// ponytail: one `[Data]` list per UserDefaults key, so a caller that was storing `[String]`
+/// paths swaps three call sites and keeps its own shape. Keep the URL that actually
+/// started each extension so replacing or deleting a choice can close it.
+@MainActor enum ScopedPaths {
+    private enum Owner: Hashable {
+        case preference(ObjectIdentifier, String)
+        case download(UUID)
+    }
+
+    private struct Scope {
+        var url: URL
+        var started: Bool
+        var owners: Set<Owner>
+    }
+
+    /// One kernel start per path. Each preference or download row holds a lease; the last
+    /// lease closes the exact URL that started the extension.
+    private static var accessing: [String: Scope] = [:]
+
+    private static func owner(_ key: String, _ defaults: UserDefaults) -> Owner {
+        .preference(ObjectIdentifier(defaults), key)
+    }
+
+    /// Every folder still reachable under `key`, access already started. Anything that no
+    /// longer resolves — folder deleted, volume gone, or a pre-sandbox plain path that the
+    /// sandbox will not grant — is dropped unless the caller preserves unavailable choices.
+    @discardableResult
+    static func urls(_ key: String, in defaults: UserDefaults = .timo, preservingUnavailable: Bool = false) -> [URL] {
+        let stored = raw(key, in: defaults)
+        let holder = owner(key, defaults)
+        var kept: [Data] = []
+        var out: [URL] = []
+        for data in stored {
+            guard let url = resolve(data), start(url, for: holder) else {
+                if preservingUnavailable { kept.append(data) }
+                continue
+            }
+            kept.append(data)
+            out.append(url)
+        }
+        let keptPaths = Set(out.map { $0.resolvingSymlinksInPath().path })
+        release(holder, except: keptPaths)
+        if kept.count != stored.count { defaults.set(kept, forKey: key) }
+        return out
+    }
+
+    static func paths(_ key: String, in defaults: UserDefaults = .timo) -> [String] {
+        urls(key, in: defaults).map(\.path)
+    }
+
+    /// Resolve a single saved choice without deleting it when a drive is temporarily
+    /// unavailable. Callers can fall back now and regain the choice on a later launch.
+    static func availableURL(_ key: String, in defaults: UserDefaults = .timo) -> URL? {
+        guard let data = raw(key, in: defaults).first,
+              let url = resolve(data), start(url, for: owner(key, defaults)) else { return nil }
+        return url
+    }
+
+    /// A download row keeps its own folder grant after the profile changes its current
+    /// destination. The row owns this data in downloads.json rather than UserDefaults.
+    static func bookmarkForLater(_ url: URL) -> Data? {
+        bookmark(url, requireScope: AppIcon.isSandboxed)
+    }
+
+    /// Path identity for migration only. Resolving a bookmark does not mean the
+    /// disconnected volume is accessible; callers must still start its scope to use it.
+    static func bookmarkedURL(_ data: Data) -> URL? { resolve(data) }
+
+    static func accessBookmark(_ data: Data, owner: UUID) -> URL? {
+        guard let url = resolve(data), start(url, for: .download(owner)) else { return nil }
+        return url
+    }
+
+    static func releaseBookmark(owner: UUID) {
+        release(.download(owner))
+    }
+
+    /// Focused selfcheck seam: counts leases, including readable unsandboxed paths.
+    static func activeOwnerCount(for url: URL) -> Int {
+        accessing[url.resolvingSymlinksInPath().path]?.owners.count ?? 0
+    }
+
+    /// Bookmark `url` and append it. False means the sandbox will not let this folder be
+    /// remembered — the honest answer to "can this be reopened next launch", and a caller
+    /// must not write down a path it cannot reopen.
+    @discardableResult
+    static func add(_ url: URL, to key: String, in defaults: UserDefaults = .timo) -> Bool {
+        guard let data = bookmark(url) else { return false }
+        var all = raw(key, in: defaults)
+        guard !all.contains(where: { same($0, url) }) else { return true }
+        all.append(data)
+        defaults.set(all, forKey: key)
+        _ = start(url, for: owner(key, defaults))
+        return true
+    }
+
+    /// Store one selected folder, replacing the previous choice only after the new
+    /// bookmark and access are valid. A sandboxed caller must not fall back to a plain
+    /// bookmark: it would appear to work until the panel's grant expires at relaunch.
+    @discardableResult
+    static func replace(_ url: URL?, at key: String, in defaults: UserDefaults = .timo) -> Bool {
+        let holder = owner(key, defaults)
+        guard let url else {
+            defaults.removeObject(forKey: key)
+            release(holder)
+            return true
+        }
+        guard let data = bookmark(url, requireScope: AppIcon.isSandboxed),
+              start(url, for: holder) else {
+            return false
+        }
+        defaults.set([data], forKey: key)
+        release(holder, except: [url.resolvingSymlinksInPath().path])
+        return true
+    }
+
+    static func remove(path: String, from key: String, in defaults: UserDefaults = .timo, bookmark: Data? = nil) {
+        let url = URL(fileURLWithPath: path)
+        defaults.set(raw(key, in: defaults).filter { $0 != bookmark && !same($0, url) }, forKey: key)
+        release(owner(key, defaults), at: url.resolvingSymlinksInPath().path)
+    }
+
+    /// The original bytes identify an unavailable choice even when URL resolution fails.
+    /// Reading its embedded path also lets legacy consumers follow Finder relocation.
+    static func savedChoices(_ key: String, in defaults: UserDefaults = .timo) -> [(data: Data, url: URL?, originalPath: String?)] {
+        raw(key, in: defaults).map { data in
+            let original = (NSURL.resourceValues(forKeys: [.pathKey], fromBookmarkData: data)?[.pathKey] as? String)
+                .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+            return (data, resolve(data), original)
+        }
+    }
+
+    /// A resolved bookmark comes back through the data volume's firmlink — under the
+    /// sandbox `~/Downloads/x` resolves to `/System/Volumes/Data/Users/…/Downloads/x` —
+    /// so identity is only meaningful after resolving symlinks on both sides.
+    /// Compare paths, not URLs: a directory bookmark resolves with a trailing slash while
+    /// URL(fileURLWithPath:) has none, so the URLs differ even though the folder is the
+    /// same one. Comparing URL objects here let the same folder be bookmarked twice, and
+    /// stopped remove(path:) from matching what add() had written.
+    private static func same(_ data: Data, _ url: URL) -> Bool {
+        guard let resolved = resolve(data)?.resolvingSymlinksInPath().path else { return false }
+        return resolved == url.resolvingSymlinksInPath().path
+    }
+
+    // MARK: internals
+
+    /// Tolerates the pre-sandbox `[String]` shape by re-bookmarking each path. Unsandboxed
+    /// that succeeds and the list upgrades itself in place; sandboxed the paths are not
+    /// readable, `bookmark` fails, and they fall out — which is the correct outcome, the
+    /// user has to pick the folder again.
+    private static func raw(_ key: String, in defaults: UserDefaults) -> [Data] {
+        let stored = defaults.array(forKey: key) ?? []
+        if let datas = stored as? [Data] { return datas }
+        let upgraded = (stored as? [String] ?? []).compactMap { bookmark(URL(fileURLWithPath: $0)) }
+        defaults.set(upgraded, forKey: key)
+        return upgraded
+    }
+
+    /// Outside the sandbox `.withSecurityScope` is refused; a plain bookmark is all that is
+    /// needed there, and resolving one grants access the process already had.
+    private static func bookmark(_ url: URL, requireScope: Bool = false) -> Data? {
+        if let scoped = try? url.bookmarkData(options: .withSecurityScope,
+                                               includingResourceValuesForKeys: nil, relativeTo: nil) {
+            return scoped
+        }
+        return requireScope ? nil : (try? url.bookmarkData())
+    }
+
+    private static func resolve(_ data: Data) -> URL? {
+        var stale = false
+        if let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
+                              bookmarkDataIsStale: &stale) { return url }
+        return try? URL(resolvingBookmarkData: data, options: [], bookmarkDataIsStale: &stale)
+    }
+
+    /// True when the path is usable. Unsandboxed `startAccessing` returns false for a plain
+    /// bookmark and the path is readable anyway, so a readability check is the real answer.
+    private static func start(_ url: URL, for owner: Owner) -> Bool {
+        let real = url.resolvingSymlinksInPath().path
+        if var scope = accessing[real] {
+            if !scope.started && url.startAccessingSecurityScopedResource() {
+                scope.url = url
+                scope.started = true
+            }
+            guard scope.started || FileManager.default.isReadableFile(atPath: url.path) else {
+                return false
+            }
+            scope.owners.insert(owner)
+            accessing[real] = scope
+            if case .download = owner { release(owner, except: [real]) }
+            return true
+        }
+        let started = url.startAccessingSecurityScopedResource()
+        guard started || FileManager.default.isReadableFile(atPath: url.path) else { return false }
+        accessing[real] = Scope(url: url, started: started, owners: [owner])
+        if case .download = owner { release(owner, except: [real]) }
+        return true
+    }
+
+    private static func release(_ owner: Owner, at path: String) {
+        guard var scope = accessing[path] else { return }
+        scope.owners.remove(owner)
+        if scope.owners.isEmpty {
+            accessing.removeValue(forKey: path)
+            if scope.started { scope.url.stopAccessingSecurityScopedResource() }
+        } else {
+            accessing[path] = scope
+        }
+    }
+
+    private static func release(_ owner: Owner, except retained: Set<String> = []) {
+        for path in Array(accessing.keys) where !retained.contains(path) {
+            release(owner, at: path)
+        }
+    }
+
+    private static func stopAll() {
+        for scope in accessing.values where scope.started {
+            scope.url.stopAccessingSecurityScopedResource()
+        }
+        accessing.removeAll()
+    }
+
+    // MARK: check
+
+    /// Proves the whole mechanism against a real folder outside the container: bookmark,
+    /// persist as `Data`, resolve, take access, read through it, drop it. Run this from a
+    /// *sandboxed* binary and it is the only thing standing between a user's extensions and
+    /// silently vanishing on the second launch.
+    static func check() -> [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        func assert(_ n: String, _ ok: Bool) { out.append((n, ok)) }
+
+        let fm = FileManager.default
+        // ~/Downloads, because it is genuinely outside the container — a container-internal
+        // path would pass without the entitlement doing anything — and the downloads
+        // entitlement is what lets the check create a scratch folder there. Falls back to
+        // the temp directory on a machine with no ~/Downloads, where the API is still
+        // exercised but the sandbox boundary is not crossed.
+        let name = "timo-scoped-check-\(UUID().uuidString)"
+        var folder = fm.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(name, isDirectory: true)
+        var outside = true
+        if (try? fm.createDirectory(at: folder, withIntermediateDirectories: true)) == nil {
+            outside = false
+            folder = fm.temporaryDirectory.appendingPathComponent(name, isDirectory: true)
+            try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        assert("~/Downloads is writable, so the bookmark crosses the container boundary", outside)
+        defer { try? fm.removeItem(at: folder) }
+        let marker = folder.appendingPathComponent("manifest.json")
+        try? Data(#"{"manifest_version":3,"name":"x","version":"1"}"#.utf8).write(to: marker)
+
+        let suite = "timo.scoped.check.\(ProcessInfo.processInfo.processIdentifier)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            return [("scratch defaults suite is available", false)]
+        }
+        defer { UserDefaults.dropScratchSuite(suite) }
+        let key = "folders"
+
+        assert("a user-picked folder can be bookmarked", add(folder, to: key, in: defaults))
+        assert("the bookmark is stored as Data, not a path string",
+               (defaults.array(forKey: key) as? [Data])?.count == 1)
+        assert("adding the same folder twice does not duplicate it",
+               add(folder, to: key, in: defaults) && (defaults.array(forKey: key) as? [Data])?.count == 1)
+
+        // The relaunch. Forgetting `accessing` is what a new process starts with, so this
+        // resolve has to take the extension again from the stored Data alone.
+        stopAll()
+        let resolved = urls(key, in: defaults)
+        assert("a stored bookmark resolves back to the same folder",
+               resolved.first?.resolvingSymlinksInPath().path == folder.resolvingSymlinksInPath().path)
+        assert("access is granted through the resolved bookmark",
+               resolved.first.map { fm.isReadableFile(atPath: $0.appendingPathComponent("manifest.json").path) } == true)
+        assert("the folder's contents are actually readable after resolving",
+               resolved.first.flatMap { try? Data(contentsOf: $0.appendingPathComponent("manifest.json")) }?.isEmpty == false)
+
+        remove(path: folder.path, from: key, in: defaults)
+        assert("removing a folder empties the stored list", raw(key, in: defaults).isEmpty)
+
+        // A new choice must release the old extension; removing the choice must close
+        // the remaining one. The check observes tracked scopes when macOS starts one.
+        let replacement = folder.deletingLastPathComponent()
+            .appendingPathComponent(name + "-replacement", isDirectory: true)
+        try? fm.createDirectory(at: replacement, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: replacement) }
+        _ = replace(folder, at: key, in: defaults)
+        let oldPath = folder.resolvingSymlinksInPath().path
+        _ = replace(replacement, at: key, in: defaults)
+        assert("replacing a selected folder releases its old scope",
+               accessing[oldPath] == nil)
+        _ = replace(nil, at: key, in: defaults)
+        assert("clearing a selected folder releases its scope",
+               accessing[replacement.resolvingSymlinksInPath().path] == nil)
+
+        // A folder that has gone away must fall out of the list instead of being retried.
+        _ = add(folder, to: key, in: defaults)
+        try? fm.removeItem(at: folder)
+        stopAll()
+        assert("a bookmark to a deleted folder is dropped, not retried forever",
+               urls(key, in: defaults).isEmpty && raw(key, in: defaults).isEmpty)
+
+        // Sanity: is the sandbox even on? ~/Pictures is not covered by any entitlement here.
+        let pictures = LegacyData.realHome.appendingPathComponent("Pictures")
+        let sandboxed = (try? fm.contentsOfDirectory(atPath: pictures.path)) == nil
+        assert("sandbox status: ~/Pictures is \(sandboxed ? "denied (sandboxed)" : "readable (NOT sandboxed)")",
+               true)
+        return out
+    }
+}
+
+/// The user's real home, for the read-only browser-import exceptions in Timo.entitlements.
+@MainActor enum LegacyData {
+    /// The *real* home directory. `NSHomeDirectory()` is redirected into the container
+    /// under the sandbox; the passwd entry is not.
+    nonisolated static let realHome: URL = {
+        guard let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir else {
+            return URL(fileURLWithPath: NSHomeDirectory())
+        }
+        return URL(fileURLWithPath: String(cString: dir))
+    }()
+}
+
+/// One isolated set of browsing data: its own cookie/website data store, its own
+/// history+bookmarks database, its own keychain items, favicons, pins, session, extensions
+/// and spaces.
+struct Profile: Identifiable, Codable, Equatable, Hashable {
+    /// A temporary browsing identity, never inserted into the saved profile list.
+    static let incognito = Profile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+                                   name: "Incognito", colorHex: "#000000")
+
+    let id: UUID
+    var name: String
+    var colorHex: String
+
+    init(id: UUID = UUID(), name: String, colorHex: String = "#6E7DD2") {
+        self.id = id
+        self.name = name
+        self.colorHex = colorHex
+    }
+
+    /// The profile that owns everything Timo wrote before profiles existed. See
+    /// `ProfileManager.suffix` — this is the whole of the migration.
+    var isDefault: Bool { id == ProfileManager.defaultID }
+}
+
+/// A named, ordered group of tabs inside exactly one profile. One profile has many spaces;
+/// a space never belongs to two profiles, which is why `profileID` is the only link and why
+/// spaces are stored in a per-profile file rather than one global list.
+struct Space: Identifiable, Codable, Equatable {
+    let id: UUID
+    var name: String
+    var profileID: UUID
+    var tabURLs: [URL]
+    /// The Favourites grid. The key is `pinnedURLs` because it predates the split between
+    /// Favourites and Pinned; renaming it would drop every existing space's grid.
+    var pinnedURLs: [URL]
+    /// Arc's Pinned section — the list rows between the space's name and the New Tab
+    /// divider. Optional so a spaces.json written before the split still decodes.
+    var pinnedTabURLs: [URL]?
+    /// The space's look. All optional, so a spaces.json written before any of this existed
+    /// still decodes — an Optional property gets `decodeIfPresent` for free. `icon` is an SF
+    /// Symbol name or emoji, `appearance` is "light"/"dark" (nil follows the system) and `tint` is how
+    /// strongly `colorHex` washes over the window ground, 0…1.
+    var colorHex: String?
+    var icon: String?
+    var appearance: String?
+    var tint: Double?
+    /// Every colour the ground is mixed from, first one first. `colorHex` is that first
+    /// colour, kept in step by `Spaces.setThemeColors`, so a space written before the theme
+    /// editor could hold more than one still reads as a one-colour theme and everything that
+    /// only knows about one — the footer dot, the toast, the Spaces menu — is untouched.
+    var colors: [String]?
+    /// Unclipped Display P3 colours; absent in older backups.
+    var themePalette: [ThemeColor]? = nil
+    /// Preset harmony survives neutral endpoints, where RGB no longer retains hue.
+    var themeHarmony: ThemeHarmony? = nil
+    /// How much static noise the ground wears, 0…1. See `Look.grain`.
+    var grain: Double?
+    /// Address-only row identities and layout, atomically committed with template-created Spaces.
+    var layout: SpaceLayout? = nil
+
+    init(id: UUID = UUID(), name: String, profileID: UUID,
+         tabURLs: [URL] = [], pinnedURLs: [URL] = [], pinnedTabURLs: [URL]? = nil,
+         colorHex: String? = nil, icon: String? = nil,
+         appearance: String? = nil, tint: Double? = nil,
+         colors: [String]? = nil, grain: Double? = nil) {
+        self.id = id
+        self.name = name
+        self.profileID = profileID
+        self.tabURLs = tabURLs
+        self.pinnedURLs = pinnedURLs
+        self.pinnedTabURLs = pinnedTabURLs
+        self.colorHex = colorHex
+        self.icon = icon
+        self.appearance = appearance
+        self.tint = tint
+        self.colors = colors
+        self.grain = grain
+    }
+}
+
+/// The profile list, the selection, and every per-profile path.
+///
+/// ponytail: a JSON file and a fixed UUID for the default profile, instead of a migration
+/// step that moves files around. Because the default profile's file names are the *old*
+/// names (`timo.db`, `session.json`, `favicons/`, the `pinnedTabs` default, keychain items
+/// with no security domain, `WKWebsiteDataStore.default()`), an existing installation is
+/// already inside its default profile on first launch — nothing is copied and nothing can
+/// be half-copied. Ceiling: the default profile can never be renamed *on disk*, so its
+/// files stay called `timo.db` forever. That is a cosmetic ceiling, not a functional one.
+@MainActor final class ProfileManager: ObservableObject {
+    static let shared = ProfileManager()
+
+    /// `000056616E65` is 'Timo' in ASCII. Fixed, because it is what makes the pre-profiles
+    /// data land in the default profile rather than being orphaned.
+    nonisolated static let defaultID = UUID(uuidString: "00000000-0000-0000-0000-000056616E65")!
+
+    /// Where profiles.json and every per-profile file lives. Injectable so `check()` can run
+    /// against a temp directory instead of the user's real Application Support folder.
+    let directory: URL
+    /// A sandboxed manager touches only files under `directory` — never the keychain, the
+    /// shared caches, UserDefaults or WebKit's data stores. `check()` uses one.
+    let sandboxed: Bool
+
+    @Published private(set) var profiles: [Profile] = []
+    lazy var chromeObservation = ProfileChromeObservation(manager: self)
+    struct SaveFailure: Identifiable, Equatable {
+        enum Target: Hashable { case profiles, deletion, spaces(UUID) }
+        let id: Target
+        let message: String
+        let canRetry: Bool
+        let details: String?
+
+        var title: String {
+            switch id {
+            case .profiles: canRetry ? "Profile changes aren’t saved" : "Profiles need recovery"
+            case .deletion: "Profile wasn’t deleted"
+            case .spaces: "Space changes aren’t saved"
+            }
+        }
+    }
+    @Published private(set) var saveFailures: [SaveFailure] = []
+    @Published private(set) var hasUnsavedProfileChanges = false
+    /// Invalidates Library cards in every window when any profile saves its Spaces.
+    @Published private(set) var spacesRevision = 0
+    @Published private var activeID: UUID = ProfileManager.defaultID
+    /// A damaged existing list is kept for recovery; no mutation may replace it with a
+    /// newly invented default profile.
+    private var profileListReadable = true
+    private var iCloudPlaceholderCache: [String: Set<UUID>]?
+    private var deletedProfileIDs = Set<UUID>()
+
+    /// The profile everything unqualified resolves to. Falls back to the first profile, so
+    /// a stale or deleted selection can never leave the app with no profile at all.
+    var active: Profile {
+        get { profiles.first { $0.id == activeID } ?? profiles[0] }
+        set {
+            guard profiles.contains(where: { $0.id == newValue.id }) else { return }
+            activeID = newValue.id
+            persist()
+        }
+    }
+
+    /// The active profile, readable from nonisolated code so it can be a default argument —
+    /// `Passwords` and the CSV importer are plain enums, and making them @MainActor would
+    /// infect Import.swift, which is not this file's to change.
+    /// ponytail: every call site is on the main thread; off it there is no safe way to read
+    /// the manager at all, so the default profile is the only honest answer.
+    nonisolated static var activeProfileID: UUID {
+        Thread.isMainThread ? MainActor.assumeIsolated { shared.active.id } : defaultID
+    }
+
+    private struct Disk: Codable {
+        var profiles: [Profile]
+        var activeID: UUID
+    }
+
+    init(directory: URL = Store.directory, sandboxed: Bool = false) {
+        self.directory = directory
+        self.sandboxed = sandboxed
+        let file = directory.appendingPathComponent("profiles.json")
+        if let data = try? Data(contentsOf: file),
+           let disk = try? JSONDecoder().decode(Disk.self, from: data),
+           !disk.profiles.isEmpty {
+            profiles = disk.profiles
+            activeID = disk.profiles.contains { $0.id == disk.activeID } ? disk.activeID : disk.profiles[0].id
+        } else {
+            profiles = [Profile(id: Self.defaultID, name: "Personal", colorHex: Self.palette[0])]
+            activeID = Self.defaultID
+            // An absent or unreadable directory is not evidence that the profile list
+            // never existed. It may return during this process's lifetime; only an
+            // accessible directory with no such entry permits first-launch creation.
+            if let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path),
+               !names.contains(file.lastPathComponent) {
+                persist()
+            } else {
+                profileListReadable = false
+                NSLog("Timo: could not read profiles.json; preserving it for recovery")
+                reportUnreadableProfiles()
+            }
+        }
+        // Deliberately not called inline: `ProfileManager.shared` is first touched from
+        // `Session.restore()`, which runs before `NSApplication.run()`, and WebKit's main
+        // WTF::RunLoop does not exist yet — `fetchAllDataStoreIdentifiers` delivers its
+        // completion into a null run loop and the app segfaults on launch. Hopping to the
+        // main actor puts it after the run loop is up, which is also when the profile's
+        // stores are least likely to be open.
+        if !sandboxed, Self.maySweepDataStores(dataDirectory: Store.overrideDirectory) {
+            let live = profiles.map(\.id)
+            Task { @MainActor in Self.sweepOrphanedDataStores(keeping: live) }
+        }
+    }
+
+    @discardableResult
+    private func persist(_ disk: Disk, deleting: Bool = false) -> Bool {
+        guard profileListReadable else {
+            NSLog("Timo: could not save profiles.json because the existing list is unreadable")
+            reportUnreadableProfiles()
+            return false
+        }
+        let target: SaveFailure.Target = deleting ? .deletion : .profiles
+        let message = deleting
+            ? "Your profile and its data are still here. Check storage and folder access, then try deleting it again."
+            : "Your latest changes are still here. Keep Timo open, check storage and folder access, then retry."
+        do {
+            let data = try JSONEncoder().encode(disk)
+            guard SnapshotPersistence.write(data, to: directory.appendingPathComponent("profiles.json"),
+                                            onFailure: { error in
+                self.reportSaveFailure(target, message: message, error: error,
+                                       canRetry: !deleting)
+            }) else { return false }
+            hasUnsavedProfileChanges = false
+            clearSaveFailure(.profiles)
+            if deleting { clearSaveFailure(.deletion) }
+            return true
+        } catch {
+            reportSaveFailure(target, message: message, error: error, canRetry: !deleting)
+            return false
+        }
+    }
+
+    @discardableResult
+    private func persist() -> Bool {
+        hasUnsavedProfileChanges = true
+        return persist(Disk(profiles: profiles, activeID: activeID))
+    }
+
+    /// Recapture the current list, including edits made since the first failure. Never
+    /// replay a rejected deletion or overwrite a list we could not read at launch.
+    @discardableResult
+    func retryProfileSave() -> Bool {
+        guard hasUnsavedProfileChanges else { return true }
+        return persist()
+    }
+
+    /// Every quit path retries pending edits before the user must explicitly discard them.
+    func prepareToQuit(discardChanges: () -> Bool) -> Bool {
+        retryProfileSave() || discardChanges()
+    }
+
+    private func reportUnreadableProfiles() {
+        reportSaveFailure(.profiles,
+                          message: "The saved profile list couldn’t be read. The original file is safe. Check folder access or restore profiles.json from a backup, then restart Timo.",
+                          canRetry: false)
+    }
+
+    private func reportSaveFailure(_ target: SaveFailure.Target, message: String,
+                                   error: Error? = nil, canRetry: Bool = false) {
+        let failure = SaveFailure(id: target, message: message, canRetry: canRetry,
+                                  details: error?.localizedDescription)
+        if let index = saveFailures.firstIndex(where: { $0.id == target }) {
+            if saveFailures[index] != failure { saveFailures[index] = failure }
+        } else {
+            saveFailures.append(failure)
+        }
+    }
+
+    private func clearSaveFailure(_ target: SaveFailure.Target) {
+        guard saveFailures.contains(where: { $0.id == target }) else { return }
+        saveFailures.removeAll { $0.id == target }
+    }
+
+    func dismissSaveFailure(_ target: SaveFailure.Target) {
+        // An unsaved or unreadable profile list needs a persistent recovery affordance.
+        guard target != .profiles else { return }
+        clearSaveFailure(target)
+    }
+
+    // MARK: CRUD
+
+    static let palette = ["#6E7DD2", "#D2795E", "#4FA07A", "#B45FA8", "#C7A03E", "#5AA3C7"]
+
+    @discardableResult
+    func create(name: String, colorHex: String? = nil) -> Profile {
+        let p = Profile(name: name, colorHex: colorHex ?? Self.palette[profiles.count % Self.palette.count])
+        Suspension.SpaceState.registerNewProfile(profileID: p.id, in: directory)
+        profiles.append(p)
+        persist()
+        return p
+    }
+
+    func rename(_ id: UUID, to name: String) {
+        guard let i = profiles.firstIndex(where: { $0.id == id }), !name.isEmpty else { return }
+        profiles[i].name = name
+        persist()
+    }
+
+    /// The profile's accent, picked from `palette`. Same shape as `rename` — `profiles` is
+    /// `private(set)` and `persist` is private, so the settings pane cannot do this itself.
+    func setColor(_ colorHex: String, for id: UUID) {
+        guard let i = profiles.firstIndex(where: { $0.id == id }) else { return }
+        profiles[i].colorHex = colorHex
+        persist()
+    }
+
+    /// Deletes the profile and everything that belongs to it. Refuses to delete the last
+    /// one — a browser with no profile has nowhere to put a tab.
+    @discardableResult
+    func delete(_ id: UUID) -> Bool {
+        guard profiles.count > 1, let i = profiles.firstIndex(where: { $0.id == id }) else { return false }
+        var remaining = profiles
+        remaining.remove(at: i)
+        let nextActiveID = activeID == id ? remaining[0].id : activeID
+        guard persist(Disk(profiles: remaining, activeID: nextActiveID), deleting: true) else { return false }
+        deletedProfileIDs.insert(id)
+        if !sandboxed { Store.retire(id) }
+        WebsitePopupWindow.forget(profileID: id)
+        profiles = remaining
+        activeID = nextActiveID
+        forgetLibraryPreferences(for: id)
+        Tab.discardPreparedFirstPage(for: id)
+        FavouritePreviews.shared.forget(profileID: id)
+
+        if !sandboxed {
+            // Close the sqlite connection and drop the cached objects before the files go.
+            Favicons.forget(id, retiring: true)
+            Task { await ExtensionHost.removePersistentData(for: id) }
+            ExtensionHost.forget(id)
+            do { try ExtensionCodeStore.removeProfile(id, directory: directory) }
+            catch { NSLog("[timo] Could not remove deleted profile extension code: %@", error.localizedDescription) }
+            Passwords.deleteAll(profileID: id)
+            SitePermissions.resetAll(profileID: id)
+            Self.removeArchivedPreferences(for: id)
+            for key in ["pinnedTabs", "offerToSavePasswords", "passwordsLastUsed", "passwordsNeverSaved", "blockerEnabled", "blockerSiteExceptions", ExtensionHost.baseKey,
+                        ExtensionHost.identifiersKey, ExtensionHost.namesKey, ExtensionHost.disabledKey, ExtensionHost.bookmarksKey, ExtensionConsent.baseKey,
+                        HTTPSOnly.exceptionsKey] {
+                UserDefaults.timo.removeObject(forKey: Self.defaultsKey(key, id))
+            }
+            _ = ScopedPaths.replace(nil, at: DownloadLocation.directoryKey(id))
+            UserDefaults.timo.removeObject(forKey: DownloadLocation.pendingDirectoryKey(id))
+            UserDefaults.timo.removeObject(forKey: DownloadLocation.askKey(id))
+            Self.eraseWebsiteData(for: id)
+        }
+
+        let fm = FileManager.default
+        let db = Self.dbURL(for: id, in: directory).path
+        for path in [db, db + "-wal", db + "-shm"] { try? fm.removeItem(atPath: path) }
+        RecoverySnapshots.forget(profileID: id, in: directory)
+        Downloads.forget(id, in: directory)
+        EaselStore.forget(id, directory: directory)
+        do { try ReadingQueueStore.forget(profileID: id, directory: directory) }
+        catch { Toasts.show("Could not remove offline articles: \(error.localizedDescription)") }
+        if !sandboxed { EaselWindow.forget(id) }
+        TidyTitles.forget(id)
+        Zoom.forget(profile: id)
+        SiteBoosts.forget(profile: id)
+        CertificateTrust.forget(profile: id)
+        ExternalApps.forgetAll(profileID: id)
+        try? fm.removeItem(at: WorkspaceTemplates.url(profile: id, directory: directory))
+        try? fm.removeItem(at: Self.spacesURL(for: id, in: directory))
+        if sandboxed { try? fm.removeItem(at: Self.faviconDir(for: id, in: directory)) }
+        return true
+    }
+
+    /// Deletes the profile and everything that belongs to it. Refuses to delete the last
+    /// one — a browser with no profile has nowhere to put a tab.
+    @discardableResult
+    func deleteAsync(_ id: UUID) async -> Bool {
+        guard !AppLifecycle.shared.persistenceExitInProgress else { return false }
+        activeTransactions += 1; defer { finishTransaction() }
+        guard profiles.count > 1, let i = profiles.firstIndex(where: { $0.id == id }) else { return false }
+        var remaining = profiles
+        remaining.remove(at: i)
+        let nextActiveID = activeID == id ? remaining[0].id : activeID
+        guard persist(Disk(profiles: remaining, activeID: nextActiveID), deleting: true) else { return false }
+        deletedProfileIDs.insert(id)
+        let faviconRetirement = sandboxed ? nil : Favicons.forget(id, retiring: true)
+        if !sandboxed { Store.retire(id) }
+        WebsitePopupWindow.forget(profileID: id)
+        profiles = remaining
+        activeID = nextActiveID
+        forgetLibraryPreferences(for: id)
+        // Invalidate documents before yielding to credential/database workers. A stale
+        // window must not enqueue new content for a profile already absent on disk.
+        EaselStore.forget(id, directory: directory)
+        do { try ReadingQueueStore.forget(profileID: id, directory: directory) }
+        catch { Toasts.show("Could not remove offline articles: \(error.localizedDescription)") }
+        await Suspension.SpaceState.retire(profileID: id, in: directory)
+        Tab.discardPreparedFirstPage(for: id)
+        FavouritePreviews.shared.forget(profileID: id)
+        await faviconRetirement?.value
+
+        if !sandboxed {
+            // Close the sqlite connection and drop the cached objects before the files go.
+            await Store.forgetAsync(id)
+            await ExtensionHost.removePersistentData(for: id)
+            do { try ExtensionCodeStore.removeProfile(id, directory: directory) }
+            catch { NSLog("[timo] Could not remove deleted profile extension code: %@", error.localizedDescription) }
+            _ = try? await Passwords.perform { Passwords.deleteAll(profileID: id) }
+            SitePermissions.resetAll(profileID: id)
+            Self.removeArchivedPreferences(for: id)
+            for key in ["pinnedTabs", "offerToSavePasswords", "passwordsLastUsed", "passwordsNeverSaved", "blockerEnabled", "blockerSiteExceptions", ExtensionHost.baseKey,
+                        ExtensionHost.identifiersKey, ExtensionHost.namesKey, ExtensionHost.disabledKey, ExtensionHost.bookmarksKey, ExtensionConsent.baseKey,
+                        HTTPSOnly.exceptionsKey] {
+                UserDefaults.timo.removeObject(forKey: Self.defaultsKey(key, id))
+            }
+            _ = ScopedPaths.replace(nil, at: DownloadLocation.directoryKey(id))
+            UserDefaults.timo.removeObject(forKey: DownloadLocation.pendingDirectoryKey(id))
+            UserDefaults.timo.removeObject(forKey: DownloadLocation.askKey(id))
+            Self.eraseWebsiteData(for: id)
+        }
+
+        let fm = FileManager.default
+        let db = Self.dbURL(for: id, in: directory).path
+        for path in [db, db + "-wal", db + "-shm"] { try? fm.removeItem(atPath: path) }
+        RecoverySnapshots.forget(profileID: id, in: directory)
+        Downloads.forget(id, in: directory)
+        await EaselStore.waitForRetirement(profileID: id, directory: directory)
+        if !sandboxed { EaselWindow.forget(id) }
+        TidyTitles.forget(id)
+        Zoom.forget(profile: id)
+        SiteBoosts.forget(profile: id)
+        CertificateTrust.forget(profile: id)
+        ExternalApps.forgetAll(profileID: id)
+        try? fm.removeItem(at: WorkspaceTemplates.url(profile: id, directory: directory))
+        try? fm.removeItem(at: Self.spacesURL(for: id, in: directory))
+        if sandboxed { try? fm.removeItem(at: Self.faviconDir(for: id, in: directory)) }
+        return true
+    }
+
+    static func removeArchivedPreferences(for id: UUID, defaults: UserDefaults = .timo) {
+        defaults.removeObject(forKey: defaultsKey("archivedTabs", id))
+        let suffix = suffix(id)
+        for base in ["pinShape", "todayShape"] {
+            defaults.removeObject(forKey: defaultsKey(base, id))
+            // Include orphaned Space keys, without touching another profile's shapes.
+            for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(base + ".") && key.hasSuffix(suffix) {
+                let space = String(key.dropFirst(base.count + 1).dropLast(suffix.count))
+                if UUID(uuidString: space) != nil { defaults.removeObject(forKey: key) }
+            }
+        }
+    }
+
+    private func forgetLibraryPreferences(for id: UUID) {
+        Archive.forget(id)
+        Self.removeArchivedPreferences(for: id)
+    }
+
+    /// Cookies, localStorage, IndexedDB, caches — everything WebKit keeps for a profile.
+    ///
+    /// Two things the original one-liner got wrong, both found by running the deletion path
+    /// for the first time:
+    ///
+    ///  * `WKWebsiteDataStore.remove(forIdentifier:)` fails while any live instance for that
+    ///    identifier is still around — and one always is, because deleting a profile does
+    ///    not close its windows, and every tab's web view holds the store. The error came
+    ///    back in a completion handler that was spelled `{ _ in }`, so the store, the
+    ///    cookies and the site databases silently stayed on disk.
+    ///  * the default profile was skipped entirely (`if id != defaultID`). It uses
+    ///    `WKWebsiteDataStore.default()`, which has no identifier to remove, so deleting the
+    ///    default profile erased its history and passwords and left every cookie behind.
+    ///
+    /// So: wipe the contents first, which always works and is the part the user actually
+    /// cares about, then try to unregister the store, which only matters for the empty
+    /// directory it leaves behind.
+    ///
+    /// The unregister step reliably fails in the launch that did the deleting —
+    /// `WKWebSiteDataStore Code=1 "Data store is in use (by network process)"` — because
+    /// WebKit's network process still has the store open. Nothing in-process makes it let
+    /// go, so `sweepOrphanedDataStores` finishes the job at the next launch, when nobody
+    /// has opened it yet.
+    ///
+    /// A profile that never opened a page is skipped entirely, because `dataStore(for:)`
+    /// *makes* the store it is asked for: erasing one that has nothing on disk would
+    /// register an empty store on the way to emptying it, and that store is then an orphan
+    /// for the next launch to sweep. Nothing registered is nothing to erase; the cached
+    /// instance, if there is one, is dropped either way.
+    private static func eraseWebsiteData(for id: UUID) {
+        // Only the normal installation's default profile uses `.default()`. A data-dir
+        // instance always has its own named store, including its Personal profile.
+        guard let storeID = dataStoreIdentifier(for: id, dataDirectory: Store.overrideDirectory)
+        else { return erase(for: id) }
+        registeredDataStores { registered in
+            Task { @MainActor in
+                guard registered.contains(storeID) else {
+                    dataStores[id] = nil
+                    return
+                }
+                erase(for: id)
+            }
+        }
+    }
+
+    /// The erase itself, once the profile is known to have a store worth emptying.
+    private static func erase(for id: UUID) {
+        let store = dataStore(for: id)
+        let storeID = dataStoreIdentifier(for: id, dataDirectory: Store.overrideDirectory)
+        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                         modifiedSince: .distantPast) {
+            MainActor.assumeIsolated {
+                dataStores[id] = nil
+                guard let storeID else { return }
+                WKWebsiteDataStore.remove(forIdentifier: storeID) { error in
+                    // Not fatal — the data is already gone — but never silent again.
+                    if let error { NSLog("Timo: profile store \(id) not unregistered: \(error)") }
+                }
+            }
+        }
+    }
+
+    /// Registered stores that no profile owns any more. Pure, so it can be asserted on.
+    nonisolated static func orphanedStores(_ registered: [UUID], keeping live: [UUID]) -> [UUID] {
+        // A regular installation must not sweep stores belonging to separate data-dir
+        // instances either. Their reserved namespace is outside this profile list.
+        registered.filter { !live.contains($0) && !isIsolatedDataStore($0) }
+    }
+
+    /// Run at launch. Picks up the store that `eraseWebsiteData` emptied but could not
+    /// unregister, and anything left behind by a crash mid-delete.
+    /// ponytail: fire-and-forget. Worst case it fails again and next launch tries again —
+    /// the data inside is already gone either way, so there is nothing to report to anyone.
+    private static func sweepOrphanedDataStores(keeping live: [UUID]) {
+        guard maySweepDataStores(dataDirectory: Store.overrideDirectory) else { return }
+        registeredDataStores { registered in
+            let orphans = orphanedStores(registered, keeping: live)
+            guard !orphans.isEmpty else { return }
+            Task { @MainActor in
+                for id in orphans where dataStores[id] == nil {
+                    WKWebsiteDataStore.remove(forIdentifier: id) { _ in }
+                }
+            }
+        }
+    }
+
+    // MARK: Paths
+    //
+    // Every per-profile name is "the old name + suffix", and the default profile's suffix is
+    // empty. That single rule is what makes an upgrade a no-op.
+
+    nonisolated static func suffix(_ id: UUID) -> String {
+        id == defaultID ? "" : "-" + id.uuidString.lowercased()
+    }
+
+    nonisolated static func dbURL(for id: UUID, in dir: URL) -> URL {
+        dir.appendingPathComponent("timo\(suffix(id)).db")
+    }
+
+    nonisolated static func sessionURL(for id: UUID, in dir: URL) -> URL {
+        dir.appendingPathComponent("session\(suffix(id)).json")
+    }
+
+    nonisolated static func spacesURL(for id: UUID, in dir: URL) -> URL {
+        dir.appendingPathComponent("spaces\(suffix(id)).json")
+    }
+
+    nonisolated static func faviconDir(for id: UUID, in dir: URL) -> URL {
+        dir.appendingPathComponent("favicons\(suffix(id))", isDirectory: true)
+    }
+
+    nonisolated static func defaultsKey(_ base: String, _ id: UUID) -> String { base + suffix(id) }
+
+    // MARK: Website data store
+
+    private static var dataStores: [UUID: WKWebsiteDataStore] = [:]
+
+    /// Only a normal launch owns the global profile list. A data-dir instance cannot
+    /// infer ownership from WebKit's global registry, even when its own list is empty.
+    nonisolated static func maySweepDataStores(dataDirectory: String?) -> Bool { dataDirectory == nil }
+
+    /// `fetchAllDataStoreIdentifiers` is a class method, so it can be the first WebKit call
+    /// this process makes — and it delivers its answer through WTF's main run loop, which
+    /// does not exist until some WebKit object has been made on the main thread. Called
+    /// before that it segfaults on a null lock: a ten-line program that calls it cold exits
+    /// 139. Launch after a crash is exactly the cold case — the restore alert spins the
+    /// run loop, the deferred sweep
+    /// runs, and no window has made a web view yet — so every relaunch crashed again.
+    private static func registeredDataStores(_ done: @escaping @Sendable ([UUID]) -> Void) {
+        WebKitStartup.prepare()
+        WKWebsiteDataStore.fetchAllDataStoreIdentifiers(done)
+    }
+
+    /// Preserve installed users' existing stores. Data-dir instances use a stable,
+    /// reserved UUID namespace derived from their directory and profile. In particular,
+    /// their fixed default profile must never resolve to WKWebsiteDataStore.default().
+    nonisolated static func dataStoreIdentifier(for profileID: UUID, dataDirectory: String?) -> UUID? {
+        guard let dataDirectory else { return profileID == defaultID ? nil : profileID }
+        let path = URL(fileURLWithPath: dataDirectory, isDirectory: true).standardizedFileURL.path
+        let input = "Timo.WebsiteData.v1\u{0}" + path + "\u{0}" + profileID.uuidString.lowercased()
+        var bytes = Array(SHA256.hash(data: Data(input.utf8)).prefix(16))
+        // 'TIMO', version 8 UUID: recognizable by the normal launch's orphan sweep.
+        // The remaining 90 hash bits distinguish directories and profiles.
+        bytes[0] = 0x56; bytes[1] = 0x41; bytes[2] = 0x4e; bytes[3] = 0x45
+        bytes[6] = (bytes[6] & 0x0f) | 0x80
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+    }
+
+    nonisolated private static func isIsolatedDataStore(_ id: UUID) -> Bool {
+        let value = id.uuid
+        return value.0 == 0x56 && value.1 == 0x41 && value.2 == 0x4e && value.3 == 0x45
+            && value.6 & 0xf0 == 0x80
+    }
+
+    /// Private tabs use .nonPersistent() instead. Cache keys are profile IDs because
+    /// TIMO_DATA_DIR is fixed for the process's lifetime.
+    static func dataStore(for id: UUID) -> WKWebsiteDataStore {
+        if id == Profile.incognito.id { return .nonPersistent() }
+        guard let storeID = dataStoreIdentifier(for: id, dataDirectory: Store.overrideDirectory)
+        else { return .default() }
+        if let existing = dataStores[id] { return existing }
+        let store = WKWebsiteDataStore(forIdentifier: storeID)
+        dataStores[id] = store
+        return store
+    }
+
+    /// Release Timo's strong reference before unregistering a temporary named store.
+    /// Callers must first tear down every web view that uses the profile.
+    static func releaseDataStore(for id: UUID) { dataStores[id] = nil }
+
+    // MARK: Spaces
+
+    /// Read filters on `profileID` as well as reading the profile's own file, so a space can
+    /// never surface under a profile that does not own it even if the file is edited by hand.
+    func spaces(for profileID: UUID) -> [Space] {
+        // Views ask on every store publication. The file stays the only source of truth:
+        // its identity, size and both timestamps are checked on each call, taken before the
+        // read, so any writer — this process or another — is seen by the next caller.
+        let stamp = spacesStamp(profileID)
+        if let stamp, let known = decodedSpaces[profileID], known.stamp == stamp { return known.spaces }
+        decodedSpaces[profileID] = nil
+        guard let data = try? Data(contentsOf: Self.spacesURL(for: profileID, in: directory)),
+              let all = try? JSONDecoder().decode([Space].self, from: data) else { return [] }
+        let owned = all.filter { $0.profileID == profileID }
+        if let stamp { decodedSpaces[profileID] = (stamp, owned, owned.count == all.count) }
+        return owned
+    }
+
+    private func spacesStamp(_ profileID: UUID) -> SpacesFileStamp? {
+        let path: String
+        if let known = spacesPaths[profileID] { path = known }
+        else {
+            path = Self.spacesURL(for: profileID, in: directory).path
+            spacesPaths[profileID] = path
+        }
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        return SpacesFileStamp(inode: info.st_ino, size: info.st_size,
+                               modified: info.st_mtimespec.tv_sec, modifiedNanoseconds: info.st_mtimespec.tv_nsec,
+                               changed: info.st_ctimespec.tv_sec, changedNanoseconds: info.st_ctimespec.tv_nsec)
+    }
+
+    private struct SpacesFileStamp: Equatable {
+        let inode: UInt64
+        let size: Int64
+        let modified: Int
+        let modifiedNanoseconds: Int
+        let changed: Int
+        let changedNanoseconds: Int
+    }
+    /// `complete`: the file held no foreign rows, so `spaces` is the whole decoded document.
+    private var decodedSpaces: [UUID: (stamp: SpacesFileStamp, spaces: [Space], complete: Bool)] = [:]
+    /// `directory` never changes, so neither does where a profile's Spaces are kept.
+    private var spacesPaths: [UUID: String] = [:]
+
+    /// Every saved Space, in profile order and then each profile's Space order.
+    /// Read-only: opening the Library must not create Spaces in unused profiles.
+    var allSpaces: [Space] { profiles.flatMap { spaces(for: $0.id) } }
+
+    /// Failed writes leave the committed list intact and publish a recovery warning even
+    /// when a caller ignores the result. Transactional callers must retry their action;
+    /// queuing these bytes could later replay a cancelled deletion or profile transfer.
+    @discardableResult
+    func saveSpaces(_ spaces: [Space], for profileID: UUID) -> Bool {
+        // Direct metadata writers also reject stale continuations after profile removal.
+        guard !deletedProfileIDs.contains(profileID) else { return false }
+        let owned = spaces.filter { $0.profileID == profileID }.map { space in
+            var space = space
+            if let layout = space.layout, (try? layout.validate()) != nil, !layout.matches(space) {
+                space.layout = layout.reconciled(with: space)
+            }
+            return space
+        }
+        let destination = Self.spacesURL(for: profileID, in: directory)
+        // Compare the actual committed metadata with the normalized owned snapshot.
+        // Missing/unreadable data and repaired layouts/foreign records are changes.
+        // The stat-stamped decode `spaces(for:)` keeps is the same document, unless it
+        // was filtered; callers like `updateSpace` have just read it, so skip a re-decode.
+        let previous: [Space]?
+        if let stamp = spacesStamp(profileID), let known = decodedSpaces[profileID],
+           known.stamp == stamp, known.complete {
+            previous = known.spaces
+        } else {
+            previous = (try? Data(contentsOf: destination)).flatMap {
+                try? JSONDecoder().decode([Space].self, from: $0)
+            }
+        }
+        let target = SaveFailure.Target.spaces(profileID)
+        // The committed document has already been decoded without filtering foreign
+        // rows. Only an exact owned snapshot may skip encoding and the atomic rewrite;
+        // missing, damaged or unreconciled metadata still takes the repair path below.
+        if previous == owned {
+            clearSaveFailure(target)
+            return true
+        }
+        let message = "The last saved version is safe. Check storage and folder access, then make the change again."
+        do {
+            let data = try JSONEncoder().encode(owned)
+            guard SnapshotPersistence.write(data, to: destination,
+                                            onFailure: { error in
+                self.reportSaveFailure(target, message: message, error: error)
+            }) else { return false }
+        } catch {
+            reportSaveFailure(target, message: message, error: error)
+            return false
+        }
+        clearSaveFailure(target)
+        if previous != owned { spacesRevision += 1 }
+        return true
+    }
+
+    /// Migrate profiles that predate Spaces. A saved empty list is intentional and stays
+    /// empty, including when the user deletes or moves away the profile's last Space.
+    ///
+    /// A profile without a Spaces file is brand new or predates Spaces. Older profiles
+    /// have tabs to account for: the pinned rows Timo kept in a profile-level
+    /// defaults key, and the Today tabs the caller hands in from the session file.
+    ///
+    /// The key is the awkward half. It was written by *any* window whose `currentSpaceID`
+    /// was nil or stale, so a profile can have Spaces **and** a stranded set of rows — and
+    /// nothing reads that key any more, so leaving it there loses those tabs for good.
+    /// So the merge is unconditional: with Spaces already present the rows go into the
+    /// last-used one (else the first), never into a Space of their own.
+    ///
+    /// The key is only removed once the Spaces holding those rows are demonstrably on disk.
+    /// If the write failed, the profile's Spaces are
+    /// returned as they were and the key is left for the next launch to try again — one
+    /// launch in the old spaceless shape beats a silently emptied Pinned section.
+    ///
+    /// `sessionTabs` is *only* ever the session being restored. Every other caller passes
+    /// nothing: reading the session file here would fold the pages a user just refused
+    /// ("Start Fresh", or `restoreSession` off) into their Space permanently.
+    ///
+    /// `spaces(for:)` above stays a plain read: it is called from a private window's chrome
+    /// and from `check()`, and neither may create a Space as a side effect of looking.
+    @discardableResult
+    func ensureSpaces(for profile: Profile, defaults: UserDefaults = .timo,
+                      sessionTabs: [URL] = []) -> [Space] {
+        if let data = try? Data(contentsOf: Self.spacesURL(for: profile.id, in: directory)),
+           let saved = try? JSONDecoder().decode([Space].self, from: data), saved.isEmpty {
+            return []
+        }
+        let key = TabStore.defaultsKey(.pinned, profile.id)
+        let stranded = (defaults.stringArray(forKey: key) ?? []).compactMap(URL.init(string:))
+        let existing = spaces(for: profile.id)
+
+        if !existing.isEmpty {
+            guard !stranded.isEmpty else { return existing }
+            // The Space the user was last looking at is the one those rows were pinned in
+            // front of; the first Space is the fallback when that is gone.
+            let last = TabStore.lastSpaceID(for: profile.id, defaults: defaults)
+            var merged = existing
+            let i = merged.firstIndex { $0.id == last } ?? 0
+            merged[i].pinnedTabURLs = Spaces.mergedPins(merged[i].pinnedTabURLs ?? [], stranded)
+            guard saveSpaces(merged, for: profile.id),
+                  spaces(for: profile.id) == merged else { return existing }
+            defaults.removeObject(forKey: key)
+            return merged
+        }
+
+        let space = Spaces.firstSpace(profileID: profile.id, name: profile.name,
+                                      colorHex: profile.colorHex, pinned: stranded,
+                                      today: sessionTabs)
+        guard saveSpaces([space], for: profile.id),
+              spaces(for: profile.id).contains(where: { $0.id == space.id }) else { return existing }
+        defaults.removeObject(forKey: key)
+        return [space]
+    }
+
+    @discardableResult
+    func createSpace(name: String, in profileID: UUID) -> Space {
+        let space = Space(name: name, profileID: profileID)
+        saveSpaces(spaces(for: profileID) + [space], for: profileID)
+        return space
+    }
+
+    /// Insert-or-replace, into the file of the profile the space says it belongs to.
+    @discardableResult
+    func updateSpace(_ space: Space) -> Bool {
+        var all = spaces(for: space.profileID)
+        if let i = all.firstIndex(where: { $0.id == space.id }) { all[i] = space } else { all.append(space) }
+        return saveSpaces(all, for: space.profileID)
+    }
+
+    /// Deleted, or moved to another profile — either way it is off this profile's list, so no
+    /// window here may go on keeping its pages alive behind the Space it is showing: there is
+    /// no strip left that could ever draw them again. See `Stash`.
+    @discardableResult
+    func deleteSpace(_ id: UUID, in profileID: UUID) -> Bool {
+        let all = spaces(for: profileID)
+        guard all.contains(where: { $0.id == id }),
+              saveSpaces(all.filter { $0.id != id }, for: profileID) else { return false }
+        TabStore.forgetStashes(space: id, profileID: profileID)
+        return true
+    }
+
+    /// Re-home a Space with the state stored outside spaces.json. The destination is written
+    /// first; a failed write leaves the source intact, where its windows can still find it.
+    /// Easel documents belong to their profile. Moving only their addresses would strand
+    /// the tabs in another repository, so those tabs must be removed before this operation.
+    func spaceContainsEasels(_ space: Space) -> Bool {
+        let urls = space.tabURLs + (space.pinnedTabURLs ?? [])
+        if urls.contains(where: { EaselAddress.boardID($0) != nil }) { return true }
+        let state = Suspension.SpaceState.load(space: space.id, profileID: space.profileID, in: directory)
+        return state.values.contains { $0.page.flatMap(EaselAddress.boardID) != nil }
+    }
+
+    @discardableResult
+    func moveSpace(_ id: UUID, from source: UUID, to destination: UUID,
+                   defaults: UserDefaults = .timo) -> Space? {
+        guard !movingSpace else { return nil }
+        let sourceSpaces = spaces(for: source)
+        guard source != destination,
+              profiles.contains(where: { $0.id == destination }),
+              let original = sourceSpaces.first(where: { $0.id == id }),
+              !spaceContainsEasels(original) else { return nil }
+        let destinationSpaces = spaces(for: destination)
+        guard !destinationSpaces.contains(where: { $0.id == id }) else { return nil }
+
+        let state = Suspension.SpaceState.load(space: id, profileID: source, in: directory).mapValues(\.withoutInteractionState)
+        guard Suspension.SpaceState.save(state, space: id, profileID: destination,
+                                         in: directory) else { return nil }
+        var moved = original
+        moved.profileID = destination
+        guard saveSpaces(destinationSpaces + [moved], for: destination) else {
+            Suspension.SpaceState.remove(space: id, profileID: destination, in: directory)
+            return nil
+        }
+        guard saveSpaces(sourceSpaces.filter { $0.id != id }, for: source) else {
+            _ = saveSpaces(destinationSpaces, for: destination)
+            Suspension.SpaceState.remove(space: id, profileID: destination, in: directory)
+            return nil
+        }
+        for kind in [TabKind.pinned, .today] {
+            let old = TabStore.shapeKey(kind, space: id, profileID: source)
+            let new = TabStore.shapeKey(kind, space: id, profileID: destination)
+            if let shape = defaults.data(forKey: old) { defaults.set(shape, forKey: new) }
+            else { defaults.removeObject(forKey: new) }
+            defaults.removeObject(forKey: old)
+        }
+        _ = Suspension.SpaceState.remove(space: id, profileID: source, in: directory)
+        TabStore.forgetStashes(space: id, profileID: source)
+        return moved
+    }
+
+    private var activeTransactions = 0
+    private var transactionWaiters: [CheckedContinuation<Void, Never>] = []
+    private func finishTransaction() {
+        activeTransactions -= 1
+        guard activeTransactions == 0 else { return }
+        let waiting = transactionWaiters; transactionWaiters = []; waiting.forEach { $0.resume() }
+    }
+    func waitForTransactions() async {
+        while activeTransactions > 0 { await withCheckedContinuation { transactionWaiters.append($0) } }
+    }
+    private var movingSpace = false
+    @discardableResult
+    func moveSpaceAsync(_ id: UUID, from source: UUID, to destination: UUID,
+                   defaults: UserDefaults = .timo) async -> Space? {
+        guard !movingSpace, !AppLifecycle.shared.persistenceExitInProgress else { return nil }
+        activeTransactions += 1; defer { finishTransaction() }
+        movingSpace = true; defer { movingSpace = false }
+        await Suspension.SpaceState.prepare(profiles: [source, destination], in: directory)
+        let sourceSpaces = spaces(for: source)
+        guard source != destination,
+              profiles.contains(where: { $0.id == destination }),
+              let original = sourceSpaces.first(where: { $0.id == id }),
+              !spaceContainsEasels(original) else { return nil }
+        let destinationSpaces = spaces(for: destination)
+        guard !destinationSpaces.contains(where: { $0.id == id }) else { return nil }
+
+        let state = Suspension.SpaceState.load(space: id, profileID: source, in: directory).mapValues(\.withoutInteractionState)
+        guard await Suspension.SpaceState.saveAsync(state, space: id, profileID: destination,
+                                         in: directory) else { return nil }
+        // Recheck both inventories after IO before publishing either list. Another
+        // window may have edited a Space or deleted a profile while this task yielded.
+        guard profiles.contains(where: { $0.id == source }), profiles.contains(where: { $0.id == destination }),
+              spaces(for: source) == sourceSpaces, spaces(for: destination) == destinationSpaces else {
+            _ = await Suspension.SpaceState.removeAsync(space: id, profileID: destination, in: directory)
+            return nil
+        }
+        var moved = original
+        moved.profileID = destination
+        guard saveSpaces(destinationSpaces + [moved], for: destination) else {
+            await Suspension.SpaceState.removeAsync(space: id, profileID: destination, in: directory)
+            return nil
+        }
+        guard saveSpaces(sourceSpaces.filter { $0.id != id }, for: source) else {
+            _ = saveSpaces(destinationSpaces, for: destination)
+            await Suspension.SpaceState.removeAsync(space: id, profileID: destination, in: directory)
+            return nil
+        }
+        for kind in [TabKind.pinned, .today] {
+            let old = TabStore.shapeKey(kind, space: id, profileID: source)
+            let new = TabStore.shapeKey(kind, space: id, profileID: destination)
+            if let shape = defaults.data(forKey: old) { defaults.set(shape, forKey: new) }
+            else { defaults.removeObject(forKey: new) }
+            defaults.removeObject(forKey: old)
+        }
+        _ = await Suspension.SpaceState.removeAsync(space: id, profileID: source, in: directory)
+        TabStore.forgetStashes(space: id, profileID: source)
+        return moved
+    }
+
+    // MARK: Offline check
+
+    /// Everything here runs against a throwaway temp directory with a sandboxed manager, so
+    /// no keychain, no WebKit, no UserDefaults and never the real Application Support folder.
+    static func check() -> [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        func assert(_ name: String, _ ok: Bool) { out.append((name, ok)) }
+
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("timo-profiles-\(UUID().uuidString)")
+        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let isolatedDefault = dataStoreIdentifier(for: defaultID, dataDirectory: "/tmp/timo-isolated-a")!
+        let otherProfile = UUID()
+        assert("the installed default profile preserves its existing default store",
+               dataStoreIdentifier(for: defaultID, dataDirectory: nil) == nil)
+        assert("an installed named profile preserves its existing store identifier",
+               dataStoreIdentifier(for: otherProfile, dataDirectory: nil) == otherProfile)
+        assert("a data-dir default profile never uses the installed default store",
+               isolatedDefault != defaultID && isIsolatedDataStore(isolatedDefault))
+        assert("a data-dir store identifier survives relaunch",
+               dataStoreIdentifier(for: defaultID, dataDirectory: "/tmp/timo-isolated-a") == isolatedDefault)
+        assert("different data directories do not share website data",
+               dataStoreIdentifier(for: defaultID, dataDirectory: "/tmp/timo-isolated-b") != isolatedDefault)
+        assert("profiles inside one data directory do not share website data",
+               dataStoreIdentifier(for: otherProfile, dataDirectory: "/tmp/timo-isolated-a") != isolatedDefault)
+        assert("equivalent directory spellings use one store",
+               dataStoreIdentifier(for: defaultID, dataDirectory: "/tmp/timo-isolated-a/../timo-isolated-a") == isolatedDefault)
+        assert("data-dir instances cannot run the global orphan sweep",
+               !maySweepDataStores(dataDirectory: "/tmp/timo-isolated-a") && maySweepDataStores(dataDirectory: nil))
+        assert("the normal orphan sweep leaves data-dir stores alone",
+               !orphanedStores([isolatedDefault, otherProfile], keeping: []).contains(isolatedDefault)
+               && orphanedStores([isolatedDefault, otherProfile], keeping: []) == [otherProfile])
+
+        // A Library opened in any profile must still discover the other profiles' Spaces.
+        do {
+            let directory = root.appendingPathComponent("library")
+            try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            let library = ProfileManager(directory: directory, sandboxed: true)
+            let school = library.create(name: "School")
+            let spare = library.create(name: "Spare")
+            let personalSpace = library.createSpace(name: "Sky", in: defaultID)
+            let schoolSpace = library.createSpace(name: "Sky", in: school.id)
+            let spareSpace = library.createSpace(name: "Reading", in: spare.id)
+            assert("the Library fixture saves all three Spaces",
+                   library.profiles.flatMap { library.spaces(for: $0.id) }.count == 3)
+            library.active = school
+            assert("the Library lists all three profiles' Spaces in profile order",
+                   library.allSpaces.map(\.id) == [personalSpace.id, schoolSpace.id, spareSpace.id])
+            library.active = spare
+            assert("changing the active profile does not hide Library Spaces",
+                   library.allSpaces.map(\.id) == [personalSpace.id, schoolSpace.id, spareSpace.id])
+            let second = library.createSpace(name: "Second", in: school.id)
+            assert("Library tab moves within the owning profile are allowed",
+                   Library.canMove(from: schoolSpace.id, to: second.id, profile: school.id, profiles: library))
+            assert("Library tab moves cannot cross profiles",
+                   !Library.canMove(from: schoolSpace.id, to: personalSpace.id, profile: school.id, profiles: library))
+            assert("a foreign source cannot move this profile's tabs",
+                   !Library.canMove(from: personalSpace.id, to: second.id, profile: school.id, profiles: library))
+            assert("a deleted destination cannot receive a Library tab",
+                   !Library.canMove(from: schoolSpace.id, to: UUID(), profile: school.id, profiles: library))
+            assert("moving a Library tab to its own Space is refused",
+                   !Library.canMove(from: schoolSpace.id, to: schoolSpace.id, profile: school.id, profiles: library))
+            library.deleteSpace(second.id, in: school.id)
+            let revision = library.spacesRevision
+            var renamed = spareSpace
+            renamed.name = "Updated Reading"
+            library.updateSpace(renamed)
+            assert("saving another profile's Space invalidates open Library cards",
+                   library.spacesRevision > revision
+                   && library.allSpaces.first { $0.id == spareSpace.id }?.name == "Updated Reading")
+            library.delete(spare.id)
+            assert("deleted profiles leave no Library cards",
+                   library.allSpaces.map(\.id) == [personalSpace.id, schoolSpace.id])
+        }
+
+        // Pre-existing, pre-profiles data sitting in the directory before any profile exists.
+        let legacyDB = root.appendingPathComponent("timo.db")
+        try? Data("legacy".utf8).write(to: legacyDB)
+
+        let pm = ProfileManager(directory: root, sandboxed: true)
+        assert("first launch creates exactly one profile", pm.profiles.count == 1)
+        assert("that profile is the fixed default id", pm.profiles[0].id == defaultID)
+        assert("the default profile's database is the pre-existing timo.db",
+               dbURL(for: defaultID, in: root) == legacyDB)
+        assert("pre-existing data is adopted, not orphaned or overwritten",
+               (try? Data(contentsOf: legacyDB)).map { String(decoding: $0, as: UTF8.self) } == "legacy")
+        assert("the default profile keeps the pre-profiles file names",
+               sessionURL(for: defaultID, in: root).lastPathComponent == "session.json"
+               && faviconDir(for: defaultID, in: root).lastPathComponent == "favicons"
+               && defaultsKey("pinnedTabs", defaultID) == "pinnedTabs")
+
+        let work = pm.create(name: "Work")
+        assert("create adds a profile", pm.profiles.count == 2)
+        assert("a created profile keeps the name it was given",
+               pm.profiles.last?.name == "Work" && !work.isDefault)
+        assert("per-profile store paths are distinct",
+               Set(pm.profiles.map { dbURL(for: $0.id, in: root).path }).count == 2)
+        assert("a non-default profile does not reuse the legacy names",
+               dbURL(for: work.id, in: root) != legacyDB
+               && sessionURL(for: work.id, in: root).lastPathComponent != "session.json"
+               && defaultsKey("pinnedTabs", work.id) != "pinnedTabs")
+
+        pm.rename(work.id, to: "School")
+        assert("rename sticks", pm.profiles.first { $0.id == work.id }?.name == "School")
+        pm.active = work
+        assert("active follows the selection", pm.active.id == work.id)
+
+        let reloaded = ProfileManager(directory: root, sandboxed: true)
+        assert("profiles round-trip through disk",
+               reloaded.profiles.count == 2 && reloaded.profiles.contains { $0.name == "School" })
+        assert("the active selection round-trips", reloaded.active.id == work.id)
+
+        // Make the profile-list destination unwritable while the victim's files remain
+        // available. A failed list update must not authorize erasing the only data for it.
+        let blockedRoot = root.appendingPathComponent("blocked-delete", isDirectory: true)
+        try? fm.createDirectory(at: blockedRoot, withIntermediateDirectories: true)
+        let blocked = ProfileManager(directory: blockedRoot, sandboxed: true)
+        let victim = blocked.create(name: "Keep Me")
+        let victimDB = dbURL(for: victim.id, in: blockedRoot)
+        let victimSession = sessionURL(for: victim.id, in: blockedRoot)
+        try? Data("database".utf8).write(to: victimDB)
+        try? Data("session".utf8).write(to: victimSession)
+        let list = blockedRoot.appendingPathComponent("profiles.json")
+        let savedList = blockedRoot.appendingPathComponent("profiles.backup.json")
+        try? fm.moveItem(at: list, to: savedList)
+        try? fm.createDirectory(at: list, withIntermediateDirectories: true)
+        let rejectedDelete = blocked.delete(victim.id)
+        assert("failed profile-list write refuses profile deletion", !rejectedDelete)
+        assert("failed profile deletion retains its in-memory entry", blocked.profiles.contains { $0.id == victim.id })
+        assert("failed profile deletion preserves database and session",
+               (try? Data(contentsOf: victimDB)) == Data("database".utf8)
+               && (try? Data(contentsOf: victimSession)) == Data("session".utf8))
+        assert("failed profile deletion leaves the last complete list readable",
+               (try? Data(contentsOf: savedList))
+                   .flatMap { try? JSONDecoder().decode(Disk.self, from: $0) }?
+                   .profiles.contains { $0.id == victim.id } == true)
+
+        let damagedRoot = root.appendingPathComponent("damaged-list", isDirectory: true)
+        try? fm.createDirectory(at: damagedRoot, withIntermediateDirectories: true)
+        let damagedList = damagedRoot.appendingPathComponent("profiles.json")
+        let damagedBytes = Data("incomplete profile JSON".utf8)
+        try? damagedBytes.write(to: damagedList)
+        _ = ProfileManager(directory: damagedRoot, sandboxed: true)
+        assert("opening a damaged profile list preserves the original bytes",
+               (try? Data(contentsOf: damagedList)) == damagedBytes)
+
+        let unavailableRoot = root.appendingPathComponent("unavailable-list", isDirectory: true)
+        let parkedRoot = root.appendingPathComponent("parked-list", isDirectory: true)
+        try? fm.createDirectory(at: unavailableRoot, withIntermediateDirectories: true)
+        let durable = ProfileManager(directory: unavailableRoot, sandboxed: true)
+        _ = durable.create(name: "Existing Work")
+        let originalList = try? Data(contentsOf: unavailableRoot.appendingPathComponent("profiles.json"))
+        try? fm.moveItem(at: unavailableRoot, to: parkedRoot)
+        let stranded = ProfileManager(directory: unavailableRoot, sandboxed: true)
+        try? fm.moveItem(at: parkedRoot, to: unavailableRoot)
+        _ = stranded.create(name: "Accidental Replacement")
+        assert("a temporarily unavailable directory cannot overwrite its restored profile list",
+               originalList != nil
+               && (try? Data(contentsOf: unavailableRoot.appendingPathComponent("profiles.json"))) == originalList)
+
+        // Spaces belong to exactly one profile.
+        let reading = pm.createSpace(name: "Reading", in: work.id)
+        pm.createSpace(name: "Inbox", in: defaultID)
+        assert("a new space belongs to the profile it was made in", reading.profileID == work.id)
+        assert("spaces list under their own profile", pm.spaces(for: work.id).map(\.name) == ["Reading"])
+        assert("a space never shows up under another profile",
+               pm.spaces(for: defaultID).map(\.name) == ["Inbox"])
+        assert("every space's profileID resolves to a live profile",
+               (pm.spaces(for: work.id) + pm.spaces(for: defaultID))
+                   .allSatisfy { s in pm.profiles.contains { $0.id == s.profileID } })
+        var edited = reading
+        edited.tabURLs = [URL(string: "https://example.com/a")!]
+        edited.pinnedURLs = [URL(string: "https://example.com/p")!]
+        pm.updateSpace(edited)
+        assert("space contents round-trip",
+               pm.spaces(for: work.id).first?.tabURLs.first?.absoluteString == "https://example.com/a"
+               && pm.spaces(for: work.id).first?.pinnedURLs.count == 1)
+        assert("updating a space replaces it instead of duplicating it",
+               pm.spaces(for: work.id).count == 1)
+        // A Space's tabs are not its whole saved state. Its scroll and navigation snapshot
+        // lives in a profile file, while each section's folders live in profile-keyed defaults.
+        let transferSuite = "timo.check.space-transfer.\(UUID().uuidString)"
+        if let defaults = UserDefaults(suiteName: transferSuite) {
+            defer { UserDefaults.dropScratchSuite(transferSuite) }
+            let transferRoot = root.appendingPathComponent("transfer", isDirectory: true)
+            try? fm.createDirectory(at: transferRoot, withIntermediateDirectories: true)
+            let transferManager = ProfileManager(directory: transferRoot, sandboxed: true)
+            let transferProfile = transferManager.create(name: "Transfer source")
+            let transferring = transferManager.createSpace(name: "Moving", in: transferProfile.id)
+            _ = transferManager.createSpace(name: "Spare", in: transferProfile.id)
+            _ = transferManager.createSpace(name: "Destination", in: defaultID)
+            var transferSpace = transferring
+            transferSpace.tabURLs = edited.tabURLs
+            transferManager.updateSpace(transferSpace)
+            let home = "https://example.com/a"
+            let state = Parked(title: "Kept page", state: Data([1, 2, 3]))
+            _ = Suspension.SpaceState.save([home: state], space: transferring.id,
+                                           profileID: transferProfile.id, in: transferRoot)
+            var pinShape = Pins()
+            _ = pinShape.newFolder(named: "Pinned group")
+            var todayShape = Pins()
+            _ = todayShape.newFolder(named: "Today group")
+            let pinData = try? JSONEncoder().encode(pinShape)
+            let todayData = try? JSONEncoder().encode(todayShape)
+            defaults.set(pinData, forKey: TabStore.shapeKey(.pinned, space: transferring.id,
+                                                            profileID: transferProfile.id))
+            defaults.set(todayData, forKey: TabStore.shapeKey(.today, space: transferring.id,
+                                                              profileID: transferProfile.id))
+            let moved = transferManager.moveSpace(transferring.id, from: transferProfile.id,
+                                                  to: defaultID, defaults: defaults)
+            assert("a moved Space keeps its id, urls and new profile",
+                   moved?.id == transferring.id && moved?.profileID == defaultID
+                   && moved?.tabURLs == edited.tabURLs)
+            assert("a moved Space leaves its source profile and enters its destination once",
+                   !transferManager.spaces(for: transferProfile.id).contains { $0.id == transferring.id }
+                   && transferManager.spaces(for: defaultID).filter { $0.id == transferring.id }.count == 1)
+            let transferredState = Suspension.SpaceState.load(space: transferring.id,
+                                                               profileID: defaultID, in: transferRoot)[home]
+            assert("a moved Space keeps its title but drops opaque state under the new profile",
+                   transferredState?.title == state.title && transferredState?.state == nil)
+            assert("a moved Space keeps both folder shapes under the new profile",
+                   defaults.data(forKey: TabStore.shapeKey(.pinned, space: transferring.id,
+                                                            profileID: defaultID)) == pinData
+                   && defaults.data(forKey: TabStore.shapeKey(.today, space: transferring.id,
+                                                               profileID: defaultID)) == todayData)
+            assert("moving a Space removes its old saved state and folder keys",
+                   Suspension.SpaceState.load(space: transferring.id, profileID: transferProfile.id,
+                                              in: transferRoot).isEmpty
+                   && defaults.data(forKey: TabStore.shapeKey(.pinned, space: transferring.id,
+                                                                profileID: transferProfile.id)) == nil
+                   && defaults.data(forKey: TabStore.shapeKey(.today, space: transferring.id,
+                                                               profileID: transferProfile.id)) == nil)
+            let last = transferManager.spaces(for: transferProfile.id).first!
+            assert("the last Space can move to another profile",
+                   transferManager.moveSpace(last.id, from: transferProfile.id,
+                                             to: defaultID, defaults: defaults)?.id == last.id)
+            assert("moving the last Space leaves its source profile empty on reopen",
+                   transferManager.ensureSpaces(for: transferProfile, defaults: defaults).isEmpty)
+        } else {
+            assert("scratch defaults for Space transfer are available", false)
+        }
+        // A spaces.json from before spaces had a look must still load, or upgrading throws
+        // away every space the user had.
+        let legacySpace = #"[{"id":"\#(UUID().uuidString)","name":"Old","profileID":"\#(work.id.uuidString)","tabURLs":[],"pinnedURLs":[]}]"#
+        assert("a space written before icons and theme colours existed still decodes",
+               (try? JSONDecoder().decode([Space].self, from: Data(legacySpace.utf8)))?.first
+                   .map { $0.name == "Old" && $0.icon == nil && $0.colorHex == nil
+                          && $0.appearance == nil && $0.tint == nil } == true)
+        assert("…and a space written before the gradient and the grain did too, with defaults",
+               (try? JSONDecoder().decode([Space].self, from: Data(legacySpace.utf8)))?.first
+                   .map { $0.colors == nil && $0.grain == nil } == true)
+        let oneColour = ##"[{"id":"\##(UUID().uuidString)","name":"Old","profileID":"\##(work.id.uuidString)","tabURLs":[],"pinnedURLs":[],"colorHex":"#4CAF6E"}]"##
+        assert("an older one-colour space reads as a one-colour theme, not as no theme",
+               (try? JSONDecoder().decode([Space].self, from: Data(oneColour.utf8)))?.first
+                   .map { Spaces.themeColors(of: $0) == ["#4CAF6E"] } == true)
+        var themed = edited
+        themed.icon = "leaf"
+        themed.colorHex = "#4FA07A"
+        themed.appearance = "dark"
+        themed.tint = 0.4
+        themed.colors = ["#4FA07A", "#5A9BD5"]
+        themed.grain = 0.6
+        pm.updateSpace(themed)
+        assert("a space's icon, colour, appearance and tint round-trip",
+               pm.spaces(for: work.id).first.map {
+                   $0.icon == "leaf" && $0.colorHex == "#4FA07A"
+                   && $0.appearance == "dark" && $0.tint == 0.4
+               } == true)
+        assert("…and so do its extra gradient colours and its grain",
+               pm.spaces(for: work.id).first.map {
+                   $0.colors == ["#4FA07A", "#5A9BD5"] && $0.grain == 0.6
+               } == true)
+        pm.updateSpace(edited)
+        pm.deleteSpace(reading.id, in: work.id)
+        assert("a deleted space is gone", pm.spaces(for: work.id).isEmpty)
+        let emptyProfile = pm.profiles.first { $0.id == work.id }!
+        assert("opening a profile whose last space was deleted leaves it empty",
+               pm.ensureSpaces(for: emptyProfile).isEmpty)
+        assert("an empty profile stays empty after reopening the manager",
+               ProfileManager(directory: root, sandboxed: true)
+                   .ensureSpaces(for: emptyProfile).isEmpty)
+
+        // A missing Spaces file is the legacy fixture; a saved empty list is intentional.
+        try? fm.removeItem(at: spacesURL(for: work.id, in: root))
+
+        // A profile that predates Spaces has its tabs in a profile-level defaults key and the
+        // session file. Both have to come back inside the Space that is made for it.
+        // A throwaway suite, so the real preferences are never read or written here.
+        let suite = "timo.check.\(UUID().uuidString)"
+        if let defaults = UserDefaults(suiteName: suite) {
+            defer { UserDefaults.dropScratchSuite(suite) }
+            let rowsKey = TabStore.defaultsKey(.pinned, work.id)
+            defaults.set(["https://pinned.example/one"], forKey: rowsKey)
+            let made = pm.ensureSpaces(for: pm.profiles.first { $0.id == work.id }!,
+                                       defaults: defaults,
+                                       sessionTabs: [URL(string: "https://open.example/two")!])
+            assert("a profile with no spaces is given exactly one", made.count == 1
+                   && pm.spaces(for: work.id).count == 1)
+            assert("it is named after the profile and wears its colour",
+                   made[0].name == "School" && made[0].colorHex == pm.profiles.first { $0.id == work.id }?.colorHex)
+            assert("the profile-level pinned rows moved into it",
+                   made[0].pinnedTabURLs?.first?.absoluteString == "https://pinned.example/one")
+            assert("the spaceless session tabs moved into it",
+                   made[0].tabURLs.first?.absoluteString == "https://open.example/two")
+            assert("the profile-level pinnedRows key is deleted, so nothing hands them back twice",
+                   defaults.stringArray(forKey: rowsKey) == nil)
+            assert("migrating twice makes no second space",
+                   pm.ensureSpaces(for: pm.profiles.first { $0.id == work.id }!,
+                                   defaults: defaults, sessionTabs: []).map(\.id) == [made[0].id])
+            assert("a profile that already has a space is left exactly as it is",
+                   pm.ensureSpaces(for: pm.profiles.first { $0.id == defaultID }!,
+                                   defaults: defaults, sessionTabs: []).map(\.name) == ["Inbox"])
+
+            // The nastier half: main wrote `pinnedRows` from *any* window whose Space was
+            // nil or stale, so a profile can have Spaces and a stranded set of rows at once.
+            // Nothing reads that key any more, so leaving it there loses those tabs for good.
+            let inboxKey = TabStore.defaultsKey(.pinned, defaultID)
+            defaults.set(["https://stranded.example/row"], forKey: inboxKey)
+            let inbox = pm.ensureSpaces(for: pm.profiles.first { $0.id == defaultID }!,
+                                        defaults: defaults, sessionTabs: [])
+            assert("stranded rows on a profile that already has spaces are not left behind",
+                   inbox.first?.pinnedTabURLs?.map(\.absoluteString)
+                       == ["https://stranded.example/row"])
+            assert("...and they go into an existing space rather than making a second one",
+                   inbox.count == 1 && inbox.first?.name == "Inbox")
+            assert("...and the key goes with them", defaults.stringArray(forKey: inboxKey) == nil)
+
+            // The write has to land before the only other copy is deleted. A manager whose
+            // directory is a *file* cannot write anything, which is the whole failure mode.
+            let wall = root.appendingPathComponent("not-a-directory")
+            try? Data("x".utf8).write(to: wall)
+            let stuck = ProfileManager(directory: wall, sandboxed: true)
+            let orphan = Profile(name: "Unwritable")
+            let orphanKey = TabStore.defaultsKey(.pinned, orphan.id)
+            defaults.set(["https://kept.example/row"], forKey: orphanKey)
+            assert("a migration that cannot reach the disk invents no space",
+                   stuck.ensureSpaces(for: orphan, defaults: defaults, sessionTabs: []).isEmpty)
+            assert("...and leaves the rows where the next launch will find them",
+                   defaults.stringArray(forKey: orphanKey) == ["https://kept.example/row"])
+        } else {
+            assert("a throwaway defaults suite can be made", false)
+        }
+        pm.saveSpaces([], for: work.id)
+        pm.updateSpace(edited)
+
+        // A profile's files must actually be on disk before deletion can prove anything.
+        try? Data("work".utf8).write(to: dbURL(for: work.id, in: root))
+        try? Data("[]".utf8).write(to: sessionURL(for: work.id, in: root))
+        assert("deleting a profile succeeds while others remain", pm.delete(work.id))
+        assert("deleting a profile removes it from the list",
+               pm.profiles.count == 1 && pm.profiles[0].id == defaultID)
+        assert("deleting the active profile moves the selection to a survivor",
+               pm.active.id == defaultID)
+        assert("deleting a profile deletes its database and session",
+               !fm.fileExists(atPath: dbURL(for: work.id, in: root).path)
+               && !fm.fileExists(atPath: sessionURL(for: work.id, in: root).path))
+        assert("deleting a profile removes its spaces",
+               pm.spaces(for: work.id).isEmpty
+               && !fm.fileExists(atPath: spacesURL(for: work.id, in: root).path))
+        assert("the surviving profile's spaces are untouched",
+               pm.spaces(for: defaultID).map(\.name) == ["Inbox"])
+        // Bytes, not just existence: `timo.db` is a prefix of every other profile's
+        // `timo-<uuid>.db`, so the default profile's history is what a sweep that matched
+        // on names rather than paths would truncate or rewrite in place.
+        assert("deleting a profile leaves the other profile's data alone",
+               (try? Data(contentsOf: legacyDB)) == Data("legacy".utf8))
+
+        assert("the last remaining profile cannot be deleted", pm.delete(defaultID) == false)
+        assert("...and is still there", pm.profiles.count == 1)
+        assert("deleting a profile that does not exist is refused",
+               pm.delete(UUID()) == false)
+
+        // Security-scoped bookmarks: the mechanism that makes every user-picked folder
+        // survive a relaunch once the app is sandboxed. Pure — files and defaults only.
+        out += ScopedPaths.check()
+
+        // Everything above ran with `sandboxed: true`, which is exactly the half of
+        // `delete(_:)` that does nothing. The destructive half runs for real, below.
+        out += liveDeletion()
+        return out
+    }
+
+    /// The half of `delete(_:)` that `check()` above cannot reach.
+    ///
+    /// `Store`, `Favicons` and `ExtensionHost` all resolve through the *real*
+    /// `Store.directory`, and the keychain and `WKWebsiteDataStore` have no injectable
+    /// form — so proving that deleting a profile really erases a keychain item, a database,
+    /// a favicon and a website data store means doing it for real. It is safe because every
+    /// name a throwaway profile owns is suffixed with its random UUID: its keychain items
+    /// are keyed on a security domain nothing else uses, its defaults keys carry the UUID,
+    /// its data store is addressed by the UUID. Nothing the user owns is in reach.
+    ///
+    /// ponytail: skipped under `selfcheck --pure`, which promises no keychain ACL prompt
+    /// and no WebKit — reading the flag off CommandLine beats threading a parameter through
+    /// a call site in a file this one does not own.
+    private static func liveDeletion() -> [(String, Bool)] {
+        guard !CommandLine.arguments.contains("--pure") else { return [] }
+        var out: [(String, Bool)] = []
+        func assert(_ name: String, _ ok: Bool) { out.append((name, ok)) }
+        let fm = FileManager.default
+        let dir = Store.directory
+        let pm = ProfileManager(directory: dir)
+
+        // The other half of the fix, and the only way to see it: this launch's startup sweep
+        // clearing the store the *previous* run of this check deleted but could not
+        // unregister. Vacuously true the first time, real every time after.
+        if maySweepDataStores(dataDirectory: Store.overrideDirectory) {
+            assert("a data store orphaned by an earlier launch is swept at startup",
+                   wait(20) { orphanedStores(dataStoreIdentifiers(), keeping: pm.profiles.map(\.id)).isEmpty })
+        } else {
+            assert("a data-dir deletion fixture does not sweep unrelated registered stores",
+                   !maySweepDataStores(dataDirectory: Store.overrideDirectory))
+        }
+
+        // MARK: sentinels for the surviving default profile
+        // Distinct hosts: `lookup` for the default profile carries no security domain, so a
+        // shared host would make the assertion depend on which item the keychain returned.
+        let keepHost = "timo-delete-check-keep.invalid"
+        let goneHost = "timo-delete-check-gone.invalid"
+        Passwords.save(host: keepHost, account: "survivor", password: "keep", profileID: defaultID)
+        let keepDir = faviconDir(for: defaultID, in: dir)
+        try? fm.createDirectory(at: keepDir, withIntermediateDirectories: true)
+        let keepIcon = keepDir.appendingPathComponent("timo-delete-check.invalid")
+        try? Data("keep".utf8).write(to: keepIcon)
+        // The real user's database is the one file in reach that is never opened and never
+        // written — only measured. So all it can be asked is that its size did not move,
+        // and, on a data directory that has no `timo.db` in it yet, that nothing conjured
+        // one: absent before and absent after says the same thing as identical before and
+        // after. That is not proof on its own, which is what the neighbour below is for.
+        let keepDB = dbURL(for: defaultID, in: dir)
+        func dbSize(_ url: URL) -> Int? { (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil }
+        let keepDBSize = dbSize(keepDB)
+        // Read-only: the real user's pinned tabs, never written by this check.
+        let keepPins = UserDefaults.timo.array(forKey: defaultsKey("pinnedTabs", defaultID)) as? [String]
+        let survivors = pm.profiles.map(\.id)
+
+        // The byte-for-byte half of the property needs a database this check owns and may
+        // fill, because the only other profile a fresh install has is the default one and
+        // that file is off limits. So: a neighbouring profile, with a real visit recorded
+        // in it through the real `Store`, taken away again once it has served its purpose.
+        // `-wal` is read alongside the database because in WAL mode that is where the row
+        // just recorded is still sitting, and `-shm` with it because that is the third file
+        // `delete` removes — between the three, every byte of the neighbour's history is
+        // covered, and a deletion that reached across to the wrong profile's files would
+        // have nowhere to hide.
+        func dbBytes(_ url: URL) -> [Data?] {
+            [url.path, url.path + "-wal", url.path + "-shm"].map { fm.contents(atPath: $0) }
+        }
+        let neighbour = pm.create(name: "Deletion Check Neighbour").id
+        let neighbourDB = dbURL(for: neighbour, in: dir)
+        Store.store(for: neighbour).record(URL(string: "https://timo-delete-check.invalid/keep")!,
+                                           title: "neighbour")
+        let neighbourBytes = dbBytes(neighbourDB)
+
+        // MARK: the throwaway, populated the way a used profile is
+        let victim = pm.create(name: "Deletion Check").id
+        let victimStoreID = dataStoreIdentifier(for: victim, dataDirectory: Store.overrideDirectory)!
+        Passwords.save(host: goneHost, account: "victim", password: "gone", profileID: victim)
+        Store.store(for: victim).record(URL(string: "https://timo-delete-check.invalid/v")!,
+                                        title: "victim")
+        let victimDB = dbURL(for: victim, in: dir)
+        let victimIcons = faviconDir(for: victim, in: dir)
+        try? fm.createDirectory(at: victimIcons, withIntermediateDirectories: true)
+        try? Data("icon".utf8).write(to: victimIcons.appendingPathComponent("example.com"))
+        try? Data("[]".utf8).write(to: sessionURL(for: victim, in: dir))
+        pm.createSpace(name: "Scratch", in: victim)
+        let victimKeys = ["pinnedTabs", "blockerEnabled", ExtensionHost.baseKey]
+            .map { defaultsKey($0, victim) }
+            + [DownloadLocation.directoryKey(victim), DownloadLocation.askKey(victim), defaultsKey("blockerSiteExceptions", victim)]
+        UserDefaults.timo.set(["https://pinned.example"], forKey: victimKeys[0])
+        UserDefaults.timo.set(false, forKey: victimKeys[1])
+        UserDefaults.timo.set([Data("bookmark".utf8)], forKey: victimKeys[2])
+        UserDefaults.timo.set([Data("download bookmark".utf8)], forKey: victimKeys[3])
+        UserDefaults.timo.set(true, forKey: victimKeys[4])
+        UserDefaults.timo.set(["example.com"], forKey: victimKeys[5])
+        let victimPermission = SitePermissions.Scope(
+            url: URL(string: "https://timo-delete-check.invalid"), profileID: victim)!
+        let neighbourPermission = SitePermissions.Scope(
+            url: URL(string: "https://timo-delete-check.invalid"), profileID: neighbour)!
+        SitePermissions.remember(scope: victimPermission, type: .camera, allow: true)
+        SitePermissions.remember(scope: neighbourPermission, type: .camera, allow: false)
+
+        // A website data store only exists on disk once something is written into it.
+        // Scoped so the only strong reference left is the manager's own cache — which is
+        // what `delete` drops. A live instance is exactly what stops WebKit unregistering.
+        do {
+            let cookie = HTTPCookie(properties: [
+                .domain: "timo-delete-check.invalid", .path: "/",
+                .name: "v", .value: "1", .expires: Date.now.addingTimeInterval(3600),
+            ])!
+            let box = Box()
+            dataStore(for: victim).httpCookieStore.setCookie(cookie) { box.done = true }
+            _ = wait(5) { box.done }
+        }
+
+        assert("a throwaway profile's keychain item is stored before deletion",
+               Passwords.lookup(host: goneHost, profileID: victim)?.password == "gone")
+        assert("a throwaway profile's database is on disk before deletion",
+               fm.fileExists(atPath: victimDB.path))
+        assert("a throwaway profile's favicon cache is on disk before deletion",
+               fm.fileExists(atPath: victimIcons.appendingPathComponent("example.com").path))
+        assert("a throwaway profile's website data store is registered before deletion",
+               dataStoreIdentifiers().contains(victimStoreID))
+        assert("a throwaway profile's cookie is in its data store before deletion",
+               cookieCount(victim) == 1)
+
+        // MARK: the thing under test
+        assert("deleting a populated profile succeeds", pm.delete(victim))
+        assert("deleting a profile forgets its camera grants",
+               SitePermissions.remembered(scope: victimPermission, type: .camera) == nil)
+        assert("deleting a profile leaves another profile's camera grants",
+               SitePermissions.remembered(scope: neighbourPermission, type: .camera) == false)
+
+        assert("deleting a profile deletes its keychain items",
+               Passwords.lookup(host: goneHost, profileID: victim) == nil)
+        assert("deleting a profile deletes its database, -wal and -shm",
+               ![victimDB.path, victimDB.path + "-wal", victimDB.path + "-shm"]
+                   .contains(where: fm.fileExists(atPath:)))
+        assert("deleting a profile deletes its favicon cache",
+               !fm.fileExists(atPath: victimIcons.path))
+        assert("deleting a profile deletes its session and spaces files",
+               !fm.fileExists(atPath: sessionURL(for: victim, in: dir).path)
+               && !fm.fileExists(atPath: spacesURL(for: victim, in: dir).path))
+        assert("deleting a profile deletes its UserDefaults keys",
+               victimKeys.allSatisfy { UserDefaults.timo.object(forKey: $0) == nil })
+        // Before the cookies are read back, because reading them re-creates the store and
+        // would re-register the identifier.
+        //
+        // WebKit will not unregister a store its network process still holds — this is the
+        // one thing running the deletion path for real turned up that cannot be fixed here.
+        // What can be checked is that the store is left in a state the next launch cleans
+        // up, and that the data inside is gone now rather than at some later launch.
+        let registered = dataStoreIdentifiers()
+        assert("an unregistered store is gone or retained safely for its namespace",
+               !registered.contains(victimStoreID) || isIsolatedDataStore(victimStoreID)
+               || orphanedStores(registered, keeping: survivors).contains(victimStoreID))
+        assert("the sweep never classifies a surviving profile's store as orphaned",
+               orphanedStores(registered, keeping: survivors).allSatisfy { !survivors.contains($0) })
+        assert("deleting a profile erases its cookies and site data",
+               wait(15) { cookieCount(victim) == 0 })
+        assert("deleting a profile drops its cached Store connection",
+               !fm.fileExists(atPath: victimDB.path))
+
+        // MARK: the survivor is untouched
+        assert("another profile's keychain items survive the sweep",
+               Passwords.lookup(host: keepHost, profileID: defaultID)?.password == "keep")
+        assert("another profile's database survives untouched, to the byte",
+               fm.fileExists(atPath: neighbourDB.path)
+               && dbBytes(neighbourDB) == neighbourBytes
+               && dbSize(keepDB) == keepDBSize)
+        assert("another profile's favicon cache survives", fm.fileExists(atPath: keepIcon.path))
+        assert("another profile's UserDefaults keys survive",
+               (UserDefaults.timo.array(forKey: defaultsKey("pinnedTabs", defaultID)) as? [String]) == keepPins)
+        assert("another profile's website data store survives",
+               dataStore(for: defaultID).isPersistent)
+
+        // The neighbour has said what it had to say; the list below is the one thing it
+        // would otherwise change.
+        pm.delete(neighbour)
+        assert("the profile list is back to exactly the profiles that were there before",
+               ProfileManager(directory: dir).profiles.map(\.id) == survivors)
+
+        // MARK: cleanup — the sentinels are the only thing this check leaves behind
+        Passwords.delete(host: keepHost, account: "survivor", profileID: defaultID)
+        try? fm.removeItem(at: keepIcon)
+        // Reading the cookies back above re-created the store; put that away again.
+        dataStores[victim] = nil
+        WKWebsiteDataStore.remove(forIdentifier: victimStoreID) { _ in }
+        return out
+    }
+
+    private static func cookieCount(_ id: UUID) -> Int {
+        let box = Box()
+        dataStore(for: id).httpCookieStore.getAllCookies { cookies in
+            box.count = cookies.count
+            box.done = true
+        }
+        _ = wait(5) { box.done }
+        return box.count
+    }
+
+    /// `check()` is synchronous and WebKit is not. Spins the main runloop rather than
+    /// blocking it, because the completion handlers land on this thread.
+    private static func wait(_ seconds: TimeInterval, until done: () -> Bool) -> Bool {
+        let deadline = Date.now.addingTimeInterval(seconds)
+        while !done(), Date.now < deadline {
+            RunLoop.current.run(mode: .default, before: Date.now.addingTimeInterval(0.05))
+        }
+        return done()
+    }
+
+    private static func dataStoreIdentifiers() -> [UUID] {
+        let box = Box()
+        registeredDataStores { ids in
+            box.ids = ids
+            box.done = true
+        }
+        _ = wait(5) { box.done }
+        return box.ids
+    }
+
+    /// A mutable box for the completion handlers above. They all land on the main thread,
+    /// which the runloop spin above is sitting on; `@unchecked` says so out loud.
+    private final class Box: @unchecked Sendable {
+        var done = false
+        var ids: [UUID] = []
+        var count = 0
+    }
+}
+
+// Committed, identity-preserving entry points for portable library reconciliation.
+extension ProfileManager {
+    func ensureICloudProfile(_ id: UUID) throws {
+        try ICloudApplyContext.check()
+        guard profileListReadable, !deletedProfileIDs.contains(id), id != Profile.incognito.id else { throw CocoaError(.fileReadCorruptFile) }
+        if profiles.contains(where: { $0.id == id }) { return }
+        try markICloudPlaceholder(id, category: "profiles", placeholder: true)
+        try mergeICloudProfile(Profile(id: id, name: "Synced profile"), placeholder: true)
+    }
+
+    func mergeICloudProfile(_ profile: Profile, position: Int? = nil, placeholder: Bool = false) throws {
+        guard profile.id != Profile.incognito.id, !deletedProfileIDs.contains(profile.id), profileListReadable else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        var next = profiles.filter { $0.id != profile.id }
+        let old = profiles.firstIndex { $0.id == profile.id } ?? next.count
+        next.insert(profile, at: min(max(0, position ?? old), next.count))
+        try ICloudApplyContext.check()
+        guard persist(Disk(profiles: next, activeID: activeID)) else { throw CocoaError(.fileWriteUnknown) }
+        profiles = next
+        if !placeholder { try markICloudPlaceholder(profile.id, category: "profiles", placeholder: false) }
+    }
+
+    private func iCloudPlaceholders() throws -> [String: Set<UUID>] {
+        if let iCloudPlaceholderCache { return iCloudPlaceholderCache }
+        let file = directory.appendingPathComponent("icloud-parent-placeholders.json")
+        let markers: [String: Set<UUID>]
+        do { markers = try JSONDecoder().decode([String: Set<UUID>].self, from: Data(contentsOf: file)) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { markers = [:] }
+        iCloudPlaceholderCache = markers
+        return markers
+    }
+
+    func markICloudPlaceholder(_ id: UUID, category: String, placeholder: Bool, profileID: UUID? = nil) throws {
+        try ICloudApplyContext.check()
+        var markers = try iCloudPlaceholders()
+        let key = profileID.map { category + ":" + $0.uuidString.lowercased() } ?? category
+        if (markers[key]?.contains(id) == true) == placeholder { return }
+        if placeholder { markers[key, default: []].insert(id) }
+        else { markers[key]?.remove(id) }
+        let file = directory.appendingPathComponent("icloud-parent-placeholders.json")
+        try ICloudApplyContext.check()
+        guard SnapshotPersistence.write(try JSONEncoder().encode(markers), to: file) else { throw CocoaError(.fileWriteUnknown) }
+        iCloudPlaceholderCache = markers
+    }
+
+    func isICloudPlaceholder(_ id: UUID, category: String, profileID: UUID? = nil) throws -> Bool {
+        let key = profileID.map { category + ":" + $0.uuidString.lowercased() } ?? category
+        return try iCloudPlaceholders()[key]?.contains(id) == true
+    }
+
+    func committedICloudSpaces(for id: UUID) throws -> [Space] {
+        let file = Self.spacesURL(for: id, in: directory)
+        do {
+            let spaces = try JSONDecoder().decode([Space].self, from: Data(contentsOf: file))
+            guard spaces.allSatisfy({ $0.profileID == id }), Set(spaces.map(\.id)).count == spaces.count else { throw CocoaError(.fileReadCorruptFile) }
+            return spaces
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+    }
+
+    func commitICloudProfiles() throws {
+        guard profileListReadable, retryProfileSave() else { throw CocoaError(.fileWriteUnknown) }
+    }
+}

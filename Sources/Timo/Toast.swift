@@ -1,0 +1,563 @@
+import AppKit
+import SwiftUI
+
+/// Arc's toasts: a small pill that slides up from the bottom of the sidebar to say what just
+/// happened — "Archived Swift Forums", "Copied URL" — sometimes with one verb beside it,
+/// usually Undo. It goes on its own after `Look.toastDuration`; a pointer resting on it holds
+/// it there, because the verb is the point and a moving target is not a button.
+///
+/// One store app-wide rather than one per window: there is one pointer, one keyboard and so
+/// one event at a time worth telling the user about. `owner` remembers which window it
+/// happened in, and only that window draws it.
+/// ponytail: no toast history and no stack — one ordinary toast at a time, replaced by
+/// whatever happens next, because the verb on the newest is the only one anybody is
+/// reaching for. Ceiling: a Notification-Center-style drawer of past toasts, which Arc
+/// does not have either.
+@MainActor final class Toasts: ObservableObject {
+    struct Toast: Identifiable {
+        /// Settable so a toast that changes its mind — "Downloading… 42%", then "…43%" —
+        /// keeps one identity and rewrites the pill in place instead of sliding a new one
+        /// up from the sidebar's edge on every tick.
+        var id = UUID()
+        /// Rewriting a stable slot still replaces its action, even when its title is unchanged.
+        var actionGeneration = UUID()
+        let text: String
+        let action: (title: String, run: @MainActor () -> Void)?
+        /// A sticky toast is up because something is still true, not because something just
+        /// happened: no clock, and an × of its own. The updater is the only thing with one.
+        var sticky = false
+        /// Status notices may wrap; page titles keep their usual single-line truncation.
+        var wraps = false
+        /// The window it happened in, so only that window draws it. On the toast
+        /// rather than the store: a toast from a second window must not drag the one
+        /// already showing into the wrong sidebar. `nil` means every window, which is what a
+        /// toast about the app itself rather than about a page wants.
+        var owner: ObjectIdentifier? = nil
+    }
+
+    /// The pure part: what is on screen and in what order, so `check()` can prove the
+    /// replacement rules without a run loop.
+    struct Queue {
+        /// The ordinary toast on screen. There is only ever one: a second thing happening
+        /// is not a pile to read, it is the news, and it takes the pill.
+        private(set) var latest: Toast?
+        /// The sticky one, kept apart because it does not age out and must not be the thing
+        /// an ordinary toast replaces. It sits above: it has been there longest.
+        private(set) var sticky: Toast?
+
+        /// Top to bottom as drawn: the notice that is still true above, the thing that just
+        /// happened below it and nearest the footer. Two pills is the most there can be.
+        var showing: [Toast] { [sticky, latest].compactMap { $0 } }
+        var current: Toast? { latest ?? sticky }
+
+        /// Puts a toast up and hands back whichever one it pushed off, so the caller can
+        /// stop that one's clock — a replaced toast must not come back to dismiss its
+        /// successor three seconds later.
+        @discardableResult mutating func push(_ toast: Toast) -> Toast? {
+            defer { latest = toast }
+            return latest
+        }
+
+        mutating func dismiss(_ id: UUID) {
+            if latest?.id == id { latest = nil }
+            if sticky?.id == id { sticky = nil }
+        }
+
+        /// One sticky toast at a time: the second is the same update saying something newer,
+        /// never a second thing to read.
+        mutating func stick(_ toast: Toast) { sticky = toast }
+        mutating func unstick() { sticky = nil }
+    }
+
+    static let shared = Toasts()
+
+    @Published private(set) var queue = Queue()
+    /// Which pills the pointer is resting on. Per toast rather than one flag: holding the
+    /// ordinary toast you are reaching for must not freeze the sticky notice above it.
+    @Published private(set) var hovering: Set<UUID> = []
+    /// One clock per toast, because each has its own `Prefs.toastSeconds`. Cancelled when
+    /// it goes — including when a newer toast takes its place.
+    private var timers: [UUID: Task<Void, Never>] = [:]
+
+    deinit { timers.values.forEach { $0.cancel() } }
+
+    var current: Toast? { queue.current }
+    var showing: [Toast] { queue.showing }
+
+    /// `store` is the window the event happened in; the menus pass nothing and get the key
+    /// window, which is where the shortcut was pressed.
+    /// Automatic page notices may fill an empty ordinary slot, but must not replace an
+    /// action the user can still take — including one held past its expiry by hovering.
+    static func show(_ text: String, action: (title: String, run: @MainActor () -> Void)? = nil,
+                     in store: TabStore? = Windows.current, replacingCurrent: Bool = true, wraps: Bool = false) {
+        guard replacingCurrent || shared.queue.latest == nil else { return }
+        shared.put(Toast(text: text, action: action, wraps: wraps, owner: store.map(ObjectIdentifier.init)))
+    }
+
+    /// Up it goes, and whatever was showing goes with it — clock, hover and all. Dropping
+    /// the old one's timer here is the point: left running, it would wake up on the pill
+    /// that replaced it and take *that* one away early.
+    private func put(_ toast: Toast) {
+        if let gone = queue.push(toast) {
+            timers.removeValue(forKey: gone.id)?.cancel()
+            hovering.remove(gone.id)
+        }
+        schedule(toast)
+    }
+
+    /// A toast with no clock, showing until its × or its verb takes it away. `id` is the
+    /// caller's, so the same pill can be rewritten as its news changes.
+    static func stick(_ text: String, id: UUID,
+                      action: (title: String, run: @MainActor () -> Void)? = nil) {
+        if let previous = shared.queue.sticky, previous.id != id { shared.dismiss(previous) }
+        shared.queue.stick(Toast(id: id, text: text, action: action, sticky: true))
+    }
+
+    /// Only the toast that put it there can take it back, by id — a stale caller must not
+    /// clear a notice that has since been replaced.
+    static func unstick(_ id: UUID) {
+        guard let toast = shared.queue.sticky, toast.id == id else { return }
+        shared.dismiss(toast)
+    }
+
+    /// A toast's text as it is read out: the same sentence with its emphasis markers gone,
+    /// so VoiceOver never says "star star v zero point two star star".
+    nonisolated static func spoken(_ text: String) -> String {
+        (try? AttributedString(markdown: text)).map { String($0.characters) } ?? text
+    }
+
+    func hover(_ toast: Toast, _ inside: Bool) {
+        guard queue.showing.contains(where: { $0.id == toast.id }) else { return }
+        if inside {
+            hovering.insert(toast.id)
+            timers.removeValue(forKey: toast.id)?.cancel()
+        } else if hovering.remove(toast.id) != nil {
+            schedule(toast)
+        }
+    }
+
+    /// The pill was pressed: take the toast away, then run the verb — "Undo" twice is not a
+    /// thing, and the toast is what stops it being one. Away first, because a verb that puts
+    /// a new toast up (the updater's "Update" does) would otherwise have it removed out from
+    /// under it a line later.
+    func act(_ toast: Toast) {
+        guard let current = queue.showing.first(where: { $0.id == toast.id }),
+              current.actionGeneration == toast.actionGeneration else { return }
+        dismiss(current)
+        current.action?.run()
+    }
+
+    func dismiss(_ toast: Toast) {
+        timers.removeValue(forKey: toast.id)?.cancel()
+        hovering.remove(toast.id)
+        queue.dismiss(toast.id)
+    }
+
+    /// A sticky toast has no clock: it is there until the × or the verb, and a timer that
+    /// took it away would be the one bug this kind of toast exists to not have.
+    private func schedule(_ toast: Toast) {
+        guard !toast.sticky, queue.latest?.id == toast.id,
+              !hovering.contains(toast.id) else { return }
+        timers[toast.id]?.cancel()
+        timers[toast.id] = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(Prefs.toastSeconds)) } catch { return }
+            guard let self, !Task.isCancelled, !hovering.contains(toast.id) else { return }
+            dismiss(toast)
+        }
+    }
+}
+
+/// Slots preserve the sidebar's media-player spacing and the Library's footer placement
+/// without mounting a second copy of the live toast or its accessibility actions.
+struct ToastBounds: PreferenceKey {
+    enum Target: Hashable { case page, sidebar, library, sidebarCovered }
+    static let defaultValue: [Target: Anchor<CGRect>] = [:]
+    static func reduce(value: inout [Target: Anchor<CGRect>],
+                       nextValue: () -> [Target: Anchor<CGRect>]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+struct ToastAnchor: View {
+    let target: ToastBounds.Target
+    var covered = false
+
+    var body: some View {
+        Color.clear.frame(height: 0)
+            .anchorPreference(key: ToastBounds.self, value: .bounds) {
+                covered ? [target: $0, .sidebarCovered: $0] : [target: $0]
+            }
+            .allowsHitTesting(false).accessibilityHidden(true)
+    }
+}
+
+/// Keep one host alive through docking, hiding, edge reveal and Library navigation.
+/// Moving its layout slot preserves the current pill, hover hold and action generation.
+struct ToastPresentation: ViewModifier {
+    @ChromeObserved var store: TabStore
+    let sidebarWidth: CGFloat
+    @EnvironmentObject private var downloads: DownloadFeedback
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var batterySaver = BatterySaver.shared
+
+    func body(content: Content) -> some View {
+        content.overlayPreferenceValue(ToastBounds.self) { bounds in
+            GeometryReader { geometry in
+                let sidebarVisible = store.sidebarShown || store.sidebarPeeking
+                let chrome = store.libraryOpen || sidebarVisible
+                let anchor = store.libraryOpen ? bounds[.library]
+                    : sidebarVisible ? bounds[.sidebar] : bounds[.page]
+                if let anchor {
+                    let slot = geometry[anchor]
+                    // Match download feedback's 16pt page inset, with a gap above its
+                    // 40pt landing control while that transient feedback is visible.
+                    let target = chrome ? slot : CGRect(
+                        x: slot.minX + 16 - Look.inset, y: slot.minY,
+                        width: min(sidebarWidth, max(0, slot.width - 32 + 2 * Look.inset)),
+                        height: max(0, slot.height - 16 - (downloads.start == nil ? 0 : 40 + Look.inset)))
+                    let covered = store.palette != nil ||
+                        (!store.libraryOpen && sidebarVisible && bounds[.sidebarCovered] != nil)
+                    ToastHost()
+                        .frame(width: target.width, alignment: chrome ? .center : .leading)
+                        .padding(.leading, target.minX)
+                        .padding(.bottom, max(0, geometry.size.height - target.maxY))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .opacity(covered ? 0 : 1)
+                        .disabled(covered)
+                        .allowsHitTesting(!covered)
+                        .accessibilityHidden(covered)
+                }
+            }
+            .animation(reduceMotion || batterySaver.isActive ? nil : Look.quick,
+                       value: downloads.start?.id)
+        }
+    }
+}
+
+/// The pills, drawn once in their owning window. The presentation follows the sidebar
+/// or Library footer when visible, and the page corner when all chrome is hidden.
+/// Dark whatever the appearance, like the command bar, with the space's colour washed over it.
+struct ToastHost: View {
+    var stickyOnly = false
+    @EnvironmentObject var store: TabStore
+    @ObservedObject private var toasts = Toasts.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var batterySaver = BatterySaver.shared
+    private var reduced: Bool { reduceMotion || batterySaver.isActive }
+
+    var body: some View {
+        // Grows upward from the footer: the thing that just happened is the pill nearest
+        // it, and the sticky notice — when there is one — rises above. A ZStack put them in
+        // depth, where the second one is simply invisible.
+        VStack(alignment: .leading, spacing: Look.rowGap) {
+            // Keep each of the two slots stable when its news changes. Rapid actions
+            // rewrite the existing pill rather than accumulating departing toast views.
+            ForEach(mine, id: \.sticky) { toast in
+                ToastPill(toast: toast, tint: tint)
+            }
+        }
+        // Never wider than the rows above it. The pill takes this width and lays itself out
+        // inside it; nothing here is a fixed height, so a two-line toast is taller and the
+        // sidebar's overlay simply has more of it to draw.
+        .padding(.horizontal, Look.inset)
+        .animation(reduced ? nil : .spring(duration: 0.22, bounce: 0.08), value: mine.map(\.id))
+        .timoMotionPolicy()
+        // Keep the shadow outside the stack's layout bounds. Clipping here cuts its
+        // top and bottom flush with the pill, leaving a hard rectangular edge.
+    }
+
+    /// The toasts this window is the one to draw: its own, plus the ones about the app
+    /// itself, which have no window of their own.
+    private var mine: [Toasts.Toast] {
+        toasts.showing.filter {
+            (!stickyOnly || $0.sticky) && ($0.owner == nil || $0.owner == ObjectIdentifier(store))
+        }
+    }
+
+    /// The space's colour, or the profile's outside any space.
+    private var tint: Color {
+        Color(hex: store.currentSpace?.colorHex ?? ProfileManager.shared.active.colorHex) ?? .clear
+    }
+}
+
+/// The toast surface, sized to the space its host offers.
+struct ToastPill: View {
+    @Environment(\.spaceChromeTheme) private var chromeTheme
+    let toast: Toasts.Toast
+    let tint: Color
+    @ObservedObject private var toasts = Toasts.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var batterySaver = BatterySaver.shared
+    @State private var hovered = false
+
+    /// Short toasts hug their content. Longer messages give up width to the controls,
+    /// keeping the action and dismiss target beside the message at every sidebar width.
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: Look.inset / 2) {
+                text(toast)
+                controls(toast, fixed: true)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+
+            HStack(spacing: Look.inset / 2) {
+                text(toast)
+                controls(toast, fixed: false)
+                    .layoutPriority(1)
+            }
+        }
+        .padding(.leading, Look.pillInset)
+        // Every toast ends in an ×, and an × is a `rowTarget` square with its glyph small in
+        // the middle of it: half an inset here is what leaves the glyph looking inset rather
+        // than crowded against the pill's edge.
+        .padding(.trailing, Look.inset / 2)
+        .padding(.vertical, Look.inset / 2)
+        .frame(minHeight: Look.toastHeight)
+        // A corner, not a capsule: a capsule on a two-line pill is a lozenge. At one line
+        // this radius *is* the capsule, so the short toast is unchanged.
+        .background(chromeTheme.barFill, in: .rect(cornerRadius: Look.toastHeight / 2))
+        .background(tint.opacity(Look.toastTint), in: .rect(cornerRadius: Look.toastHeight / 2))
+        .background(Look.barMaterial, in: .rect(cornerRadius: Look.toastHeight / 2))
+        .overlay {
+            RoundedRectangle(cornerRadius: Look.toastHeight / 2)
+                .strokeBorder(Look.barStroke, lineWidth: 1)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .shadow(color: Look.floatShadow, radius: Look.floatShadowRadius, y: Look.floatShadowY)
+        .onHover { hovered = $0; toasts.hover(toast, $0) }
+        .onChange(of: toast.id) { _, _ in
+            // A stable slot can stay under a stationary pointer through replacement.
+            if hovered { toasts.hover(toast, true) }
+        }
+        .onDisappear { toasts.hover(toast, false) }
+        // Reduced insertion must be an identity transition, including its hit testing.
+        // The modifier still observes policy changes inside a transition already running.
+        .transition(reduceMotion || batterySaver.isActive ? .identity :
+            .modifier(active: Feel09ToastTransition(progress: 0, id: toast.id),
+                      identity: Feel09ToastTransition(progress: 1, id: toast.id)))
+        .timoMotionPolicy()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Toasts.spoken(toast.text))
+    }
+
+    private func text(_ toast: Toasts.Toast) -> some View {
+        // No `.font` modifier — a font on the view replaces the one a bold run carries, and
+        // the version would stop being the bold half of "Timo v0.2.0";
+        // `styled` sets both weights itself. Page titles truncate on one line; persistent
+        // update notices can use two lines to keep their status readable.
+        Text(styled(toast.text, emphasis: toast.sticky))
+            .lineLimit(toast.sticky || toast.wraps ? 2 : 1)
+            .truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: true)
+            .foregroundStyle(Look.barSelectedText)
+    }
+
+    @ViewBuilder private func controls(_ toast: Toasts.Toast, fixed: Bool) -> some View {
+        if let action = toast.action {
+            Button(action.title) { toasts.act(toast) }
+                .buttonStyle(TactileButtonStyle(scales: false))
+                // Keep the surface stable, but cancel a press begun on a different action.
+                .id(Feel09ToastControlID(toast: toast.id, action: toast.actionGeneration))
+                .font(Look.Typography.shortcut.font)
+                .lineLimit(2)
+                .fixedSize(horizontal: fixed, vertical: true)
+                .foregroundStyle(Look.barText)
+                .padding(.horizontal, Look.inset / 2)
+                .frame(minHeight: Look.control)
+                .background(chromeTheme.barSelected, in: .capsule)
+        }
+        // Every toast, not only the sticky one: the pointer resting on a pill already stops
+        // its clock, so by the time you are anywhere near the × it has stopped moving away.
+        Button { toasts.dismiss(toast) } label: {
+            Image(systemName: "xmark")
+                .font(Look.rowGlyph)
+                .frame(width: Look.rowTarget, height: Look.rowTarget)
+                .contentShape(.rect)
+        }
+        .buttonStyle(TactileButtonStyle(scales: false))
+        .id(toast.id)
+        .foregroundStyle(Look.barText)
+        .help("Dismiss")
+        .accessibilityLabel("Dismiss \(Toasts.spoken(toast.text))")
+    }
+
+    /// A toast's text, ready to draw. `emphasis` parses the one piece of markup a toast is
+    /// allowed — `**bold**`, the version number on the updater's pill. Off for every other
+    /// toast, because a page title is not markup and "5 * 3 * 2" is not an italic.
+    private func styled(_ text: String, emphasis: Bool) -> AttributedString {
+        var out = emphasis ? ((try? AttributedString(markdown: text)) ?? AttributedString(text))
+                           : AttributedString(text)
+        out.font = Look.Typography.secondary.font
+        for run in out.runs where run.inlinePresentationIntent?.contains(.stronglyEmphasized) == true {
+            out[run.range].font = Look.Typography.secondary.font.bold()
+        }
+        return out
+    }
+}
+
+private struct Feel09ToastControlID: Hashable {
+    let toast: UUID
+    let action: UUID
+}
+
+/// The policy lives inside the running transition. Replacing `.transition` or removing
+/// its animation only changes the next transition; it cannot finish one already in flight.
+private struct Feel09ToastTransition: ViewModifier, Animatable {
+    nonisolated var progress: Double
+    let id: UUID
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var batterySaver = BatterySaver.shared
+    @ObservedObject private var toasts = Toasts.shared
+    @State private var policyStopped = false
+    private var reduced: Bool { reduceMotion || batterySaver.isActive }
+
+    nonisolated var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        // Once interrupted, stay at the semantic end state even if policy is restored
+        // before the spring ends. A departing toast's end state is invisible.
+        let present = toasts.showing.contains { $0.id == id }
+        let visible = reduced || policyStopped ? (present ? 1.0 : 0.0) : progress
+        content.opacity(visible).offset(y: (1 - visible) * 4)
+            .onChange(of: reduced, initial: true) { _, reduced in
+                if reduced { Motion.instant { policyStopped = true } }
+            }
+    }
+}
+
+// MARK: - check
+
+extension Toasts {
+    static func check() -> [(String, Bool)] {
+        var q = Queue()
+        let a = Toast(text: "a", action: nil), b = Toast(text: "b", action: nil)
+        let c = Toast(text: "c", action: nil)
+        var out: [(String, Bool)] = [("nothing shows before anything happened", q.current == nil)]
+        q.push(a)
+        out.append(("the first toast shows at once", q.showing.map(\.id) == [a.id]))
+        let gone = q.push(b)
+        out.append(("a second replaces the first rather than stacking on it",
+                    q.showing.map(\.id) == [b.id]))
+        out.append(("...and the one it replaced is handed back, so its clock can be stopped",
+                    gone?.id == a.id))
+        q.push(c)
+        out.append(("only ever the newest", q.current?.id == c.id))
+        q.dismiss(a.id)
+        out.append(("dismissing a toast that has already been replaced changes nothing",
+                    q.showing.map(\.id) == [c.id]))
+        q.dismiss(c.id)
+        out.append(("the × empties the sidebar", q.current == nil))
+        out.append(("dismissing past empty is harmless", { q.dismiss(c.id); return q.current == nil }()))
+
+        // The sticky kind: an update notice that stays until it is answered.
+        let update = Toast(text: "Timo **v0.2.0** is available", action: nil, sticky: true)
+        q.stick(update)
+        out.append(("a sticky toast shows on its own", q.showing.map(\.id) == [update.id]))
+        out.append(("the clock never runs on it", q.current?.sticky == true))
+        q.push(a)
+        out.append(("an ordinary toast shows under it, not over it",
+                    q.showing.map(\.id) == [update.id, a.id]))
+        out.append(("...and it is the ordinary one the pointer's verb belongs to",
+                    q.current?.id == a.id))
+        q.push(b)
+        out.append(("a newer one replaces the ordinary toast and leaves the notice alone",
+                    q.showing.map(\.id) == [update.id, b.id]))
+        out.append(("two pills is the most there can ever be", q.showing.count <= 2))
+        q.dismiss(b.id)
+        out.append(("...and the notice is still there when it has gone",
+                    q.showing.map(\.id) == [update.id]))
+        let progress = Toast(id: update.id, text: "Downloading… 42%", action: nil, sticky: true)
+        q.stick(progress)
+        out.append(("the same update rewrites its own pill rather than putting up a second",
+                    q.showing.count == 1 && q.current?.text == "Downloading… 42%"))
+        q.unstick()
+        out.append(("the × is the only thing that takes it away", q.current == nil))
+
+        // How long an ordinary toast stands, which is the user's to say now. The pref is
+        // put back afterwards, so a check is never a preference change.
+        out.append(("every offered duration is a real one",
+                    Prefs.toastChoices.allSatisfy { $0.seconds > 0 }))
+        out.append(("the default is one of the durations the setting offers",
+                    Prefs.toastChoices.contains { $0.seconds == Look.toastDuration }))
+        let held = UserDefaults.timo.object(forKey: "toastSeconds")
+        defer { UserDefaults.timo.set(held, forKey: "toastSeconds") }
+        UserDefaults.timo.removeObject(forKey: "toastSeconds")
+        out.append(("with nothing chosen a toast stands for as long as it always did",
+                    Prefs.toastSeconds == Look.toastDuration))
+        Prefs.toastSeconds = Prefs.toastChoices.last!.seconds
+        out.append(("...and a chosen one is what the clock reads",
+                    Prefs.toastSeconds == Prefs.toastChoices.last!.seconds))
+
+        // The updater's wording, which is what the pill actually says.
+        out.append(("the offer names the release, with the version as the bold half",
+                    Updater.text(for: .available("v0.2.0")) == "Timo **v0.2.0**"))
+        out.append(("...and VoiceOver reads the sentence, not the markers",
+                    spoken(Updater.text(for: .available("v0.2.0"))) == "Timo v0.2.0"))
+        out.append(("a toast with no markup is read exactly as written",
+                    spoken("Archived Swift Forums") == "Archived Swift Forums"))
+        out.append(("progress is a whole percentage",
+                    Updater.text(for: .downloading(0.4249)) == "Downloading… 42%"))
+        out.append(("a finished install leaves only the relaunch",
+                    Updater.text(for: .ready) == "Restart to update"))
+        out.append(("a failure says so", Updater.text(for: .failed(nil)) == "Update failed"))
+
+        // Which offer may go up over what is already on screen. The two rows that matter are
+        // the last two: a release this copy refused used to be re-armed by every half-hourly
+        // check, because `fail()` moved the phase off `.available` and the "already offered"
+        // test stopped matching — so each press fetched the whole zip again on its way to the
+        // same refusal.
+        func arm(_ tag: String, over phase: Updater.Phase?, working: Bool = false) -> Bool {
+            Updater.mayArm(tag: tag, over: phase, working: working)
+        }
+        out.append(("the first offer of a release goes up", arm("v2", over: nil)))
+        out.append(("...and a later release goes up over the one on screen",
+                    arm("v3", over: .available("v2"))))
+        out.append(("the same release does not re-stick after the user put it away",
+                    !arm("v2", over: .available("v2"))))
+        out.append(("nothing interrupts a download, an install, or a finished one",
+                    !arm("v2", over: .downloading(0.5)) && !arm("v2", over: .installing)
+                        && !arm("v2", over: .ready)))
+        out.append(("...nor an update already working, whatever the phase says",
+                    !arm("v2", over: nil, working: true)))
+        out.append(("a release this copy refused is never offered again",
+                    !arm("v2", over: .failed("v2"))))
+        out.append(("...but a newer one still is, and a failure that was only bad luck retries",
+                    arm("v3", over: .failed("v2")) && arm("v2", over: .failed(nil))))
+        return out
+    }
+}
+
+// MARK: - ⌘W
+
+extension TabStore {
+    /// ⌘W with its toast: "Archived <title>", and Undo brings the page back out of the
+    /// archive. A favourite or a pinned tab is only parked by ⌘W — nothing has left the
+    /// sidebar, so there is nothing to say and nothing to undo.
+    /// ponytail: Undo reopens the page as a new Today tab at the end of the list, not in the
+    /// slot it left. Ceiling: remembering the index, which `unarchive` does not either.
+    func archiveWithToast() {
+        guard let tab = active else { return }
+        let title = TidyTitles.title(for: tab), url = tab.currentURL, leaving = tab.kind == .today
+        archive(tab.id)
+        guard leaving else { return }
+        // Only what `archiveNow` actually wrote down can be brought back from the archive.
+        let restorable = !isPrivate && TabAddress.restorable(url)
+        var undo: (title: String, run: @MainActor () -> Void)?
+        if restorable {
+            undo = ("Undo", { [weak self] in
+                guard let self, let url else { return }
+                if let entry = Archive.shared(for: profileID).entries
+                    .first(where: { $0.url == url.absoluteString }) {
+                    unarchive(entry)
+                } else {
+                    newTab(url)
+                }
+            })
+        }
+        Toasts.show("Archived \(title)", action: undo, in: self)
+    }
+}

@@ -1,0 +1,136 @@
+import Foundation
+import WebKit
+
+/// Folder validation and host limitations, independent of installation consent.
+@MainActor enum ExtensionDiagnostics {
+    static let unsupportedAPIs: Set<String> = [
+        "browser.runtime.sendNativeMessage", "browser.runtime.connectNative"
+    ]
+    static let unsupportedPermissions: Set<String> = ["nativeMessaging"]
+
+    static func limitations(_ manifest: [String: Any], extension ext: WKWebExtension) -> [String] {
+        let recognized = Set(ext.requestedPermissions.union(ext.optionalPermissions).map(\.rawValue))
+        let declared = Set(((manifest["permissions"] as? [String] ?? [])
+                            + (manifest["optional_permissions"] as? [String] ?? []))
+            .filter { !$0.contains("://") && $0 != "<all_urls>" })
+        var issues = declared.subtracting(recognized).sorted().map {
+            "\($0): this WebKit version does not recognize this capability."
+        }
+        for permission in declared.intersection(unsupportedPermissions).sorted() {
+            issues.append("\(permission): Timo does not provide " + (permission == "nativeMessaging"
+                ? "connections to native messaging hosts." : "extension items in page menus."))
+        }
+        if declared.contains("webRequestBlocking") {
+            issues.append("webRequestBlocking: system WebKit cannot cancel or redirect requests or change headers through webRequest. MV2 background pages, actions and content scripts can run. uBlock Origin can use Timo’s partial static-filter compatibility; dynamic request decisions remain unavailable.")
+        }
+        if ext.displayName == "uBlock Origin", ext.manifestVersion == 2 {
+            issues.append("privacy: Timo exposes explicit unsupported-setting errors so uBlock’s Chromium adapter can finish starting. Its privacy switches cannot change Timo’s browser settings.")
+            issues.append("webNavigation.onCreatedNavigationTarget: Timo derives tab-level target events from known openers. Source frame and process identifiers are unavailable.")
+        }
+        for (key, detail) in [
+            ("chrome_url_overrides", "replacement browser pages"),
+            ("side_panel", "extension side panels"),
+            ("devtools_page", "extension developer-tools panels"),
+            ("omnibox", "extension search keywords"),
+            ("oauth2", "Chrome identity integration")
+        ] where manifest[key] != nil {
+            issues.append("\(key): Timo does not provide \(detail).")
+        }
+        return issues
+    }
+
+    /// Successful background completion is required separately. A running page's
+    /// script diagnostics stay visible without turning activation into a race.
+    static func blockingErrors(_ errors: [any Error], manifest: [String: Any]) -> [any Error] {
+        displayErrors(errors, manifest: manifest).filter { !isRuntimeDiagnostic($0) }
+    }
+
+    static func runtimeErrors(_ errors: [any Error], manifest: [String: Any]) -> [any Error] {
+        displayErrors(errors, manifest: manifest).filter { isRuntimeDiagnostic($0) }
+    }
+
+    private static func isRuntimeDiagnostic(_ error: any Error) -> Bool {
+        let value = error as NSError
+        // WebKit distinguishes ScriptExecutionError (7) from a failed
+        // background load (6); the public SDK does not yet name code 7.
+        // This excludes only reported runtime diagnostics, never errors
+        // delivered by the required background-completion callback.
+        return value.domain == WKWebExtensionContext.errorDomain && value.code == 7
+    }
+
+    /// Absent optional description metadata alone does not need attention.
+    static func displayErrors(_ errors: [any Error], manifest: [String: Any]) -> [any Error] {
+        errors.filter { error in
+            let value = error as NSError
+            return !(manifest["description"] == nil && value.domain == WKWebExtension.errorDomain
+                && value.code == WKWebExtension.Error.invalidManifestEntry.rawValue
+                && value.localizedDescription.contains("`description`"))
+        }
+    }
+
+    /// WebKit can parse a manifest while deferring resource errors until first use.
+    /// Check executable/UI/ruleset entry points now, before any context can run.
+    static func validateResources(_ manifest: [String: Any], in folder: URL) throws {
+        var resources: [(String, String, Bool)] = []
+        func single(_ value: Any?, _ key: String, pageURL: Bool = false, allowEmpty: Bool = false) {
+            if let path = value as? String, !allowEmpty || !path.isEmpty { resources.append((key, path, pageURL)) }
+        }
+        func list(_ value: Any?, _ key: String) {
+            for path in value as? [String] ?? [] { resources.append((key, path, false)) }
+        }
+        if let background = manifest["background"] as? [String: Any] {
+            single(background["service_worker"], "background.service_worker")
+            single(background["page"], "background.page", pageURL: true)
+            list(background["scripts"], "background.scripts")
+        }
+        for script in manifest["content_scripts"] as? [[String: Any]] ?? [] {
+            list(script["js"], "content_scripts.js")
+            list(script["css"], "content_scripts.css")
+        }
+        for key in ["action", "browser_action", "page_action"] {
+            if let action = manifest[key] as? [String: Any] { single(action["default_popup"], "\(key).default_popup", pageURL: true, allowEmpty: true) }
+        }
+        single(manifest["options_page"], "options_page", pageURL: true)
+        single((manifest["options_ui"] as? [String: Any])?["page"], "options_ui.page", pageURL: true)
+        if let dnr = manifest["declarative_net_request"] as? [String: Any] {
+            for rule in dnr["rule_resources"] as? [[String: Any]] ?? [] { single(rule["path"], "declarative_net_request.rule_resources.path") }
+        }
+        let root = folder.resolvingSymlinksInPath().standardizedFileURL.path + "/"
+        for (key, path, pageURL) in resources {
+            var resourcePath = path
+            if pageURL {
+                guard let components = URLComponents(string: path), components.scheme == nil, components.host == nil else {
+                    throw ExtensionHost.Failure("\(key): “\(path)” must be a URL inside the extension folder.")
+                }
+                resourcePath = components.path
+                if resourcePath.hasPrefix("/") { resourcePath.removeFirst() }
+            }
+            let resource = folder.appendingPathComponent(resourcePath).resolvingSymlinksInPath().standardizedFileURL
+            var directory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: resource.path, isDirectory: &directory), !directory.boolValue,
+                  FileManager.default.isReadableFile(atPath: resource.path) else {
+                throw ExtensionHost.Failure("\(key): “\(path)” is missing or unreadable. Restore that file or fix manifest.json, then retry.")
+            }
+            guard !path.isEmpty, resource.path.hasPrefix(root) else {
+                throw ExtensionHost.Failure("\(key): “\(path)” must point to a file inside the extension folder. Fix manifest.json and retry.")
+            }
+        }
+    }
+
+    static func describe(_ errors: [any Error]) -> String {
+        var seen: Set<String> = []
+        return errors.flatMap { details($0, depth: 0) }.filter { seen.insert($0).inserted }.joined(separator: "\n")
+    }
+
+    private static func details(_ error: any Error, depth: Int) -> [String] {
+        if error is ExtensionHost.Failure { return [error.localizedDescription] }
+        let error = error as NSError
+        var result = ["\(error.localizedDescription) [\(error.domain):\(error.code)]"]
+        if let reason = error.localizedFailureReason { result.append(reason) }
+        if let recovery = error.localizedRecoverySuggestion { result.append(recovery) }
+        if depth < 3, let underlying = error.userInfo[NSUnderlyingErrorKey] as? any Error {
+            result += details(underlying, depth: depth + 1)
+        }
+        return result
+    }
+}

@@ -1,0 +1,932 @@
+import AppKit
+import SwiftUI
+import WebKit
+
+// MARK: - The model
+
+/// Arc's Site Control Center: everything this browser can be told about *one site*, in one
+/// popover hanging off the address pill's trailing controls button. Before it, the glyph opened the whole
+/// Settings window and the per-site answers (camera, zoom, the inspector) were spread across
+/// four menus and a preferences pane.
+///
+/// The model is the interesting half and it is pure. Turning "this page, this profile" into
+/// "these rows, in this order, live or inert" is where a site panel goes quietly wrong — a
+/// Reader row on a page with no article, a camera toggle reading "off" when the honest
+/// answer is "nobody has been asked yet" — so it is proved offline in `check()` rather than
+/// looked at in a screenshot.
+///
+/// ponytail: a value built fresh on every render out of the statics that already own each
+/// setting (`SitePermissions`, `Zoom`, `Blocker`, `Reader`, `ExtensionHost`), not a store of
+/// its own. There is nothing here to persist that those files do not already persist better.
+struct SiteControlModel: Equatable, Sendable {
+    /// One extension, as this site sees it.
+    struct Ext: Equatable, Sendable {
+        let name: String
+        let allowed: Bool
+        /// What `browser.action.setBadgeText` put on the button for this tab, truncated to
+        /// what a 16pt glyph holds. Nil is no badge.
+        var badge: String?
+        /// `browser.action.disable()`. The button greys out; the access switch beside it
+        /// does not, because "may this extension see this site" is still a live question.
+        var enabled = true
+        /// Its action is also a glyph in the address pill.
+        var pinned = false
+    }
+
+    /// One app this site may open without being asked again — a remembered "Always Allow".
+    struct App: Equatable, Sendable {
+        /// The url scheme the answer was given for: "zoommtg", "msteams", "mailto".
+        let scheme: String
+        /// The handler's display name, or the scheme itself when nothing on this Mac claims
+        /// it any more — the answer is still standing and still has to be removable.
+        let name: String
+    }
+
+    /// Empty for anything with no site to control: nothing loaded, a file, about:blank.
+    var host = ""
+    var scheme: String?
+    var secureContent = true
+    var certificateTrusted = true
+    var navigationFailed = false
+    /// nil is not "off": it means this site has never been answered, so it will be asked.
+    var camera: Bool?
+    var microphone: Bool?
+    var location: Bool?
+    /// Ask here means blocked with a toast offering to open it, not a prompt.
+    var popups: Bool?
+    var locationOnce = false
+    var cameraOnce = false
+    var microphoneOnce = false
+    var pictureInPicture = false
+    var zoom = 1.0
+    var blocking = true
+    var profileBlocking = true
+    var reader = false
+    var readerAvailable = false
+    var extensions: [Ext] = []
+    /// The apps this site is allowed to open without asking. See ExternalApps.swift.
+    var apps: [App] = []
+    var boosted = false
+    var developer = false
+}
+
+extension SiteControlModel {
+
+    /// Which row, so the view can act on one without matching on its title.
+    enum RowID: Hashable, Sendable {
+        case camera, microphone, location, popups, pictureInPicture, zoom, blocker, blockerSettings, reader, capture, boost, clearData, developer
+        /// The index into `extensions`, which is also the index into the host's contexts.
+        case ext(Int)
+        /// The index into `apps`: one remembered "Always Allow" for another app.
+        case app(Int)
+    }
+
+    /// What sits at the trailing edge of a row.
+    enum Control: Equatable, Sendable {
+        case toggle(Bool)
+        /// Allow / Block / Ask. A permission has three answers, and collapsing the third
+        /// into "off" is the lie this case exists to avoid.
+        case permission(Bool?)
+        /// The zoom stepper's current label ("100%", "125%").
+        case zoom(String)
+        /// The row is the button: Clear Site Data.
+        case action
+    }
+
+    struct Row: Identifiable, Equatable, Sendable {
+        let id: RowID
+        let title: String
+        let glyph: String
+        let control: Control
+        /// A second line under the title, for when a row does less than its name promises.
+        var note: String?
+        /// Greyed and unclickable. `note` says why.
+        var inert = false
+        /// A mark on the row's icon: an extension action's badge.
+        var badge: String?
+        /// The icon is drawn dim and the row's tap does nothing, but the row is not inert —
+        /// its switch still works. A disabled extension action, and only that.
+        var dim = false
+    }
+
+    /// No host is no site: a `file://` page, `about:blank`, or no tab at all. The popover
+    /// says so rather than offering eleven controls that would each write nothing.
+    var siteless: Bool { host.isEmpty }
+
+    /// The host as the pill shows it — Arc drops `www.`, and so must the title over a panel
+    /// that claims to be about the same site.
+    var title: String {
+        host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+
+    var insecure: Bool {
+        PillState.insecure(scheme: scheme, onlySecureContent: secureContent,
+                           trusted: certificateTrusted)
+    }
+
+    /// The pill's leading glyph, which is also the button that opens this popover. Always
+    /// something: a button that comes and goes as pages load makes the pill jump, and the
+    /// sidebar's chrome does not move.
+    var glyph: String {
+        if siteless || navigationFailed { return "globe" }
+        if insecure { return PillState.glyph(scheme: scheme) }
+        // Only https has earned a closed lock. A host on some other scheme — a custom one,
+        // a `timo:` page — is not encrypted and is not "not secure" either; it gets the
+        // neutral globe rather than a padlock promising something nobody checked.
+        return scheme?.lowercased() == "https" ? "lock" : "globe"
+    }
+
+    /// The header's second line. Says *which* kind of not-secure, because "you clicked
+    /// through a certificate warning here" and "this page is plain http" are different
+    /// problems with different fixes.
+    var connection: String {
+        guard !siteless else { return "No page loaded" }
+        if navigationFailed { return "This page did not load" }
+        switch scheme?.lowercased() {
+        case "https":
+            if !certificateTrusted { return "Not secure — a certificate problem was accepted here" }
+            if !secureContent { return "Not fully secure — part of this page loaded over http" }
+            return "Connection is secure"
+        case "http": return "Not secure — this page is not encrypted"
+        default:     return "Not a web page"
+        }
+    }
+
+    /// The tiny mark on the pill's glyph. Only a *grant* badges: a remembered "no" is not
+    /// something the user has to be told about at a glance, and badging both would make the
+    /// mark mean nothing. Nil is no badge.
+    var badge: String? {
+        switch (camera == true, microphone == true) {
+        case (true, true):  "Camera and microphone allowed"
+        case (true, false): "Camera allowed"
+        case (false, true): "Microphone allowed"
+        default:            nil
+        }
+    }
+
+    /// The rows, in Arc's order: what the page may do, then how it is shown, then what can
+    /// be taken away from it, and the developer switch last.
+    var rows: [Row] {
+        guard !siteless else { return [] }
+        var out: [Row] = [
+            Row(id: .camera, title: "Camera", glyph: "camera", control: .permission(camera),
+                note: cameraOnce ? "Allowed once, until this tab navigates or closes." : nil),
+            Row(id: .microphone, title: "Microphone", glyph: "mic",
+                control: .permission(microphone),
+                note: microphoneOnce ? "Allowed once, until this tab navigates or closes." : nil),
+            Row(id: .popups, title: "Pop-ups", glyph: "macwindow.on.rectangle",
+                control: .permission(popups),
+                note: "Pop-ups you click open either way. Ask blocks the rest and offers to open them."),
+            // ponytail: no Notifications row. WKWebView has no web-notification permission
+            // hook on macOS — nothing asks, so there is nothing to remember and nothing to
+            // switch, and a dead toggle is a promise Timo cannot keep. Upgrade path the day
+            // WebKit exposes one: a third `.permission` row keyed exactly like these two.
+            // ponytail: the switch is offered whatever the page holds, because whether
+            // there is a detachable video is a question only the page can answer and only
+            // asynchronously — `window.__timoPiP()` returns 'unsupported' and the switch
+            // springs back. Upgrade path: publish that answer onto `Tab` from the same
+            // script that already reports the mode, and this row gets `inert` like Reader's.
+            Row(id: .pictureInPicture, title: "Picture in Picture", glyph: "pip",
+                control: .toggle(pictureInPicture)),
+            Row(id: .zoom, title: "Zoom", glyph: "textformat.size",
+                control: .zoom(PillState.zoomLabel(zoom) ?? "100%")),
+            Row(id: .blocker, title: "Block Ads on This Site", glyph: "shield",
+                control: .toggle(blocking),
+                note: profileBlocking ? "This exact host in this profile. Changing it reloads the page." : "Blocking is off for this profile. Enable it in Privacy settings.",
+                inert: !profileBlocking),
+            Row(id: .blockerSettings, title: "Filter Lists and Diagnostics", glyph: "list.bullet.rectangle",
+                control: .action),
+            Row(id: .reader, title: "Reader Mode", glyph: "doc.plaintext",
+                control: .toggle(reader),
+                note: reader || readerAvailable ? nil : "This page has no article to read.",
+                inert: !(reader || readerAvailable)),
+        ]
+        for (i, ext) in extensions.enumerated() {
+            out.append(Row(id: .ext(i), title: ext.name,
+                           // The fallback only: the view draws the action's own icon when
+                           // WebKit can load one, which is nearly always.
+                           glyph: "puzzlepiece.extension",
+                           control: .toggle(ext.allowed),
+                           note: ext.enabled ? nil : "Not available on this page.",
+                           badge: ext.badge, dim: !ext.enabled))
+        }
+        // What this site may open outside the browser. Only ever the answers that exist: a
+        // site that has never been allowed an app has no row here, the same way a site with
+        // no extensions has none for those.
+        for (i, app) in apps.enumerated() {
+            out.append(Row(id: .app(i), title: "Open in " + app.name,
+                           glyph: "arrow.up.forward.app",
+                           control: .toggle(true),
+                           note: "Always opens " + app.scheme + ": links from this site."))
+        }
+        if scheme?.lowercased() == "http" || scheme?.lowercased() == "https" {
+            out.append(Row(id: .boost, title: boosted ? "Edit Boost" : "Boost This Site", glyph: "paintbrush.pointed", control: .action))
+        }
+        if SitePermissions.supportsLocation {
+            out.insert(Row(id: .location, title: "Location", glyph: "location", control: .permission(location),
+                           note: (locationOnce ? "Allowed once, until this tab navigates or closes. " : "")
+                            + "Revoking location reloads this page. Existing access ends when reload completes."), at: 2)
+        }
+        out.append(Row(id: .capture, title: "Capture a Portion of This Page",
+                       glyph: "camera.viewfinder", control: .action))
+        out.append(Row(id: .clearData, title: "Clear Site Data…", glyph: "trash",
+                       control: .action))
+        out.append(Row(id: .developer, title: "Developer Mode", glyph: "hammer",
+                       control: .toggle(developer),
+                       note: "The dev bar and Web Inspector for this site. On by itself for localhost."))
+        return out
+    }
+
+    /// A `WKWebsiteDataRecord` is named for its registrable domain, so the record covering
+    /// `news.example.com` is called `example.com`. Clearing one site's data has to match
+    /// that — and must never be a bare suffix test, which would take `notexample.com` down
+    /// with `example.com`.
+    nonisolated static func covers(record: String, host: String) -> Bool {
+        let r = record.lowercased(), h = host.lowercased()
+        guard !r.isEmpty, !h.isEmpty else { return false }
+        return h == r || h.hasSuffix("." + r)
+    }
+}
+
+// MARK: - Reading and writing the page's state
+
+@MainActor extension SiteControlModel {
+    /// Everything the popover shows, read out of the files that own it. Cheap enough to do
+    /// on every render — six UserDefaults lookups and a walk of the loaded extensions —
+    /// which is what keeps this a derived value rather than another thing to keep in sync.
+    init(_ tab: Tab?) {
+        self.init()
+        guard let tab, let url = tab.currentURL, let h = url.host(), !h.isEmpty else { return }
+        host = h
+        scheme = url.scheme
+        secureContent = tab.secureContent
+        certificateTrusted = tab.certificateTrusted
+        navigationFailed = tab.displayingNavigationError
+        if let permissionScope = SitePermissions.scope(for: tab) {
+            camera = SitePermissions.effective(scope: permissionScope, type: .camera, tabID: tab.id)
+            microphone = SitePermissions.effective(scope: permissionScope, type: .microphone, tabID: tab.id)
+            cameraOnce = SitePermissions.isAllowedOnce(scope: permissionScope, type: .camera, tabID: tab.id)
+            location = SitePermissions.effective(scope: permissionScope, type: .location, tabID: tab.id)
+            locationOnce = SitePermissions.isAllowedOnce(scope: permissionScope, type: .location, tabID: tab.id)
+            microphoneOnce = SitePermissions.isAllowedOnce(scope: permissionScope, type: .microphone, tabID: tab.id)
+            popups = SitePermissions.remembered(scope: permissionScope, type: .popups)
+        }
+        pictureInPicture = tab.pictureInPicture
+        zoom = tab.zoom
+        profileBlocking = Blocker.enabled(for: tab.profileID)
+        blocking = Blocker.enabled(for: tab.profileID, url: url)
+        reader = Reader.isOn(tab)
+        readerAvailable = tab.readerAvailable
+        let host = tab.extensions
+        extensions = host.visible(in: tab).map { context in
+            let action = host.action(context, for: tab)
+            return Ext(name: context.webExtension.displayName ?? "Extension",
+                       allowed: context.hasAccess(to: url),
+                       badge: action.flatMap { ExtensionPins.badge($0.badgeText) },
+                       enabled: action?.isEnabled ?? true,
+                       pinned: host.isPinned(context))
+        }
+        // The name is looked up per scheme rather than stored: the answer is a (site,
+        // scheme) pair, and which app answers to a scheme is macOS's to change.
+        apps = ExternalApps.schemes(scope: SitePermissions.scope(for: tab)).map { scheme in
+            let handler = URL(string: scheme + "://open").flatMap(ExternalApps.handler(for:))
+            return App(scheme: scheme, name: ExternalApps.name(of: handler) ?? scheme)
+        }
+        if let origin = SiteBoosts.origin(url) { boosted = SiteBoosts.value(origin: origin, tab: tab) != SiteBoost() }
+        developer = tab.developer
+    }
+}
+
+/// What makes the pill and the popover redraw when a *setting* changes rather than the tab.
+///
+/// One bump off `UserDefaults.didChangeNotification` catches persistent settings. Private
+/// media answers live in memory, so their modal prompt calls `bump()` explicitly. The
+/// popover's own actions also bump directly so their feedback is immediate.
+@MainActor final class SiteChanges: ObservableObject {
+    static let shared = SiteChanges()
+    @Published private(set) var revision = 0
+
+    private init() {
+        // `assumeIsolated` would trap if this ever arrived off the main queue; a hop costs
+        // nothing here, since all it does is invalidate two small views. Weak self rather
+        // than `SiteChanges.shared`, which is still being assigned while this init runs.
+        NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in Task { @MainActor in self?.revision &+= 1 } }
+    }
+
+    func bump() { revision &+= 1 }
+}
+
+/// The side that writes. Split from the view so a row's action is one named call.
+@MainActor enum SiteControl {
+
+    /// The host the popover is about, as the model keys everything on.
+    static func host(of tab: Tab) -> String { tab.currentURL?.host() ?? "" }
+
+    /// Every case reads the setting it is about to flip *now*, rather than inverting what
+    /// the model said when the row was drawn. A popover can sit open across a navigation,
+    /// a second window, or the modal permission prompt, and a stale `!on` writes the value
+    /// the user is already looking at back over the one that changed underneath them.
+    static func act(_ id: SiteControlModel.RowID, on tab: Tab) {
+        let host = host(of: tab)
+        switch id {
+        case .camera:     cycle(.camera, on: tab)
+        case .microphone: cycle(.microphone, on: tab)
+        case .location: cycle(.location, on: tab)
+        case .popups: cycle(.popups, on: tab)
+        case .pictureInPicture: PictureInPicture.toggle(tab)
+        case .zoom: Zoom.reset(tab)
+        case .blocker:
+            guard Blocker.enabled(for: tab.profileID) else { return }
+            let excepted = Blocker.siteExceptions(for: tab.profileID).contains(host.lowercased())
+            Blocker.setSiteException(host, allowed: !excepted, profileID: tab.profileID, recompile: false)
+            Blocker.refresh(completion: { [weak tab] in tab?.reload() })
+        case .blockerSettings: SettingsWindow.show(tab: "privacy", profileID: tab.profileID)
+        case .reader: Reader.toggle(tab)
+        case .capture: PageCapture.start(tab)
+        case .boost: SiteBoostEditor.open(tab: tab)
+        case .ext(let i): toggleExtension(i, on: tab)
+        // The switch is on because the answer exists; the only thing it can do is take it
+        // back, which puts the site back to being asked.
+        case .app(let i): forgetApp(i, on: tab)
+        case .clearData: clearSiteData(host: host, tab: tab)
+        case .developer: DeveloperMode.toggle(tab)
+        }
+        SiteChanges.shared.bump()
+    }
+
+    /// The permission row's own control is a picker; this is what a click on the row body
+    /// does, so the keyboard and VoiceOver have a route that is not a menu.
+    private static func cycle(_ type: SitePermissions.Kind, on tab: Tab) {
+        guard let scope = SitePermissions.scope(for: tab) else { return }
+        let current = SitePermissions.effective(scope: scope, type: type, tabID: tab.id)
+        set(type, to: current == nil ? true : (current == true ? false : nil), on: tab)
+    }
+
+    static func set(_ type: SitePermissions.Kind, to answer: Bool?, on tab: Tab) {
+        guard let scope = SitePermissions.scope(for: tab) else { return }
+        SitePermissions.set(scope: scope, type: type, answer: answer, tabID: tab.id)
+        SiteChanges.shared.bump()
+    }
+
+    /// The extensions the rows are indexed against — the same list the model built itself
+    /// from, so `.ext(2)` is the third row and not the third *installed* extension, which
+    /// differ in a private window.
+    static func contexts(on tab: Tab) -> [WKWebExtensionContext] { tab.extensions.visible(in: tab) }
+
+    /// Per-site extension access, flipped from what this extension can see right now.
+    /// WebKit turns the url into a match pattern for us, so "allow this extension here" is
+    /// one call and does not need a pattern built by hand.
+    ///
+    /// Takes the context, not a row index: the row was drawn from a snapshot of
+    /// `contexts(on:)` and an extension can finish loading between the draw and the click,
+    /// which would slide every index along by one and flip the wrong extension.
+    static func toggleAccess(_ context: WKWebExtensionContext, on tab: Tab) {
+        guard let url = tab.currentURL else { return }
+        let allowed = !context.hasAccess(to: url)
+        context.setPermissionStatus(allowed ? .grantedExplicitly : .deniedExplicitly, for: url)
+    }
+
+    /// "Always Allow", taken back. Indexed the way the row was drawn — against the sorted
+    /// list `ExternalApps.schemes` returns — and re-read here rather than carried, so a row
+    /// whose answer has gone in the meantime removes nothing instead of its neighbour.
+    static func forgetApp(_ index: Int, on tab: Tab) {
+        let scope = SitePermissions.scope(for: tab)
+        let all = ExternalApps.schemes(scope: scope)
+        guard all.indices.contains(index) else { return }
+        ExternalApps.forget(scope: scope, scheme: all[index])
+    }
+
+    /// The index-keyed way in, for `act` — which is keyed on `RowID` and has nothing else to
+    /// go on. The popover's own rows use their snapshot instead.
+    static func toggleExtension(_ index: Int, on tab: Tab) {
+        let all = contexts(on: tab)
+        guard all.indices.contains(index) else { return }
+        toggleAccess(all[index], on: tab)
+    }
+
+    /// Inspect the exact tab's store before choosing which website data to clear.
+    static func clearSiteData(host: String, tab: Tab) {
+        guard !host.isEmpty else { return }
+        WebsiteDataWindow.show(host: host, tab: tab)
+    }
+
+    // MARK: - check
+
+    /// The mapping, proved without a page. Every assertion here is something a screenshot
+    /// cannot show: that a row is inert for the right reason, that "never asked" survives
+    /// the trip to the control, that clearing one site's data cannot reach another's.
+    nonisolated static func check() -> [(String, Bool)] {
+        var m = SiteControlModel()
+        var out: [(String, Bool)] = []
+
+        // Nothing loaded.
+        out.append(("no page is no site", m.siteless))
+        out.append(("…so there are no rows to offer", m.rows.isEmpty))
+        out.append(("…and the header says so rather than claiming a secure connection",
+                    m.connection == "No page loaded"))
+        out.append(("…but the pill keeps a glyph, so the button does not come and go",
+                    m.glyph == "globe"))
+
+        // The connection line.
+        m = SiteControlModel(host: "example.com", scheme: "https")
+        out.append(("plain https reads as secure", m.connection == "Connection is secure"))
+        out.append(("…and wears the lock", m.glyph == "lock" && !m.insecure))
+        var mixed = m
+        mixed.secureContent = false
+        out.append(("mixed content is called out as partly insecure",
+                    mixed.connection.contains("part of this page loaded over http")))
+        out.append(("…and the glyph changes with it", mixed.glyph == "exclamationmark.triangle"))
+        var untrusted = m
+        untrusted.certificateTrusted = false
+        out.append(("a clicked-through certificate is named as the reason, not lumped in",
+                    untrusted.connection.contains("certificate")))
+        var plain = m
+        plain.scheme = "http"
+        out.append(("http reads as not encrypted", plain.connection == "Not secure — this page is not encrypted"))
+        out.append(("…and wears the broken lock", plain.glyph == "lock.slash"))
+        // A lock is a claim about encryption, and only https has made one.
+        var other = m
+        other.scheme = "timo"
+        out.append(("a host on some other scheme gets no padlock", other.glyph == "globe"))
+        out.append(("…and is not called insecure either", !other.insecure))
+        out.append(("…and says what it is rather than promising security",
+                    other.connection == "Not a web page"))
+        out.append(("HTTPS in capitals still earns the lock",
+                    { var c = m; c.scheme = "HTTPS"; return c.glyph == "lock" }()))
+
+        // www. is dropped in the title, the way the pill drops it.
+        var www = m
+        www.host = "www.example.com"
+        out.append(("the title drops www., the way the pill does", www.title == "example.com"))
+        out.append(("…and a host that merely starts with w is left alone",
+                    SiteControlModel(host: "wwworld.example").title == "wwworld.example"))
+
+        // Rows.
+        let ids = m.rows.map(\.id)
+        out.append(("a site gets the whole panel", ids.count >= 8))
+        out.append(("camera and microphone lead it", ids.prefix(2) == [.camera, .microphone]))
+        out.append(("developer mode is last, the way Arc buries it", ids.last == .developer))
+        out.append(("clearing site data sits just above it",
+                    ids.dropLast().last == .clearData))
+        out.append(("every row is uniquely identified", Set(ids).count == ids.count))
+        out.append(("every row names itself", m.rows.allSatisfy { !$0.title.isEmpty }))
+        out.append(("every row has a glyph", m.rows.allSatisfy { !$0.glyph.isEmpty }))
+
+        // A permission that has never been answered is not "off".
+        func control(_ model: SiteControlModel, _ id: SiteControlModel.RowID) -> SiteControlModel.Control? {
+            model.rows.first { $0.id == id }?.control
+        }
+        out.append(("an unanswered camera is Ask, not Block",
+                    control(m, .camera) == .permission(nil)))
+        var allowed = m
+        allowed.camera = true
+        out.append(("an allowed camera reads as allowed", control(allowed, .camera) == .permission(true)))
+        var denied = m
+        denied.camera = false
+        out.append(("a denied camera reads as denied, which is not the same as unanswered",
+                    control(denied, .camera) == .permission(false)))
+        out.append(("…and the two are told apart",
+                    control(denied, .camera) != control(m, .camera)))
+
+        // The badge on the pill's glyph.
+        out.append(("an untouched site does not badge the pill", m.badge == nil))
+        out.append(("a remembered no does not badge it either — a badge means a grant exists",
+                    denied.badge == nil))
+        out.append(("an allowed camera badges it", allowed.badge == "Camera allowed"))
+        var both = m
+        both.camera = true
+        both.microphone = true
+        out.append(("both grants read as one badge", both.badge == "Camera and microphone allowed"))
+        var mic = m
+        mic.microphone = true
+        out.append(("a microphone grant badges on its own", mic.badge == "Microphone allowed"))
+
+        // Reader.
+        out.append(("Reader is inert on a page with no article",
+                    m.rows.first { $0.id == .reader }?.inert == true))
+        out.append(("…and says why rather than just greying out",
+                    m.rows.first { $0.id == .reader }?.note?.contains("no article") == true))
+        var readable = m
+        readable.readerAvailable = true
+        out.append(("Reader wakes up on an article",
+                    readable.rows.first { $0.id == .reader }?.inert == false))
+        var reading = m
+        reading.reader = true
+        out.append(("Reader stays live while it is on, so it can be turned off again",
+                    reading.rows.first { $0.id == .reader }?.inert == false))
+        out.append(("…and reads as on", control(reading, .reader) == .toggle(true)))
+
+        // The blocker row is honest about its reach.
+        out.append(("the ad blocker row explains exact-host scope",
+                    m.rows.first { $0.id == .blocker }?.note?.lowercased()
+                        .contains("exact host in this profile") == true))
+        out.append(("…and is never inert, because it does work",
+                    m.rows.first { $0.id == .blocker }?.inert == false))
+
+        // Zoom.
+        out.append(("an unzoomed page reads 100%", control(m, .zoom) == .zoom("100%")))
+        var zoomed = m
+        zoomed.zoom = 1.25
+        out.append(("a zoomed page reads its level", control(zoomed, .zoom) == .zoom("125%")))
+
+        // Extensions.
+        out.append(("no extensions means no extension rows",
+                    !m.rows.contains { if case .ext = $0.id { return true } else { return false } }))
+        var withExts = m
+        withExts.extensions = [.init(name: "uBlock", allowed: true),
+                               .init(name: "Dark Reader", allowed: false)]
+        let extRows = withExts.rows.filter { if case .ext = $0.id { return true } else { return false } }
+        out.append(("each loaded extension gets a row", extRows.count == 2))
+        out.append(("…named after the extension", extRows.first?.title == "uBlock"))
+        out.append(("…reading whether it may see this site",
+                    extRows.map(\.control) == [.toggle(true), .toggle(false)]))
+        out.append(("…and indexed so the right one is toggled",
+                    extRows.map(\.id) == [.ext(0), .ext(1)]))
+        // The action button on the row: its badge, and what an extension disabling it does.
+        out.append(("an extension with no badge does not draw one",
+                    extRows.allSatisfy { $0.badge == nil }))
+        var badged = m
+        badged.extensions = [.init(name: "uBlock", allowed: true, badge: "12")]
+        out.append(("a badge set for this tab reaches the row",
+                    badged.rows.first { $0.id == .ext(0) }?.badge == "12"))
+        var off = m
+        off.extensions = [.init(name: "uBlock", allowed: true, enabled: false)]
+        let offRow = off.rows.first { $0.id == .ext(0) }
+        out.append(("an action its extension disabled is drawn dim", offRow?.dim == true))
+        out.append(("…and says so rather than just greying out",
+                    offRow?.note == "Not available on this page."))
+        out.append(("…but the row is not inert, because its access switch still works",
+                    offRow?.inert == false))
+        out.append(("…and that switch still reads the site's answer",
+                    offRow?.control == .toggle(true)))
+        out.append(("a live action is neither dim nor noted",
+                    extRows.allSatisfy { !$0.dim && $0.note == nil }))
+        var pinnedExt = m
+        pinnedExt.extensions = [.init(name: "uBlock", allowed: true, pinned: true),
+                                .init(name: "Dark Reader", allowed: true)]
+        out.append(("the model says which extensions are pinned to the pill",
+                    pinnedExt.extensions.map(\.pinned) == [true, false]))
+
+        // Developer mode.
+        out.append(("developer mode is off by default in the model", control(m, .developer) == .toggle(false)))
+        var dev = m
+        dev.developer = true
+        out.append(("…and reads as on when the tab is inspectable", control(dev, .developer) == .toggle(true)))
+
+        // Apps this site may open without asking. See ExternalApps.swift.
+        out.append(("a site that has never been allowed an app gets no row for one",
+                    !m.rows.contains { if case .app = $0.id { return true }; return false }))
+        var opens = m
+        opens.apps = [SiteControlModel.App(scheme: "zoommtg", name: "Zoom"),
+                      SiteControlModel.App(scheme: "msteams", name: "Microsoft Teams")]
+        let appRows: [SiteControlModel.Row] =
+            opens.rows.filter { if case .app = $0.id { return true }; return false }
+        out.append(("one row per remembered app", appRows.count == 2))
+        out.append(("…named after the app, not the scheme", appRows.first?.title == "Open in Zoom"))
+        out.append(("…and saying which links it takes",
+                    appRows.first?.note == "Always opens zoommtg: links from this site."))
+        out.append(("…as a switch that is on, because the only thing it can do is be taken back",
+                    appRows.allSatisfy { $0.control == .toggle(true) && !$0.inert }))
+        out.append(("…in the order the store hands them over, so the rows do not shuffle",
+                    appRows.map(\.title) == ["Open in Zoom", "Open in Microsoft Teams"]))
+        out.append(("…and they sit above Clear Site Data, which is still the last thing but one",
+                    opens.rows.dropLast().last?.id == .clearData))
+        out.append(("a scheme nothing claims any more is still listed, so it can be removed",
+                    { var orphan = opens
+                      orphan.apps = [SiteControlModel.App(scheme: "zoommtg", name: "zoommtg")]
+                      return orphan.rows.contains { $0.title == "Open in zoommtg" } }()))
+
+        // Clearing site data, scoped.
+        out.append(("a site's own record is cleared",
+                    SiteControlModel.covers(record: "example.com", host: "example.com")))
+        out.append(("a subdomain is covered by its registrable domain's record",
+                    SiteControlModel.covers(record: "example.com", host: "news.example.com")))
+        out.append(("a host that merely ends the same way is not",
+                    !SiteControlModel.covers(record: "example.com", host: "notexample.com")))
+        out.append(("a different site's record is left alone",
+                    !SiteControlModel.covers(record: "other.example", host: "example.com")))
+        out.append(("matching is case-insensitive, the way hosts are",
+                    SiteControlModel.covers(record: "Example.COM", host: "NEWS.example.com")))
+        out.append(("an empty record matches nothing, rather than everything",
+                    !SiteControlModel.covers(record: "", host: "example.com")))
+        out.append(("an empty host clears nothing",
+                    !SiteControlModel.covers(record: "example.com", host: "")))
+        return out
+    }
+}
+
+// MARK: - The popover
+
+/// ~300pt of flat rows hanging off the pill's site glyph. No blur and no material: it is a
+/// panel of controls, and every fill in it comes from `Look` like the sidebar's do.
+struct SiteControlPopover: View {
+    @ObservedObject var tab: Tab
+    /// Redraws when a setting changes rather than the tab — see `SiteChanges`.
+    @ObservedObject private var changes = SiteChanges.shared
+
+    var body: some View {
+        let model = SiteControlModel(tab)
+        // One snapshot, taken where the model was built and handed to every row: the model's
+        // `.ext(i)` indexes into *this* list, and re-reading it at click time would let an
+        // extension that finished loading in between renumber the rows under the pointer.
+        let contexts = SiteControl.contexts(on: tab)
+        VStack(alignment: .leading, spacing: Look.rowGap) {
+            header(model)
+            if model.siteless {
+                Text("There is nothing to control on this page.")
+                    .font(Look.caption)
+                    .foregroundStyle(Look.inkQuiet)
+                    .padding(.horizontal, Look.rowInset)
+                    .padding(.bottom, Look.inset)
+            } else {
+                ForEach(model.rows) { row in
+                    SiteControlRow(row: row, tab: tab, contexts: contexts)
+                }
+            }
+        }
+        .padding(Look.inset)
+        .frame(width: Look.siteWidth)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Site Control Center")
+        .accessibilityValue(model.siteless ? "No page loaded" : "\(model.title), \(model.connection)")
+        .timoMotionPolicy()
+    }
+
+    private func header(_ model: SiteControlModel) -> some View {
+        HStack(spacing: Look.rowSpacing) {
+            Group {
+                if let icon = tab.favicon {
+                    SiteIcon(icon: icon, size: Look.rowIcon, rounded: tab.currentURL?.isFileURL != true)
+                } else {
+                    Image(systemName: model.glyph).resizable().foregroundStyle(.tertiary)
+                }
+            }
+            .aspectRatio(contentMode: .fit)
+            .frame(width: Look.rowIcon, height: Look.rowIcon)
+            VStack(alignment: .leading, spacing: Look.captionGap) {
+                Text(model.siteless ? "This Page" : model.title)
+                    .font(Look.heading).foregroundStyle(Look.inkPrimary).lineLimit(1)
+                Text(model.connection)
+                    .font(Look.caption)
+                    .foregroundStyle(model.insecure ? Look.warning : Look.inkTertiary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Look.rowInset)
+        .padding(.vertical, Look.inset)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// One row: glyph, title, an optional second line, and whatever control the model asked for.
+/// The whole row is the hit target, the way the sidebar's rows are — a 20pt switch is not
+/// something anyone should have to aim at.
+private struct SiteControlRow: View {
+    @Environment(\.spaceChromeTheme) private var chromeTheme
+    let row: SiteControlModel.Row
+    let tab: Tab
+    /// The extensions the popover indexed its rows against, taken once where the model was
+    /// built. `.ext(i)` means `contexts[i]` and nothing else.
+    let contexts: [WKWebExtensionContext]
+    @State private var hovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Website Data opens in its own window, so Clear Site Data closes this
+    /// first and runs on the next turn of the loop.
+    @Environment(\.dismiss) private var dismiss
+    /// An extension's popup hangs off this row, not off the top of the window.
+    @StateObject private var anchor = ActionAnchor()
+
+    var body: some View {
+        HStack(spacing: Look.rowSpacing) {
+            icon
+                .frame(width: Look.rowIcon, height: Look.rowIcon)
+                .opacity(row.dim ? Look.dimmed : 1)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: Look.captionGap) {
+                Text(row.title).font(Look.rowTitle).lineLimit(1)
+                if let note = row.note {
+                    Text(note).font(Look.caption).foregroundStyle(Look.inkQuiet)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: Look.rowGap)
+            control
+        }
+        .foregroundStyle(row.inert ? Look.inkDisabled : Look.inkPrimary)
+        .padding(.horizontal, Look.rowInset)
+        .padding(.vertical, Look.rowPadding)
+        .frame(minHeight: Look.rowHeight)
+        .background(hovering && !row.inert ? chromeTheme.hovered : .clear,
+                    in: .rect(cornerRadius: Look.pillRadius))
+        .animation(reduceMotion ? nil : Look.quick, value: hovering)
+        .animation(Motion.reduced ? nil : Look.quick, value: row.control)
+        .contentShape(.rect)
+        .actionAnchor(anchor)
+        .onHover { hovering = $0 && !row.inert }
+        .onTapGesture(perform: press)
+        .contextMenu { pinItem }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(row.title)
+        .accessibilityValue(axValue)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint(hint)
+        .accessibilityActions {
+            // The stepper's own buttons are inside an element VoiceOver is told to ignore,
+            // so its two actions have to be published by the row itself — otherwise the
+            // only zoom a screen reader can reach is the row's tap, which is Actual Size.
+            if case .zoom = row.control {
+                Button("Zoom In") { Zoom.zoomIn(tab); SiteChanges.shared.bump() }
+                Button("Zoom Out") { Zoom.zoomOut(tab); SiteChanges.shared.bump() }
+            }
+            // An extension row's tap runs the extension and its switch is hidden from
+            // VoiceOver (the row already reads as a button), so without this there is no
+            // route at all to the one thing the row is really about: may it see this site.
+            if let ext = extRow, case .toggle(let allowed) = row.control {
+                Button(allowed ? "Deny Access to This Site" : "Allow Access to This Site") {
+                    SiteControl.toggleAccess(ext.context, on: tab)
+                    SiteChanges.shared.bump()
+                }
+            }
+            // The pin lives in a context menu, which is not a route a screen reader has.
+            pinItem
+        }
+    }
+
+    /// An extension row leads with the extension's own action icon, badge and all, drawn in
+    /// the same 16pt box a favicon or an SF Symbol would be. The image is read here rather
+    /// than carried in the model: an `NSImage` is neither `Sendable` nor `Equatable`, and
+    /// the model is both.
+    @ViewBuilder private var icon: some View {
+        if let context = extRow?.context {
+            ActionIcon(host: tab.extensions, context: context, tab: tab, badge: row.badge)
+        } else {
+            Image(systemName: row.glyph).font(Look.symbol)
+        }
+    }
+
+    /// Arc's "pin to the address bar", per extension. Capped at three, and the item says so
+    /// rather than going quietly dead.
+    @ViewBuilder private var pinItem: some View {
+        if let ext = extRow {
+            let pinned = tab.extensions.isPinned(ext.context)
+            let full = !pinned && !tab.extensions.canPin
+            Button(full ? "Address Bar Is Full — \(ExtensionPins.cap) Pinned"
+                        : pinned ? "Unpin from Address Bar" : "Pin to Address Bar") {
+                tab.extensions.togglePin(ext.context)
+            }
+            .disabled(full)
+        }
+    }
+
+    /// The extension this row stands for, if it stands for one — out of the snapshot the
+    /// popover indexed against, never re-read, so the row cannot act on its neighbour.
+    private var extRow: (index: Int, context: WKWebExtensionContext)? {
+        guard case .ext(let i) = row.id, contexts.indices.contains(i) else { return nil }
+        return (i, contexts[i])
+    }
+
+    private func press() {
+        guard !row.inert else { return }
+        // An extension row is its action button: the click runs the extension, and the
+        // switch beside it is what still answers "may it see this site".
+        if let ext = extRow {
+            guard !row.dim else { return }
+            return tab.extensions.run(ext.context, for: tab, from: anchor.view)
+        }
+        guard case .action = row.control else { return SiteControl.act(row.id, on: tab) }
+        dismiss()
+        Task { @MainActor in SiteControl.act(row.id, on: tab) }
+    }
+
+    /// What the row is about to do, when that is not obvious from its title — and, on the
+    /// two rows that do something a tap cannot be taken back from, what it costs.
+    private var hint: String {
+        if case .ext = row.id, !row.dim {
+            return "Runs this extension here. The switch beside it says whether it may see this site."
+        }
+        switch row.control {
+        case .zoom:   return "Resets the page to actual size. Zoom In and Zoom Out are also available."
+        case .action where row.id == .blockerSettings:
+            return "Opens filter subscriptions, update status, unsupported rules, and site exceptions."
+        case .action where row.id == .boost:
+            return "Change this website’s fonts and colors, hide distractions, or add custom code."
+        case .action where row.id == .capture:
+            return "Click an element or drag a region to capture. Escape cancels."
+        case .action: return "Signs you out of this site and forgets what it stored. This cannot be undone."
+        default:      return row.note ?? ""
+        }
+    }
+
+    @ViewBuilder private var control: some View {
+        switch row.control {
+        case .toggle(let on):
+            Toggle("", isOn: Binding(get: { on }, set: { _ in
+                guard let ext = extRow else { return SiteControl.act(row.id, on: tab) }
+                SiteControl.toggleAccess(ext.context, on: tab)
+                SiteChanges.shared.bump()
+            }))
+                // A switch, not the checkbox a bare `Toggle` renders as in a popover: this
+                // is a setting that takes effect as it is flipped, not a box on a form.
+                .toggleStyle(.switch).labelsHidden().controlSize(.mini).disabled(row.inert)
+                .accessibilityHidden(true)          // the row already reads as a button
+        case .permission(let answer):
+            Picker("", selection: Binding(
+                get: { PermissionAnswer(answer) },
+                set: { answer in
+                    let type: SitePermissions.Kind = switch row.id {
+                    case .camera: .camera
+                    case .location: .location
+                    case .popups: .popups
+                    default: .microphone
+                    }
+                    SiteControl.set(type, to: answer.value, on: tab)
+                })) {
+                ForEach(PermissionAnswer.allCases) { Text($0.title).tag($0) }
+            }
+            .labelsHidden().fixedSize().controlSize(.small)
+            .accessibilityHidden(true)
+        case .zoom(let label):
+            HStack(spacing: Look.stepGap) {
+                StepButton(glyph: "minus") { Zoom.zoomOut(tab); SiteChanges.shared.bump() }
+                Text(label).font(Look.caption).monospacedDigit()
+                    .frame(width: Look.stepLabel)
+                    .accessibilityHidden(true)
+                StepButton(glyph: "plus") { Zoom.zoomIn(tab); SiteChanges.shared.bump() }
+            }
+        case .action:
+            Image(systemName: "chevron.right").font(Look.caption)
+                .foregroundStyle(Look.inkQuiet).accessibilityHidden(true)
+        }
+    }
+
+    /// An extension row's badge is the only thing on it a screen reader would otherwise
+    /// miss entirely: it is drawn on an icon that is `accessibilityHidden`, and "3 blocked"
+    /// is the whole point of the button.
+    private var axValue: String {
+        var parts: [String] = []
+        if let badge = row.badge { parts.append("Badge \(badge)") }
+        switch row.control {
+        case .toggle(let on):
+            if extRow != nil { parts.append(on ? "Allowed on this site" : "Not allowed on this site") }
+            else { parts.append(on ? "On" : "Off") }
+        case .permission(let a):     parts.append(PermissionAnswer(a).title)
+        case .zoom(let label):       parts.append(label)
+        case .action:                break
+        }
+        if row.dim { parts.append("Unavailable on this page") }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// −/+ beside the zoom label. A plain glyph on a fill, sized like a settings control.
+private struct StepButton: View {
+    @Environment(\.spaceChromeTheme) private var chromeTheme
+    let glyph: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: glyph)
+                .font(Look.caption)
+                .frame(width: Look.step, height: Look.step)
+                .background(chromeTheme.controlFill, in: .rect(cornerRadius: Look.chipRadius))
+                .contentShape(.rect)
+        }
+        .buttonStyle(CompactControlStyle(size: Look.step))
+        .accessibilityLabel(glyph == "plus" ? "Zoom In" : "Zoom Out")
+    }
+}
+
+/// The three answers a permission has, as a picker can hold them. `Bool?` cannot be a
+/// `Picker` tag on its own — `nil` is not `Hashable` as a selection — and naming the third
+/// state is the point anyway.
+private enum PermissionAnswer: String, CaseIterable, Identifiable {
+    case ask, allow, block
+    var id: String { rawValue }
+
+    init(_ value: Bool?) {
+        switch value {
+        case .some(true):  self = .allow
+        case .some(false): self = .block
+        case nil:          self = .ask
+        }
+    }
+
+    var value: Bool? {
+        switch self {
+        case .ask:   nil
+        case .allow: true
+        case .block: false
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .ask:   "Ask"
+        case .allow: "Allow"
+        case .block: "Block"
+        }
+    }
+}

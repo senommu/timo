@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Exercise shard coverage and completion against executable CLI boundaries."""
+
+import json
+import re
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+SCRIPT = Path(__file__).with_name("native-test-shards.py")
+
+
+class NativeTestShardsTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.inventory = self.root / "inventory.txt"
+        self.weights = self.root / "durations.json"
+        self.weights.write_text(json.dumps({"classes": {
+            "TimoTests.Slow": 10, "TimoTests.Medium": 6, "TimoTests.Fast": 4}}))
+
+    def plan(self, tests, index=1, count=2, success=True, suite="all"):
+        self.inventory.write_text("\n".join(tests) + "\n")
+        manifest = self.root / f"shard-{index}.json"
+        pattern = self.root / f"shard-{index}.filter"
+        result = subprocess.run([
+            sys.executable, str(SCRIPT), "plan", "--inventory", str(self.inventory),
+            "--index", str(index), "--count", str(count), "--durations", str(self.weights),
+            "--manifest", str(manifest), "--filter-output", str(pattern),
+            "--suite", suite,
+        ], capture_output=True, text=True)
+        self.assertEqual(result.returncode == 0, success, result.stderr)
+        if success:
+            return json.loads(manifest.read_text()), pattern.read_text().strip()
+        self.assertFalse(manifest.exists())
+
+    def test_worker_identity_probe_is_blocking_with_every_required_test(self):
+        probe = "TimoTests.ExtensionUserAgentTests/testServiceWorkerNavigatorIdentityAcrossSelections"
+        inventory = [probe, "TimoTests.ExtensionUserAgentTests/testDefaultSafariIdentityReachesPopupAndManifestTwoBackgroundBeforeScriptsRun",
+                     "TimoTests.Other/testNewRegression"]
+        mandatory, pattern = self.plan(inventory, count=1, suite="required")
+        self.assertEqual(mandatory["tests"], sorted(inventory))
+        for test in inventory: self.assertIsNotNone(re.search(pattern, test))
+
+    def test_retired_advisory_suite_cannot_be_selected(self):
+        self.plan(["TimoTests.A/testA"], count=1, suite="known-limitations", success=False)
+
+    def test_missing_or_renamed_worker_identity_probe_fails_closed(self):
+        tests = ["TimoTests.ExtensionUserAgentTests/testRenamedProbe", "TimoTests.Other/testA"]
+        self.plan(tests, count=1, suite="required", success=False)
+
+    def test_balances_duration_without_splitting_classes_or_losing_new_tests(self):
+        tests = ["TimoTests.Slow/testA", "TimoTests.Slow/testB", "TimoTests.Medium/testA",
+                 "TimoTests.Fast/testA", "TimoTests.New/testAdded"]
+        first, first_filter = self.plan(tests)
+        second, second_filter = self.plan(list(reversed(tests)), index=2)
+        self.assertEqual(first["tests"], ["TimoTests.New/testAdded", "TimoTests.Slow/testA", "TimoTests.Slow/testB"])
+        self.assertEqual(second["tests"], ["TimoTests.Fast/testA", "TimoTests.Medium/testA"])
+        self.assertEqual(first["inventory_sha256"], second["inventory_sha256"])
+        self.assertEqual(set(first["tests"]) | set(second["tests"]), set(tests))
+        self.assertFalse(set(first["tests"]) & set(second["tests"]))
+        for manifest, pattern in ((first, first_filter), (second, second_filter)):
+            self.assertEqual([test for test in sorted(tests) if re.search(pattern, test)], manifest["tests"])
+            self.assertIsNone(re.search(pattern, "OtherTimoTests.Slow/testA"))
+            self.assertIsNone(re.search(pattern, "TimoTests.SlowExtra/testA"))
+        repeated, repeated_filter = self.plan(list(reversed(tests)))
+        self.assertEqual(repeated, first)
+        self.assertEqual(repeated_filter, first_filter)
+
+    def test_zero_duration_classes_still_distribute_across_all_shards(self):
+        self.weights.write_text(json.dumps({"classes": {f"TimoTests.C{i}": 0 for i in range(8)}}))
+        tests = [f"TimoTests.C{i}/testA" for i in range(8)]
+        groups = [self.plan(tests, index=i, count=4)[0]["tests"] for i in range(1, 5)]
+        self.assertEqual([len(group) for group in groups], [2, 2, 2, 2])
+        self.assertEqual(sorted(test for group in groups for test in group), tests)
+
+    def test_accepts_successful_bootstrap_diagnostic_merged_into_swift_discovery(self):
+        manifest, pattern = self.plan([
+            "TimoTests.A/testOne", "TimoTests.A/testTwo",
+            "Native test host bootstrap: beforeAppKit=true, configured=true",
+        ], count=1)
+        self.assertEqual(manifest["tests"], ["TimoTests.A/testOne", "TimoTests.A/testTwo"])
+        self.assertIsNotNone(re.search(pattern, "TimoTests.A/testOne"))
+        for diagnostic in (
+            "Native test host bootstrap: beforeAppKit=false, configured=true",
+            "Native test host bootstrap: beforeAppKit=true, configured=false",
+            "Unexpected discovery diagnostic",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                (self.root / "shard-1.json").unlink(missing_ok=True)
+                self.plan(["TimoTests.A/testOne", diagnostic], count=1, success=False)
+
+    def test_rejects_invalid_discovery_and_shard_parameters(self):
+        for tests, index, count in [([], 1, 2), (["warning: no tests"], 1, 2),
+                                    (["TimoTests.A/test", "TimoTests.A/test"], 1, 1),
+                                    (["TimoTests.A/test"], 0, 1), (["TimoTests.A/test"], 2, 1),
+                                    (["TimoTests.A/test"], 1, 0), (["TimoTests.A/test"], 1, 2)]:
+            with self.subTest(tests=tests, index=index, count=count):
+                self.plan(tests, index, count, success=False)
+
+    def test_rejects_invalid_duration_weights(self):
+        for weight in (-1, "slow", float("nan"), float("inf"), True):
+            with self.subTest(weight=weight):
+                self.weights.write_text(json.dumps({"classes": {"TimoTests.A": weight}}))
+                self.plan(["TimoTests.A/test"], count=1, success=False)
+
+    def verify(self, text, success):
+        log = self.root / "tests.log"
+        log.write_text(text)
+        result = subprocess.run([sys.executable, str(SCRIPT), "verify", "--manifest",
+                                 str(self.root / "shard-1.json"), "--log", str(log)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode == 0, success, result.stderr)
+
+    def test_requires_every_selected_test_to_finish_and_cleanup_to_succeed(self):
+        self.plan(["TimoTests.A/testOne", "TimoTests.A/testTwo"], count=1)
+        first = "Test Case '-[TimoTests.A testOne]' passed (0.001 seconds).\n"
+        second = "Test Case '-[TimoTests.A testTwo]' skipped (0.001 seconds).\n"
+        cleanup = "Native suite primary status=0; cleanup status=0\n"
+        self.verify(first + second + cleanup, True)
+        self.verify(first + cleanup, False)
+        self.verify(first + second, False)
+        self.verify(first + second + cleanup.replace("cleanup status=0", "cleanup status=1"), False)
+        self.verify(first + second.replace("skipped", "failed") + cleanup, False)
+        self.verify(first + second + "*** Signal 5: Backtracing\n" + cleanup, False)
+        self.verify("Test Case '-[Other.A testOne]' passed (0.001 seconds).\n" + second + cleanup, False)
+
+    def test_fresh_process_probe_uses_the_same_fail_closed_verifier(self):
+        # The smoke process must not pass on zero tests, a signal, or failed cleanup.
+        test = "TimoTests.NativeApplicationLoopSmokeTests/testOwnedLoopAdmitsAsyncWorkAndStops"
+        passed = "Test Case '-[TimoTests.NativeApplicationLoopSmokeTests testOwnedLoopAdmitsAsyncWorkAndStops]' passed (6.1 seconds).\n"
+        cleanup = "Native suite primary status=0; cleanup status=0\n"
+        log = self.root / "smoke.log"
+        for text, wanted in (
+            (passed + cleanup, True),
+            (cleanup, False),
+            (passed, False),
+            (passed.replace("passed", "failed") + cleanup, False),
+            (passed.replace("passed", "skipped") + cleanup, False),
+            (passed + cleanup.replace("cleanup status=0", "cleanup status=1"), False),
+            (passed + "*** Signal 5: Backtracing\n" + cleanup, False),
+            (passed + cleanup + "\n*** Signal 11: Backtracing from 0x0... done\n", False),
+        ):
+            with self.subTest(text=text):
+                log.write_text(text)
+                result = subprocess.run([sys.executable, str(SCRIPT), "verify", "--test", test,
+                                         "--log", str(log)], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, wanted, result.stderr)
+
+    def test_probe_selection_rejects_ambiguous_missing_or_malformed_expectations(self):
+        self.plan(["TimoTests.A/testOne"], count=1)
+        log = self.root / "smoke.log"
+        log.write_text("Native suite primary status=0; cleanup status=0\n")
+        for selection in ([], ["--test", "bad"], ["--test", ""],
+                          ["--test", "TimoTests.A/testOne", "--manifest", str(self.root / "shard-1.json")]):
+            with self.subTest(selection=selection):
+                result = subprocess.run([sys.executable, str(SCRIPT), "verify", *selection,
+                                         "--log", str(log)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_empty_or_duplicate_manifest_cannot_pass_on_cleanup_alone(self):
+        for tests in ([], ["TimoTests.A/test", "TimoTests.A/test"]):
+            (self.root / "shard-1.json").write_text(json.dumps({"schema": 1, "tests": tests}))
+            self.verify("Native suite primary status=0; cleanup status=0\n", False)
+
+
+if __name__ == "__main__":
+    unittest.main()

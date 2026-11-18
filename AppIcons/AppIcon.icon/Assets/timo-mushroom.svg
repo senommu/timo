@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
+  <title>Timo mushroom</title>
+  <defs><linearGradient id="glass" x1="220" y1="250" x2="800" y2="820" gradientUnits="userSpaceOnUse"><stop stop-color="#D0D2D6"/><stop offset="0.52" stop-color="#BEC1C6"/><stop offset="1" stop-color="#B4B7BD"/></linearGradient></defs>
+  <g fill="url(#glass)" stroke="#95999F" stroke-width="2.5" stroke-linejoin="round">
+    <path d="M 264 590 C 225 590 204 568 204 530 C 204 389 353 252 512 252 C 671 252 820 389 820 530 C 820 568 799 590 760 590 Z"/>
+    <path d="M 436 622 L 588 622 C 639 622 666 665 666 724 C 666 783 639 830 588 830 L 436 830 C 385 830 358 783 358 724 C 358 665 385 622 436 622 Z"/>
+  </g>
+</svg>

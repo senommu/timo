@@ -1,0 +1,2690 @@
+import AppKit
+import SwiftUI
+import Combine
+import WebKit
+
+/// The native browser frame, page-paint coordination, and traffic-light placement.
+///
+/// AppKit picks where the lights go from the titlebar's height, and it re-picks after every
+/// resize, every key/resign-key and every restored frame. An empty compact toolbar gets that
+/// metric *close* to `Look.lightsCentre` — measured 19.75 against a row centred on 19 — but
+/// close is what the user saw as "the traffic lights aren't in the same place as the others".
+/// So the buttons are moved back onto the line after every layout pass, whatever AppKit did.
+final class TimoWindow: NSWindow {
+    private var resizePreparation: WindowResizePreparation?
+    private var resizeAnchor: WindowResizeAnchor?
+    private var committingResize = false
+    private var sidebarResizePreparation: SidebarPageResizePreparation?
+    private var livePageResizeBuffer: LivePageResizeBuffer?
+    private var liveResizeOwner = UUID()
+    private var sidebarDrag = false
+    private var sidebarResizePublication: SidebarResizePublication?
+    /// The window's own setting while a live resize defers key-view-loop rebuilds.
+    private var keyViewLoopBeforeLiveResize: Bool?
+    /// A drag deferred rebuilds that SwiftUI has not yet made up for.
+    private var keyViewLoopStale = false
+
+    /// A second close command cancels the pending close; a command after its
+    /// publication may proceed as a normal reopen.
+    func cancelSidebarResize() -> Bool {
+        cancelLiveSidebarResize()
+        let waiting = sidebarResizePreparation?.awaitingPaint == true
+        sidebarResizePreparation?.cancel()
+        sidebarResizePreparation = nil
+        return waiting
+    }
+
+    /// Gesture disappearance belongs only to the continuous drag. The separate
+    /// discrete close may already be painting/animating its covered endpoint.
+    func cancelLiveSidebarResize() {
+        if sidebarDrag {
+            sidebarResizePublication?.cancel()
+            livePageResizeBuffer?.cancel()
+        }
+    }
+
+    override var contentView: NSView? {
+        willSet {
+            if newValue !== contentView {
+                keyViewLoopStale = false
+                livePageResizeBuffer?.cancel()
+            }
+        }
+    }
+
+    override func orderOut(_ sender: Any?) {
+        resizeAnchor = nil
+        keyViewLoopStale = false
+        livePageResizeBuffer?.cancel()
+        super.orderOut(sender)
+    }
+
+    func prepareSidebarClose(_ store: TabStore) -> Bool {
+        guard isVisible, !isPreparingPageResize, !inLiveResize, let root = contentView,
+              store.sidebarShown, !store.libraryOpen else { return false }
+        let expansion = SidebarWidth.inWindow(store) - Look.cardGap
+        let pages = WindowResizePreparation.targets(in: root, nextSize: root.bounds.size,
+                                                    leadingExpansion: expansion)
+        guard !pages.isEmpty else { return false }
+        let preparation = SidebarPageResizePreparation(window: self, pages: pages,
+            isCurrent: { [weak self, weak store] in
+                guard let self, let store else { return false }
+                return store.window === self && store.profileVisible && store.sidebarShown && !store.libraryOpen
+            }, commit: { [weak store] in store?.sidebarShown = false })
+        sidebarResizePreparation = preparation
+        preparation.start()
+        return true
+    }
+
+    var isPreparingPageResize: Bool { resizePreparation?.isPreparing == true || livePageResizeBuffer?.isPreparing == true }
+
+    /// A covered native commit already runs AppKit's window layout lifecycle.
+    /// Its prepared WebKit viewport does not need another eager hosting render
+    /// from inside setFrameSize. All other sizing retains immediate propagation.
+    var isCommittingBufferedPageResize: Bool {
+        committingResize && resizeAnchor != nil && !sidebarDrag
+            && livePageResizeBuffer?.usesNativeSidebarSizing == false
+    }
+
+    func beginSidebarResize(_ store: TabStore, frameDriver: SidebarResizePublication.FrameDriver? = nil) {
+        _ = cancelSidebarResize()
+        livePageResizeBuffer?.cancel()
+        resizePreparation?.cancel()
+        sidebarDrag = true
+        let owner = UUID()
+        liveResizeOwner = owner
+        livePageResizeBuffer = LivePageResizeBuffer(window: self, axes: NSSize(width: 1, height: 0),
+            isCurrent: { [weak self, weak store] in
+                guard let self, let store else { return false }
+                return self.liveResizeOwner == owner && store.window === self && store.profileVisible
+                    && store.sidebarShown && !store.libraryOpen
+            }, apply: { [weak self] _, width in
+                if let width { self?.sidebarResizePublication?.enqueue(width) }
+            }, completion: { [weak self] in
+                guard let self, self.liveResizeOwner == owner else { return }
+                self.sidebarResizePublication?.cancel()
+                self.sidebarResizePublication = nil
+                self.livePageResizeBuffer = nil
+                self.sidebarDrag = false
+                self.rebuildStaleKeyViewLoop()
+            })
+        guard let buffer = livePageResizeBuffer, let root = contentView else {
+            livePageResizeBuffer?.cancel()
+            sidebarDrag = false
+            return
+        }
+        let frameLayout = SidebarResizeFrameLayout(window: self, root: root,
+            isCurrent: { [weak self, weak buffer] in
+                guard let self, let buffer, self.liveResizeOwner == owner,
+                      self.livePageResizeBuffer === buffer else { return false }
+                return buffer.validateSidebarPublication()
+            })
+        sidebarResizePublication = SidebarResizePublication(buffer: buffer,
+            frameDriver: frameDriver ?? SidebarResizePublication.displayFrames(for: self),
+            afterFrame: { frameLayout.presentFrame() },
+            publish: { [weak store] width in
+                let previous = SidebarWidth.shared.width
+                SidebarWidth.shared.setLiveWidth(width, available: store?.window?.contentView?.bounds.width)
+                frameLayout.didPublishWidth(from: previous, to: SidebarWidth.shared.width)
+            })
+        buffer.start()
+    }
+
+    @discardableResult func updateSidebarResize(_ width: CGFloat) -> Bool {
+        guard sidebarDrag else { return false }
+        return livePageResizeBuffer?.request(frame: frame, sidebarWidth: width) == true
+    }
+
+    @discardableResult func endSidebarResize(_ width: CGFloat, completion: @escaping @MainActor () -> Void) -> Bool {
+        guard updateSidebarResize(width), let buffer = livePageResizeBuffer else { return false }
+        sidebarResizePublication?.finish()
+        buffer.finish(completion)
+        return true
+    }
+
+    @discardableResult func preparePageResize(frame: NSRect, display: Bool) -> Bool {
+        _ = cancelSidebarResize()
+        livePageResizeBuffer?.cancel()
+        if resizePreparation == nil {
+            resizePreparation = WindowResizePreparation(window: self) { [weak self] frame, display in
+                self?.commitPreparedResize(frame, display: display)
+            }
+        }
+        return resizePreparation?.request(frame: frame, display: display) == true
+    }
+
+    private func commitPreparedResize(_ frame: NSRect, display: Bool) {
+        committingResize = true
+        super.setFrame(frame, display: false)
+        committingResize = false
+        BufferedResizeLayout.release()
+        if display { viewsNeedDisplay = true }
+    }
+
+    func beginPageResize(at point: NSPoint = NSEvent.mouseLocation) {
+        _ = cancelSidebarResize()
+        livePageResizeBuffer?.cancel()
+        resizePreparation?.cancel()
+        resizeAnchor = WindowResizeAnchor(frame: frame, pointer: point)
+        let nearHorizontal = min(abs(point.x - frame.minX), abs(point.x - frame.maxX)) <= 24
+        let nearVertical = min(abs(point.y - frame.minY), abs(point.y - frame.maxY)) <= 24
+        let owner = UUID()
+        liveResizeOwner = owner
+        livePageResizeBuffer = LivePageResizeBuffer(window: self,
+            axes: NSSize(width: nearHorizontal ? 1 : 0, height: nearVertical ? 1 : 0),
+            frameDriver: SidebarResizePublication.displayFrames(for: self),
+            apply: { [weak self] frame, _ in self?.commitPreparedResize(frame, display: true) },
+            completion: { [weak self] in
+                guard let self, self.liveResizeOwner == owner else { return }
+                self.livePageResizeBuffer = nil
+                self.rebuildStaleKeyViewLoop()
+            })
+        livePageResizeBuffer?.start()
+        resizePreparation?.beginLiveResize()
+        // Every frame of a vertical resize moves focusable chrome, and SwiftUI then
+        // rebuilds the whole key-view loop at once in a window that does not
+        // recalculate its own: a quarter of the main thread per frame, growing with
+        // the tab count. Let it mark the loop stale instead, until the drag ends.
+        if keyViewLoopBeforeLiveResize == nil {
+            keyViewLoopBeforeLiveResize = autorecalculatesKeyViewLoop
+            autorecalculatesKeyViewLoop = true
+        }
+    }
+
+    func proposedPageResize(_ size: NSSize) -> NSSize {
+        guard !committingResize, let resizeAnchor, !styleMask.contains(.fullScreen) else { return size }
+        let target = resizeAnchor.frame(for: size)
+        if livePageResizeBuffer?.request(frame: target) == true { return frame.size }
+        return preparePageResize(frame: target, display: true) ? frame.size : size
+    }
+
+    /// A window that is closing, miniaturising, changing its content or entering
+    /// full screen ends the drag without the rebuild; its chrome is not resized.
+    func endPageResize(rebuildingKeyViewLoop: Bool = true) {
+        resizeAnchor = nil
+        if let previous = keyViewLoopBeforeLiveResize {
+            keyViewLoopBeforeLiveResize = nil
+            autorecalculatesKeyViewLoop = previous
+            keyViewLoopStale = true
+        }
+        if !rebuildingKeyViewLoop { keyViewLoopStale = false }
+        livePageResizeBuffer?.finish()
+        resizePreparation?.endLiveResize()
+        rebuildStaleKeyViewLoop()
+    }
+
+    /// SwiftUI orders its loop by its own focus items, which AppKit's
+    /// `recalculateKeyViewLoop()` does not reproduce, and it rebuilds only when a
+    /// focusable view moves. So once the drag's buffer has retired, move them: one
+    /// undisplayed resize of the content view and back, as a last drag frame would.
+    private func rebuildStaleKeyViewLoop() {
+        guard keyViewLoopStale, keyViewLoopBeforeLiveResize == nil, livePageResizeBuffer == nil,
+              let view = contentView else { return }
+        keyViewLoopStale = false
+        let size = view.frame.size
+        // Two points, so a centred control still moves a whole one. Inward: a
+        // larger viewport would clamp every scroll view sitting at its end, and
+        // shrinking back would not undo it.
+        isRebuildingKeyViewLoop = true
+        view.setFrameSize(NSSize(width: size.width - 2, height: size.height - 2))
+        view.setFrameSize(size)
+        isRebuildingKeyViewLoop = false
+        let held = heldPageHosts
+        heldPageHosts = []
+        held.forEach { $0.applyHeldFrame() }
+    }
+
+    /// The chrome moves and returns within one turn. Every `WebHost` sits it out
+    /// and then takes the last frame it was given, which is the one it has, so no
+    /// page sees a viewport it was never shown at.
+    private(set) var isRebuildingKeyViewLoop = false
+    var heldPageHosts: [WebHost] = []
+
+    override func close() {
+        _ = cancelSidebarResize()
+        endPageResize(rebuildingKeyViewLoop: false)
+        livePageResizeBuffer?.cancel()
+        resizePreparation?.cancel()
+        super.close()
+    }
+
+    override func miniaturize(_ sender: Any?) {
+        _ = cancelSidebarResize()
+        endPageResize(rebuildingKeyViewLoop: false)
+        livePageResizeBuffer?.cancel()
+        resizePreparation?.cancel()
+        super.miniaturize(sender)
+    }
+
+    override func toggleFullScreen(_ sender: Any?) {
+        _ = cancelSidebarResize()
+        endPageResize(rebuildingKeyViewLoop: false)
+        livePageResizeBuffer?.cancel()
+        resizePreparation?.cancel()
+        super.toggleFullScreen(sender)
+    }
+
+    /// Where a light's frame origin has to sit for its centre to land `Look.lightsCentre`
+    /// below the window's top edge. `top` is that top edge in the button's superview's own
+    /// (unflipped, y-up) coordinates, so this is the same arithmetic whatever titlebar view
+    /// AppKit happens to have parented the buttons to.
+    /// Pure, so `selfcheck --pure` can prove it without a window server.
+    nonisolated static func lightOriginY(windowTop top: CGFloat, buttonHeight h: CGFloat,
+                                         peeking: Bool = false) -> CGFloat {
+        top - lightsCentre(peeking: peeking) - h / 2
+    }
+
+    /// The lights follow the floating panel's inset so they stay on its top row.
+    /// `Look.check` pins `lightsCentre == topInset + topRow / 2`; the additional
+    /// clearance is shared with the panel's layout and gesture bounds.
+    nonisolated static func lightsCentre(peeking: Bool) -> CGFloat {
+        peeking ? Look.floatingSidebarGap + Look.topInset + Look.topRow / 2 : Look.lightsCentre
+    }
+
+    /// How far right of AppKit's own x the lights sit. Zero docked — AppKit's x already
+    /// matches Arc's, 18.75pt from the window edge and 23pt apart — and the panel's inset
+    /// while peeking.
+    nonisolated static func lightsOffsetX(peeking: Bool) -> CGFloat {
+        peeking ? Look.floatingSidebarGap : 0
+    }
+
+    /// True while the sidebar is hidden *and* the pointer has peeked the floating panel back.
+    /// Set from `BrowserWindow`, which is the only thing that knows.
+    var peekingSidebar = false {
+        didSet { if peekingSidebar != oldValue { centreTrafficLights() } }
+    }
+
+    /// AppKit's own x for each light, captured the first time we see it. Read once and kept:
+    /// after the first shift the button's own frame is no longer AppKit's answer, and AppKit
+    /// puts it back to this on its own relayouts, so a delta from "wherever it is now" drifts
+    /// by the inset every time the peek opens.
+    private var baseX: [NSWindow.ButtonType: CGFloat] = [:]
+
+    /// AppKit finds each standard button by walking the whole view tree, and every layout
+    /// pass asks for all three. Reuse a button while it is still installed in this window;
+    /// AppKit's replacements (style mask or fullscreen changes) detach the old one.
+    private let lightButtons = NSMapTable<NSNumber, NSButton>.strongToWeakObjects()
+
+    override func standardWindowButton(_ kind: NSWindow.ButtonType) -> NSButton? {
+        let key = NSNumber(value: kind.rawValue)
+        if let button = lightButtons.object(forKey: key), button.window === self { return button }
+        let button = super.standardWindowButton(kind)
+        lightButtons.setObject(button, forKey: key)
+        return button
+    }
+
+    /// Interpolated by the same SwiftUI transaction as the sidebar. Keep this
+    /// across AppKit relayouts instead of snapping back to the destination row.
+    private var trafficLightOffset: CGPoint?
+
+    func placeTrafficLights(offset: CGPoint, visibility: CGFloat, peeking: Bool) {
+        trafficLightOffset = offset
+        for kind in Self.lightKinds {
+            if let button = standardWindowButton(kind), button.isHidden != (visibility <= 0.001) {
+                button.isHidden = visibility <= 0.001
+            }
+        }
+        peekingSidebar = peeking
+        centreTrafficLights()
+    }
+
+    /// The lights' resting face, laid over AppKit's own three. See `TrafficLightRest`.
+    private var lightsAtRest: TrafficLightRest?
+
+    /// The three buttons, in AppKit's own left-to-right order — which is the order
+    /// `Look.lightColours` is written in.
+    static let lightKinds: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+
+    func centreTrafficLights() {
+        let peeking = peekingSidebar
+        for kind in Self.lightKinds {
+            guard let button = standardWindowButton(kind), let host = button.superview else { continue }
+            // The window's top edge in base coordinates is its own height; convert that into
+            // whatever space the buttons are laid out in.
+            let top = host.convert(NSPoint(x: 0, y: frame.height), from: nil).y
+            let wantY = trafficLightOffset.map {
+                top - Look.lightsCentre - $0.y - button.frame.height / 2
+            } ?? Self.lightOriginY(windowTop: top, buttonHeight: button.frame.height, peeking: peeking)
+            let base = baseX[kind] ?? button.frame.origin.x
+            baseX[kind] = base
+            let wantX = base + (trafficLightOffset?.x ?? Self.lightsOffsetX(peeking: peeking))
+            guard abs(button.frame.origin.y - wantY) > 0.01
+                    || abs(button.frame.origin.x - wantX) > 0.01 else { continue }
+            button.setFrameOrigin(NSPoint(x: wantX, y: wantY))
+        }
+        dressTrafficLights()
+    }
+
+    /// Keeps `TrafficLightRest` sitting exactly on the three buttons — which have just been
+    /// moved, and which AppKit moves back, hides and shows on its own. Called from the one
+    /// place that already runs after every one of those.
+    private func dressTrafficLights() {
+        let buttons = Self.lightKinds.compactMap { standardWindowButton($0) }
+        guard buttons.count == Self.lightKinds.count, let host = buttons[0].superview else { return }
+        let rest = lightsAtRest ?? TrafficLightRest()
+        lightsAtRest = rest
+        // Above everything the titlebar has, so the discs cover AppKit's own buttons rather
+        // than hiding behind them. Re-asserted rather than added once: AppKit adds and
+        // removes its own titlebar views, and an overlay underneath one of them is not one.
+        if host.subviews.last !== rest { host.addSubview(rest, positioned: .above, relativeTo: nil) }
+        rest.follow(buttons, key: isKeyWindow)
+    }
+
+    /// Every AppKit relayout ends here, which makes this the one hook that catches a resize,
+    /// a live-resize step, a restored frame and a first ordering-in alike.
+    override func layoutIfNeeded() {
+        super.layoutIfNeeded()
+        centreTrafficLights()
+    }
+
+    /// Nothing under a Library takes the keyboard, including while its panel is still
+    /// sliding over a sidebar that has not been disabled yet.
+    override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
+        guard MainActor.assumeIsolated({ LibrarySidebarCover.admits(responder, in: self) }) else { return false }
+        return super.makeFirstResponder(responder)
+    }
+
+    /// WebKit offers unhandled DOM keys back to AppKit asynchronously. A page can
+    /// act on a key (for example YouTube's L) without preventing its default, so
+    /// reaching the window is not evidence that the user's shortcut was invalid.
+    /// This is only the fallback: the page and Timo's shortcut monitor run first.
+    override func keyDown(with event: NSEvent) {
+        var view = firstResponder as? NSView
+        while let current = view {
+            if current is WKWebView { return }
+            view = current.superview
+        }
+        super.keyDown(with: event)
+    }
+
+    /// Arc's sidebar *is* the window's title bar: dragging its bare ground moves the window,
+    /// and dragging anything on it does that thing instead. `WindowDragGround` is SwiftUI's
+    /// own answer to "is the pointer on bare ground", so this is the whole of it — and it
+    /// deliberately does not use `isMovableByWindowBackground`, which cannot tell the
+    /// difference and moved the window from a drag on a tab row.
+    override func sendEvent(_ event: NSEvent) {
+        // Setup and the quit scrim own their input. In particular,
+        // stale sidebar hover must never turn its buttons into window drags.
+        if MainActor.assumeIsolated({ FirstLaunch.isPresenting || QuitDialog.isUp }) {
+            super.sendEvent(event)
+            return
+        }
+        MainActor.assumeIsolated { PasswordChooser.handlePointer(event) }
+        // Escape takes the saved-account list down first — it is the newest thing on screen
+        // and the one thing the user cannot dismiss any other way — then drops a
+        // multi-select, then stops a page that is still coming in, and *only* then, so a
+        // page's own dialog, menu or full-screen video keeps its Escape the rest of the time.
+        if event.type == .keyDown, event.keyCode == 53,
+           MainActor.assumeIsolated({
+               PasswordChooser.dismiss(in: self) || Selection.clear(in: self)
+                   || TabActions.stopLoading(in: self)
+           }) { return }
+        // A released Library opening has not installed its Escape button yet.
+        // Keep Escape ahead of the page during that short presentation tail.
+        if event.type == .keyDown, event.keyCode == 53,
+           MainActor.assumeIsolated({
+               guard let store = TabStore.all.first(where: { $0.window === self && $0.profileVisible }),
+                     !store.libraryOpen, store.librarySwipeMonitor.intendsOpen(in: store),
+                     store.palette == nil, !store.findOpen, attachedSheet == nil,
+                     NSApp.modalWindow == nil else { return false }
+               Library.close(store)
+               return true
+           }) { return }
+        // ⌘A takes the current tab's whole section — but only when nothing that types has
+        // the focus, which is the whole of `Selection.selectAll`'s job.
+        if event.type == .keyDown, event.charactersIgnoringModifiers == "a",
+           event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           MainActor.assumeIsolated({ Selection.selectAll(in: self) }) { return }
+        if event.type == .leftMouseDown {
+            let at = event.locationInWindow
+            if MainActor.assumeIsolated({
+                Self.picksUpWindow(overGround: WindowDragGround.shared.over(in: self, at: at),
+                                   onLight: onTrafficLight(at))
+            }) {
+                // Runs its own event loop until the button comes up, and gives us AppKit's
+                // edge snapping and Spaces handling for nothing.
+                performDrag(with: event)
+                return
+            }
+        }
+        super.sendEvent(event)
+    }
+
+    /// Whether a left mouse-down picks the window up, given what is under the pointer.
+    ///
+    /// The second half is the bug this exists for. The traffic lights are AppKit's own
+    /// buttons, in the titlebar view, *above* the content view — and the drag ground is a
+    /// SwiftUI view laid under the whole sidebar (under Little Timo's whole bar), which
+    /// knows nothing about a view hierarchy it is not in. SwiftUI reports that ground as
+    /// hovered while the pointer is on a light, so "over" alone said bare ground over the
+    /// close button: `sendEvent` turned the click into `performDrag`, which for a click
+    /// with no movement starts and ends a window move and never reaches the button. ×, −
+    /// and the zoom button all did nothing, in every Timo window — most visibly in a Little
+    /// Timo, where the lights are the only way to close, minimise or zoom it.
+    ///
+    /// Pure, so the rule can be proved without a window server. `onLight` is an autoclosure
+    /// because this runs on every left mouse-down in the app and the ground is the cheap
+    /// half — an integer read — while the light test is three `hitTest`s and two coordinate
+    /// conversions. Off the ground there is nothing to ask.
+    nonisolated static func picksUpWindow(overGround: Bool,
+                                          onLight: @autoclosure () -> Bool) -> Bool {
+        overGround && !onLight()
+    }
+
+    /// True while `point` — in the window's own coordinates — is on one of the traffic
+    /// lights. The three standard buttons and nothing else: the titlebar view spans the
+    /// window's whole width, and the bar drawn across it is meant to pick the window up
+    /// everywhere the lights are not. A hidden button (`showTrafficLights(false)`, a
+    /// collapsed window) is not there to be clicked and does not stop a drag.
+    @MainActor func onTrafficLight(_ point: NSPoint) -> Bool {
+        for kind in Self.lightKinds {
+            guard let button = standardWindowButton(kind), !button.isHidden,
+                  let host = button.superview else { continue }
+            // `hitTest` takes a point in the *superview's* space, and answers nil for a
+            // button that is hidden or disabled — which is the answer we want either way.
+            if button.hitTest(host.convert(point, from: nil)) != nil { return true }
+        }
+        return false
+    }
+
+    /// Becoming or resigning key swaps the buttons' images and can re-lay them without a
+    /// layout pass of the window's own.
+    override func becomeKey() { super.becomeKey(); centreTrafficLights() }
+    override func resignKey() { super.resignKey(); centreTrafficLights() }
+}
+
+/// The traffic lights, in the two faces Timo draws itself.
+///
+/// At rest in the key window they are three all-but-invisible discs — the chrome's own ink,
+/// a hair above the ground behind them — each ringed in its own colour just enough to tell ×
+/// from − from ⤢. The moment the pointer reaches any one of the three, all three come up in
+/// full red, yellow and green with their glyphs: together, not one at a time, because they
+/// are one group and lighting only the one under the pointer reads as a rollover on a button
+/// rather than as a window waking up. Leaving all three takes them back.
+///
+/// In a window that has not got the keyboard there is no third state to reach: plain grey
+/// discs, no colour, and a pointer passing over them changes nothing — the same as every
+/// other Mac window in the background, and for the same reason. They are not what you are
+/// aiming at; the window is.
+///
+/// ponytail: paint laid *over* AppKit's own buttons, which are faded out under it, rather
+/// than three buttons of our own. The full-colour face is then AppKit's — exactly the lights
+/// every other Mac app has, glyphs and key states and all — and there is nothing to wire up:
+/// `alphaValue` hides a button without taking it out of hit-testing, so every click, and
+/// AppKit's own hover, still land on the real buttons underneath. One overlay across all
+/// three rather than one each, so "any of them" is a single tracking area instead of three
+/// that have to agree with each other.
+final class TrafficLightRest: NSView {
+    /// Each light's disc, in this view's own coordinates, left to right.
+    private var discs: [CGRect] = []
+    /// AppKit's own three, underneath. Faded out except in the one state that is theirs.
+    private var lights: [NSButton] = []
+    private var hover: NSTrackingArea?
+    /// Whether the window this is in has the keyboard, and whether the pointer is away from
+    /// all three lights. Between them they pick the face.
+    private var key = true
+    private var resting = true
+
+    /// Paint, never a target: the buttons underneath are the things being clicked.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// True while AppKit's own buttons are the ones to show: the key window, pointer on the
+    /// group. A background window's lights stay ours however near the pointer gets.
+    private var lit: Bool { key && !resting }
+
+    /// Sits the overlay on `buttons` — which have just been moved onto the sidebar's row, and
+    /// which AppKit hides with the rest of the chrome. Hidden when they are: a window with no
+    /// sidebar has no lights, and three discs floating on a bare page is worse than none.
+    ///
+    /// Every line here writes only on a change. This runs inside the window's own display
+    /// pass — `centreTrafficLights` is called from `layoutIfNeeded` — and a view that asks
+    /// for another display every time it is displayed is an infinite one: AppKit throws
+    /// "more Display Window passes than there are views in the window" and the app dies.
+    func follow(_ buttons: [NSButton], key isKey: Bool) {
+        guard let first = buttons.first else { return }
+        let union = buttons.dropFirst().reduce(first.frame) { $0.union($1.frame) }
+        let wanted = buttons.map {
+            let box = $0.frame.offsetBy(dx: -union.origin.x, dy: -union.origin.y)
+            return CGRect(x: box.midX - Look.lightDisc / 2, y: box.midY - Look.lightDisc / 2,
+                          width: Look.lightDisc, height: Look.lightDisc)
+        }
+        if frame != union { frame = union }
+        if discs != wanted { discs = wanted; needsDisplay = true }
+        var moved = false
+        if lights != buttons { lights = buttons; moved = true }
+        if key != isKey { key = isKey; moved = true; needsDisplay = true }
+        if moved { show(animated: false) }
+        let gone = buttons.contains { $0.isHidden }
+        if isHidden != gone { isHidden = gone }
+        if hover?.rect != bounds {
+            if let old = hover { removeTrackingArea(old) }
+            // `.activeAlways`: the pointer reaching a background window's lights still has to
+            // be heard, or one that goes into the background under the pointer keeps whatever
+            // face it had when it lost the keyboard.
+            let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways],
+                                      owner: self)
+            addTrackingArea(area)
+            hover = area
+            // A tracking area only ever reports crossings after it exists. The pointer can
+            // already be parked on the lights when the window is first laid out — moving no
+            // further, so no `mouseEntered` is ever coming — and they would sit dim under it
+            // until it left and came back. Read where it actually is instead.
+            let inside = window.map {
+                bounds.contains(convert($0.mouseLocationOutsideOfEventStream, from: nil))
+            } ?? false
+            if resting == inside { resting = !inside; show(animated: false) }
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) { resting = false; show(animated: true) }
+    override func mouseExited(with event: NSEvent) { resting = true; show(animated: true) }
+
+    /// Crossfades this face against AppKit's own three underneath, which is the whole of the
+    /// hover. The list's own timing, so the chrome moves at one speed; Reduce Motion cuts.
+    private func show(animated: Bool) {
+        let duration = animated && !Motion.reduced ? Look.listSeconds : 0
+        fade(to: lit ? 0 : Look.lightHoverAlpha, duration: duration)
+        for light in lights { light.fade(to: lit ? Look.lightHoverAlpha : 0.001, duration: duration) }
+    }
+
+    /// The discs are ink over whatever the space is washed in, and ink is appearance-keyed.
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Self.drawDiscs(discs, key: key)
+    }
+
+    static func drawDiscs(_ discs: [CGRect], key: Bool) {
+        let ringed = key ? Look.lightRingOpacity : Look.lightInactiveRingOpacity
+        for (i, disc) in discs.enumerated() where i < Look.lightColours.count {
+            (key ? Look.lightRest : Look.lightInactive).setFill()
+            NSBezierPath(ovalIn: disc).fill()
+            guard ringed > 0 else { continue }
+            // `strokeBorder`'s trick, by hand: half the line's width in, so the whole point
+            // lands inside the disc instead of blurring across its antialiased edge.
+            let ring = NSBezierPath(ovalIn: disc.insetBy(dx: Look.lightRing / 2,
+                                                         dy: Look.lightRing / 2))
+            ring.lineWidth = Look.lightRing
+            Look.lightColours[i].withAlphaComponent(ringed).setStroke()
+            ring.stroke()
+        }
+    }
+}
+
+extension TrafficLightRest {
+    /// AppKit owns the buttons under this painted face, including their keyboard actions.
+    /// This needs a real window because AppKit itself disables a standard control at zero alpha.
+    @MainActor static func checkControls() -> [(String, Bool)] {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered, defer: false)
+        let buttons = TimoWindow.lightKinds.compactMap { window.standardWindowButton($0) }
+        let rest = TrafficLightRest()
+        rest.follow(buttons, key: true)
+        return [("the resting face keeps AppKit's buttons enabled for keyboard actions",
+                 buttons.count == TimoWindow.lightKinds.count && buttons.allSatisfy(\.isEnabled))]
+    }
+}
+
+extension TimoWindow {
+    /// The peeked sidebar's geometry, proved offline. `Look.check` already pins the docked
+    /// numbers; these are the ones that only apply while the floating panel is showing.
+    nonisolated static func check() -> [(String, Bool)] {
+        [
+            ("docked, the lights sit on the sidebar's own top row",
+             lightsCentre(peeking: false) == Look.lightsCentre),
+            ("peeked, they move down by the panel's inset",
+             lightsCentre(peeking: true) == Look.lightsCentre + Look.floatingSidebarGap),
+            ("…which is the panel's padding plus its own top row",
+             lightsCentre(peeking: true) == Look.floatingSidebarGap + Look.topInset + Look.topRow / 2),
+            ("docked, x is AppKit's own", lightsOffsetX(peeking: false) == 0),
+            ("peeked, x moves right by the same inset", lightsOffsetX(peeking: true) == Look.floatingSidebarGap),
+            ("the y origin follows the peeked line",
+             lightOriginY(windowTop: 800, buttonHeight: 14, peeking: true)
+                == lightOriginY(windowTop: 800, buttonHeight: 14) - Look.floatingSidebarGap),
+            ("peeking is the only thing that moves them",
+             lightOriginY(windowTop: 800, buttonHeight: 14, peeking: false)
+                == lightOriginY(windowTop: 800, buttonHeight: 14)),
+
+            // The lights answer a click. The drag ground lies under them, and used to eat it.
+            ("bare ground picks the window up", picksUpWindow(overGround: true, onLight: false)),
+            ("a traffic light does not — the click is the button's",
+             !picksUpWindow(overGround: true, onLight: true)),
+            ("nothing at all under the pointer is not a drag either",
+             !picksUpWindow(overGround: false, onLight: false)),
+            ("a light with no ground behind it is still not a drag",
+             !picksUpWindow(overGround: false, onLight: true)),
+            ("Little Timo's bar really does reach over the lights, which is why the guard "
+             + "is needed", Look.littleTopInset + Look.pillHeight > Look.lightsCentre),
+            ("…and so does the sidebar's own top strip",
+             Look.topInset + Look.topRow > Look.lightsCentre),
+        ]
+    }
+}
+
+/// Window bookkeeping + session restore. ponytail: no NSDocument, no window controller
+/// hierarchy — a list of live TabStores and their NSWindows is the whole model.
+@MainActor enum Windows {
+    private static var delegates: [WindowDelegate] = []
+
+    /// The window in front, whatever kind it is — a Little Arc included, because ⌘L, ⌘R,
+    /// Find and the rest have to act on the window the user is looking at. keyWindow is nil
+    /// while a sheet or panel is up, so fall back to the most recently opened one rather
+    /// than doing nothing; the fallback skips Little Arcs, since a menu item fired with no
+    /// key window meant the browser.
+    /// Anything that moves rows around a sidebar, a Space or the archive wants `main`.
+    static var current: TabStore? {
+        // Browser commands in a website dialog must never target the opener behind it.
+        if WebsitePopupWindow.owns(NSApp.keyWindow) { return nil }
+        return TabStore.all.first { $0.window?.isKeyWindow == true } ?? main
+    }
+
+    // MARK: ⌘W
+
+    /// What ⌘W closes.
+    enum CloseTarget: Equatable, Sendable {
+        /// A tab in the window the keystroke was aimed at — `current`.
+        case tab
+        /// The key window itself, because it holds no tabs to close.
+        case window
+        /// The Library, because it is standing in front of the tabs.
+        case library
+    }
+
+    /// Timo has windows of its own that hold no tabs at all — Settings, History, Extensions —
+    /// and `current` deliberately falls back to the frontmost browser window when the key
+    /// window is not one of its stores. Together those meant ⌘W over Settings left Settings
+    /// open and quietly archived a tab in a browser window *behind* it, which is both a key
+    /// that does nothing and a tab the user did not close. In every Mac app, ⌘W over a window
+    /// with nothing to close inside it closes the window.
+    ///
+    /// A window attached to another — a Peek's child window, a popover, a panel or a sheet
+    /// hanging off the browser — is still aimed at the window behind it, which is where
+    /// `current` already looks. So is no key window at all, which is what `current`'s fallback
+    /// was written for.
+    ///
+    /// The Library is a panel *in* the window, not a window of its own, so the key window
+    /// holds tabs while it is up and ⌘W archived a tab behind it — a tab the user could not
+    /// even see go. Arc's ⌘W there shuts the Library, which is the thing in front.
+    ///
+    /// Pure, so `selfcheck --pure` proves the ladder without a window server.
+    nonisolated static func closeTarget(hasKey: Bool, keyHoldsTabs: Bool,
+                                        keyIsAttached: Bool,
+                                        libraryOpen: Bool) -> CloseTarget {
+        guard !hasKey || keyHoldsTabs || keyIsAttached else { return .window }
+        return libraryOpen ? .library : .tab
+    }
+
+    // MARK: Bringing the window forward
+
+    /// Whether the window a command is about to make or show a tab in has to be raised first.
+    ///
+    /// `current` and `main` both fall back to the frontmost browser window when the key
+    /// window is one of Timo's own tabless ones — Settings, History, Extensions. Acting on
+    /// that window is right; leaving it behind the one in front is not, because the new tab,
+    /// the address bar it opens with and the Space just switched to are all out of sight. Arc
+    /// and Safari both act *and* bring the window forward.
+    ///
+    /// Not for a window that is already key — raising it would be a no-op with a flicker —
+    /// and not for a Peek, a popover, a panel or a sheet hanging off a window: the
+    /// child is already over the window it belongs to, and taking key away from it is how a
+    /// popover dismisses itself. With no key window at all Timo is not the app in front, and
+    /// pulling a window over whatever is is not ours to do.
+    ///
+    /// Pure, so `selfcheck --pure` proves it with no window server.
+    nonisolated static func raises(hasKey: Bool, targetIsKey: Bool,
+                                   keyIsAttached: Bool) -> Bool {
+        hasKey && !targetIsKey && !keyIsAttached
+    }
+
+    // MARK: The keyboard
+
+    /// Whether the page has to be handed the keyboard back.
+    ///
+    /// AppKit leaves a window's first responder as *the window itself* the moment the view
+    /// holding the keyboard is taken out of the hierarchy — which is exactly what closing the
+    /// command bar or the find bar does to its field. A window in that state answers nothing
+    /// down the responder chain, so ⌘V, ⌘C, ⌘X, ⌘Z and ⌘A quietly die (they are targetless
+    /// standard menu items — see Standard.swift) and the page can be neither typed into nor
+    /// scrolled until it is clicked. `Library.close` already hands it back on the way out of
+    /// the panel; the bars that float over the page need it for the same reason.
+    ///
+    /// Only when nobody holds it: never taken off a field that has it, and never invented for
+    /// a window with no page in it. Never while the Library is up either — the rail takes no
+    /// first responder of its own, so a window showing it looks exactly like one nobody holds
+    /// the keyboard in, and handing the page the keyboard there would send ⌘F to the page
+    /// instead of to the panel the user is looking at (`TabStore.keyboardOnPage`).
+    ///
+    /// Pure, so `selfcheck --pure` proves it with no window.
+    nonisolated static func handsKeyboardBack(nobodyHasIt: Bool, hasPage: Bool,
+                                              libraryOpen: Bool) -> Bool {
+        nobodyHasIt && hasPage && !libraryOpen
+    }
+
+    /// The frontmost ordinary browser window, never a Little Arc. What a link from another
+    /// app opens a tab in, what a Little Arc hands its page over to, and what every menu
+    /// item that needs a sidebar acts on. See LittleArc.swift.
+    /// Never a parked store: it is a profile a window *has been* in, with no window of its
+    /// own to raise and no chrome on screen to act on. See `Windows.hop`.
+    static var main: TabStore? {
+        let ordinary = TabStore.all.filter { !$0.isLittle && !$0.isParked && $0.window != nil }
+        return ordinary.first { $0.window?.isKeyWindow == true } ?? ordinary.last
+    }
+
+    /// The window the menus act on, restricted to one profile — and to one kind of window.
+    ///
+    /// `isPrivate` has to match, and defaults to the ordinary window every caller means. A
+    /// Private Window is not a window a page can be quietly handed to: it keeps no history,
+    /// holds no Space, and throws its cookies away when it closes. Without the test, a
+    /// private Little Timo whose own window was key fell through to `mine.last` and handed
+    /// its page — with its url, its title and its cookies — to an ordinary window, which is
+    /// the one thing a Private Window exists not to allow. It reads the other way too: a
+    /// page from an ordinary Little Timo must not land in an incognito window that will
+    /// throw it away.
+    ///
+    /// A parked store is not one either: it is this profile all right, but it is behind
+    /// another profile's in a window that is showing that one, so handing a page to it would
+    /// put it somewhere nobody is looking. `switchTo(profile:)` is what brings one back.
+    static func current(in profileID: UUID, isPrivate: Bool = false) -> TabStore? {
+        let mine = TabStore.all.filter {
+            $0.profileID == profileID && !$0.isLittle && !$0.isParked
+                && $0.window != nil && $0.isPrivate == isPrivate
+        }
+        return mine.first { $0.window?.isKeyWindow == true } ?? mine.last
+    }
+
+    @discardableResult
+    static func open(isPrivate: Bool = false, urls: [URL] = [],
+                     profile: Profile? = nil, space: Space? = nil,
+                     parked: [String: Parked] = [:], focus: Bool = true,
+                     session: [Session.Entry]? = nil, selected: UUID? = nil,
+                     restoringLegacySession: Bool = false, recoveringSession: Bool = false) -> TabStore {
+        let profile = isPrivate ? .incognito : profile ?? space.flatMap { s in
+            ProfileManager.shared.profiles.first { $0.id == s.profileID }
+        } ?? ProfileManager.shared.active
+        // Arc's rule: every tab in a browser window lives in a Space, so an ordinary window
+        // always resolves to one — the Space it was asked for, else the profile's last-used
+        // one, else its first, and the profile is given a first one if it has none. A
+        // private window is Arc's incognito: no Space, nothing written down.
+        let space = isPrivate ? nil : Spaces.resolve(space, for: profile)
+        let store = TabStore(isPrivate: isPrivate, urls: urls, profileID: profile.id, space: space,
+                             parked: parked, session: session, selected: selected,
+                             restoringLegacySession: restoringLegacySession, recoveringSession: recoveringSession)
+        // Live folders keep themselves filled for as long as a window is open. A private
+        // window holds none — it has no Pinned section — so it does not start the clock.
+        if !isPrivate {
+            LiveFolders.shared(for: profile.id).begin()
+            FavouritePreviewWarmup.shared.begin()
+        }
+        let window = TimoWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 840),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false)
+        window.title = WindowTitle.current(in: store)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        // An empty toolbar, never shown: it only exists to make the titlebar 38pt tall,
+        // which puts AppKit's own idea of where the lights go within a point of the
+        // sidebar's top row instead of 3pt above it — so the one frame that is drawn before
+        // `TimoWindow.centreTrafficLights` first runs is already near enough not to jump.
+        // The titlebar is transparent and the toolbar has no items, so nothing of it is
+        // ever drawn. `TimoWindow` is what actually holds the lights on the line.
+        window.toolbar = NSToolbar(identifier: "TimoEmpty")
+        window.toolbarStyle = .unifiedCompact
+        window.tabbingMode = .disallowed          // Timo draws its own tabs
+        // A window made in code is `isReleasedWhenClosed` by default, which under ARC is an
+        // over-release — the close animation reaching a window ARC has already freed. See
+        // `LittleArc.open`, where it crashed, and `SettingsWindow`, which turns it off too.
+        window.isReleasedWhenClosed = false
+        // The window itself draws nothing: `WindowGlass` inside the content view is the
+        // only ground, so the desktop shows through the sidebar and the gap around the page
+        // card. An opaque window would paint over it before SwiftUI ever ran.
+        window.isOpaque = false
+        // Not `.clear`: a non-opaque window lets the pointer fall through wherever its
+        // pixels are fully transparent, and the behind-window blur is drawn by the window
+        // server, not into our pixels — so hover over the sidebar's ground came and went
+        // with the glyphs under it. A hair of alpha makes the whole window hit-testable and
+        // draws nothing anyone can see.
+        window.backgroundColor = NSColor.black.withAlphaComponent(0.001)
+        let delegate = WindowDelegate(store)
+        delegates.append(delegate)
+        window.delegate = delegate
+        // `BrowserWindowHost`, not `BrowserWindow` directly: a window hops profiles in place,
+        // so which store it is showing is a thing that changes. The host is what watches it.
+        window.contentView = BrowserWindowHost(shown: delegate.shown)
+        // Full-size content fills the frame. The content limit avoids minSize's
+        // additional toolbar inset on compact windows.
+        window.contentMinSize = NSSize(width: 470, height: 380)
+        // Position first, autosave second, as SettingsWindow does: `setFrameUsingName`
+        // says whether there was a saved frame, and centring after it would throw the
+        // saved position away and keep only the size — which is what every launch did.
+        let name = isPrivate ? "" : "TimoMain"
+        // Windows, not stores: a window that has hopped profiles holds several, and cascading
+        // the first real window off a parked one would lose the saved frame.
+        if TabStore.all.contains(where: { $0 !== store && !$0.isParked }) {
+            window.cascadeTopLeft(from: NSPoint(x: 40, y: 40))
+        } else if name.isEmpty || !window.setFrameUsingName(name) {
+            window.center()
+        }
+        // ponytail: AppKit writes this frame into its own defaults domain, not
+        // `UserDefaults.timo`, so a `TIMO_DATA_DIR` instance still inherits the real app's
+        // window size. Cosmetic, and the upgrade path is saving the frame ourselves — a
+        // whole second frame-restoration path for a window that opens in the right place.
+        window.setFrameAutosaveName(name)
+        store.window = window
+        // Here, not only in `BrowserWindow.onAppear`: the content view appears before the
+        // window is on the store, so a Space pinned to light or dark came up wearing the
+        // system's appearance until something else edited it.
+        store.applySpaceAppearance()
+        SharedTabs.refreshPresentation()
+        // A link opened from a floating page may need its first ordinary window, but
+        // must leave the source window key just like a background tab does.
+        if focus { window.makeKeyAndOrderFront(nil) } else { window.orderBack(nil) }
+        store.extensions.sync()
+        return store
+    }
+
+    /// Make a profile active and put a window for it in front: the one that is already open,
+    /// the one the front window has parked behind the profile it is showing, else its restored
+    /// session, else a fresh window. This is what a "Profiles" menu item calls.
+    @discardableResult
+    static func switchTo(profile: Profile) -> TabStore {
+        ProfileManager.shared.active = profile
+        if let existing = current(in: profile.id) {
+            existing.window?.makeKeyAndOrderFront(nil)
+            return existing
+        }
+        // A window that has walked along the strip into another profile is still holding this
+        // one, parked, with its pages loaded. Bringing that back is the same window — opening
+        // a second one for a profile the user can already see the Spaces of would be two
+        // windows where the strip says there is one.
+        if let front = main, let window = front.window,
+           let held = parked(profile.id, in: window),
+           let space = held.currentSpace ?? Spaces.resolve(nil, for: profile),
+           let hopped = hop(front, to: space) {
+            window.makeKeyAndOrderFront(nil)
+            return hopped
+        }
+        if Session.restore(profile: profile), let restored = current(in: profile.id) { return restored }
+        return open(profile: profile)
+    }
+
+    /// Select an open tab, including stashed Spaces behind another profile in this window.
+    /// The command bar lists tabs from every store; a parked store has no `window` to raise,
+    /// so bring its profile to the front before selecting its tab.
+    @discardableResult
+    static func reveal(_ tab: Tab, in owner: TabStore) -> Bool {
+        guard owner.everyTab.contains(where: { $0 === tab }) else { return false }
+        if let window = owner.parkedIn {
+            guard let showing = TabStore.all.first(where: { $0.window === window }),
+                  let spaceID = owner.space(stashing: tab.id) ?? owner.currentSpaceID,
+                  let space = owner.spaces.first(where: { $0.id == spaceID }),
+                  hop(showing, to: space) === owner else { return false }
+        } else if owner.window == nil {
+            return false
+        }
+        owner.reveal(tab.id)
+        owner.window?.makeKeyAndOrderFront(nil)
+        owner.focusPageAfterHop()
+        return true
+    }
+
+    // MARK: Hopping profile in place
+
+    /// Show another profile in this window, in place.
+    ///
+    /// Arc's Spaces strip runs across every profile, so walking off the end of one profile's
+    /// Spaces arrives in the next profile's — in the *same* window, not another one. A window
+    /// keeps one store per profile it has been in: the one on screen, and the ones parked
+    /// behind it with their pages still loaded and their Spaces still stashed, so hopping back
+    /// is as cheap as a Space switch.
+    ///
+    /// Not one store showing two profiles: a `TabStore` is built out of its profile's website
+    /// data store, cookie jar, history, favicon cache and extension host, and none of those
+    /// can be re-homed under a live web view. The window swaps which store it points at
+    /// instead. BrowserWindowHost keeps each profile's interface with its parked store,
+    /// so returning reuses the page host and sidebar rather than rebuilding them.
+    ///
+    /// Returns nil, changing nothing, for a window that has no profile to hop *to*: a private
+    /// window and a Little Timo are both spaceless.
+    @discardableResult
+    static func hop(_ store: TabStore, to space: Space) -> TabStore? {
+        guard !store.isPrivate, !store.isLittle, !store.isParked,
+              space.profileID != store.profileID,
+              let window = store.window,
+              let delegate = window.delegate as? WindowDelegate,
+              let profile = ProfileManager.shared.profiles.first(where: { $0.id == space.profileID })
+        else { return nil }
+        // Every route into a hop must persist the departing Space, including the Profiles
+        // menu's direct call above. Otherwise its tabs exist only in the parked store until
+        // the next session save and a crash before then loses them.
+        store.saveCurrentSpace()
+        // A keyboard or menu switch can leave from under the Library. Its visit ends here,
+        // or the parked profile would come back with the panel up, or with an opening swipe
+        // still to land.
+        if store.libraryOpen || store.librarySwipeMonitor.intendsOpen(in: store) {
+            Motion.instant { Library.close(store) }
+        }
+        // Either the store this window already has for that profile, or a new one opened
+        // straight into the Space being walked to — there is no intermediate Space to show.
+        let arriving = parked(profile.id, in: window)
+            ?? TabStore(profileID: profile.id, space: space)
+        // Visibility belongs to the window, across every Space and profile. Apply it
+        // before mounting the arriving host, including when reusing a parked profile.
+        arriving.sidebarShown = store.sidebarShown
+        arriving.sidebarPeeking = store.sidebarPeeking
+        arriving.sidebarPresentationRevision &+= 1
+        if let slide = (window.contentView as? BrowserWindowHost)?.spaceSlide,
+           slide.isActive, slide.isSource(store) {
+            // Hide live rows and carry the gesture's tint/footer before mounting the
+            // arriving profile. The native sidebar continues travelling above this host.
+            slide.attach(arriving)
+        }
+        store.sidebarPeeking = false
+        store.parkedIn = window
+        store.window = nil
+        store.profileVisible = false
+        arriving.parkedIn = nil
+        arriving.window = window
+        arriving.profileVisible = true
+        ProfileManager.shared.active = profile
+        // Live folders keep themselves filled for as long as a window is showing the profile.
+        LiveFolders.shared(for: profile.id).begin()
+        // A Space deleted while this store was parked leaves it pointing at one that is not
+        // on disk, and an ordinary window always shows a real Space.
+        arriving.resolveStaleSpace()
+        arriving.switchTo(space: space)         // a no-op for a store built into it just now
+        arriving.applySpaceAppearance()
+        delegate.shown.store = arriving         // expose only the finalized destination
+        // A cached host can take another display turn to acknowledge visibility.
+        // The next gesture already belongs to this profile when hop returns.
+        arriving.librarySwipeMonitor.install(arriving)
+        if arriving.sidebarShown || arriving.sidebarPeeking {
+            arriving.spaceGesture.monitor.install(arriving)
+        }
+        SharedTabs.refreshPresentation()
+        store.extensions.sync()
+        arriving.extensions.sync()
+        // The parked profile is intentionally absent from SharedTabs' visible-window
+        // election. Its outgoing panes still need their call departure considered.
+        store.onScreenTabs.forEach(CallPopout.presentationChanged)
+        // Also set synchronously: a cached host may already have observed this title while
+        // its profile was parked and had no window to update.
+        window.title = WindowTitle.current(in: arriving)
+        rebuild()                               // the Spaces menu's checkmark has changed profile
+        // Swapping the profile host detaches the old first responder. Put the keyboard on
+        // the arriving page once AppKit has mounted it, so a keyboard switch can keep typing.
+        arriving.focusPageAfterHop()
+        return arriving
+    }
+
+    /// Prepare only a committed navigation target. Its profile remains parked
+    /// and hidden: window, footer, traffic lights and input still belong to source.
+    @discardableResult
+    static func prepareHop(_ source: TabStore, to space: Space) -> TabStore? {
+        guard !source.isPrivate, !source.isLittle, !source.isParked,
+              space.profileID != source.profileID, let window = source.window,
+              window.delegate is WindowDelegate,
+              let profile = ProfileManager.shared.profiles.first(where: { $0.id == space.profileID }),
+              let host = window.contentView as? BrowserWindowHost else { return nil }
+        let arriving = parked(profile.id, in: window) ?? TabStore(profileID: profile.id, space: space)
+        guard arriving !== source, arriving.window == nil else { return nil }
+        arriving.parkedIn = window
+        arriving.profileVisible = false
+        arriving.sidebarShown = source.sidebarShown
+        arriving.sidebarPeeking = source.sidebarPeeking
+        arriving.resolveStaleSpace()
+        arriving.switchTo(space: space)
+        // Construct only the pages this explicit navigation is committing to.
+        // Do not claim their SharedTabs presentation lease or move an existing
+        // page out of another window, and preserve recovery/authentication gates.
+        for tab in arriving.onScreenTabs where !tab.tornDown && !tab.needsRecovery
+            && tab.easelSession == nil && !arriving.isTabLocked(tab.id) {
+            tab.resume()
+            if !tab.suspended { _ = tab.web }
+        }
+        host.prepare(arriving)
+        return arriving
+    }
+
+    /// The store this window is holding for `profileID` behind the one it is showing, if it
+    /// has been in that profile before.
+    private static func parked(_ profileID: UUID, in window: NSWindow) -> TabStore? {
+        TabStore.all.first { $0.parkedIn === window && $0.profileID == profileID }
+    }
+
+    @MainActor fileprivate final class WindowDelegate: NSObject, NSWindowDelegate {
+        /// Which of the window's stores is on screen. A window keeps one store per profile it
+        /// has been in (see `hop`), so the delegate follows the swap rather than holding one
+        /// store for the window's life — and the chrome watches the same object.
+        let shown: ShownStore
+        var store: TabStore { shown.store }
+        init(_ store: TabStore) { shown = ShownStore(store) }
+        /// Belt and braces around `TimoWindow.layoutIfNeeded`: a resize that AppKit satisfies
+        /// without a full layout pass still moves the lights, and this catches it.
+        /// The store's window, not the notification's: a `Notification` is not Sendable and
+        /// may not cross into the main actor, while the store already holds the window.
+        @MainActor private func recentre() {
+            (store.window as? TimoWindow)?.centreTrafficLights()
+        }
+        func windowDidResize(_ n: Notification) { recentre() }
+        func windowWillStartLiveResize(_ n: Notification) {
+            (store.window as? TimoWindow)?.beginPageResize()
+        }
+        func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+            (sender as? TimoWindow)?.proposedPageResize(frameSize) ?? frameSize
+        }
+        func windowDidEndLiveResize(_ n: Notification) {
+            (store.window as? TimoWindow)?.endPageResize()
+            recentre()
+        }
+        func windowDidBecomeKey(_ n: Notification) {
+            recentre()
+            MainActor.assumeIsolated { rebuild(); SharedTabs.refreshPresentation(); store.extensions.sync() }
+        }
+        func windowDidResignKey(_ n: Notification) {
+            recentre()
+            MainActor.assumeIsolated { store.extensions.sync() }
+        }
+        func windowDidEnterFullScreen(_ n: Notification) { recentre() }
+        func windowDidExitFullScreen(_ n: Notification) { recentre() }
+        /// Arc's auto picture-in-picture, the other way out of a page: minimising the window
+        /// pops the playing video out, and bringing the window back puts it home. *Will*, not
+        /// did: the page has to still be on screen when it is asked, the same reason
+        /// `enterIfPlaying` keeps the tab mounted while it waits for the answer.
+        /// Every pane of a split, not just the focused one — the other pane is just as much
+        /// what the user was watching.
+        func windowWillMiniaturize(_ n: Notification) {
+            MainActor.assumeIsolated { store.onScreenTabs.forEach { PictureInPicture.enterIfPlaying($0, minimizingWindow: store.window) } }
+        }
+        func windowDidDeminiaturize(_ n: Notification) {
+            MainActor.assumeIsolated { store.onScreenTabs.forEach(PictureInPicture.exitIfAuto) }
+        }
+        func windowWillClose(_ n: Notification) {
+            MainActor.assumeIsolated {
+                Session.enqueueSave()
+                // Every store the window is holding, not only the one on screen: a window
+                // that has hopped profiles keeps the ones behind it alive, pages and all.
+                // See `hop`.
+                let window = store.window
+                let held = [store] + (window.map { w in
+                    TabStore.all.filter { $0.parkedIn === w }
+                } ?? [])
+                for one in held {
+                    // Take the pages down with the window: see `Tab.tearDown`. Every Space
+                    // the store was keeping alive behind its own goes too — see `Stash`.
+                    let pages = one.everyTab
+                    Library.shared.forgetPrivateQuery(in: one)
+                    TabStore.all.removeAll { $0 === one }
+                    SharedTabs.release(pages, excluding: one)
+                    one.extensions.sync()
+                    // After the removal, so it can see whether this was the profile's last
+                    // window: the live folders' timer must not outlive the sidebar drawing
+                    // them.
+                    LiveFolders.forget(one.profileID)
+                }
+                SharedTabs.refreshPresentation()
+                delegates.removeAll { $0 === self }
+            }
+        }
+    }
+
+    // MARK: - check
+
+    /// The ladders above, proved offline.
+    nonisolated static func check() -> [(String, Bool)] {
+        [
+            ("⌘W over a browser window closes a tab",
+             closeTarget(hasKey: true, keyHoldsTabs: true, keyIsAttached: false,
+                         libraryOpen: false) == .tab),
+            ("⌘W over a window of ours that holds no tabs — Settings, History, Extensions — "
+             + "closes that window, rather than archiving a tab in a browser window behind it",
+             closeTarget(hasKey: true, keyHoldsTabs: false, keyIsAttached: false,
+                         libraryOpen: false) == .window),
+            ("…and over a Peek, a popover or a sheet hanging off the browser it is still the tab",
+             closeTarget(hasKey: true, keyHoldsTabs: false, keyIsAttached: true,
+                         libraryOpen: false) == .tab),
+            ("with no key window at all it is the tab, which is what `current`'s fallback is for",
+             closeTarget(hasKey: false, keyHoldsTabs: false, keyIsAttached: false,
+                         libraryOpen: false) == .tab),
+            ("with the Library up it shuts the Library, the way Arc's ⌘W does, rather than "
+             + "archiving a tab behind the panel where nobody can see it go",
+             closeTarget(hasKey: true, keyHoldsTabs: true, keyIsAttached: false,
+                         libraryOpen: true) == .library),
+            ("a tabless window in front still closes itself, whatever the window behind it "
+             + "is showing",
+             closeTarget(hasKey: true, keyHoldsTabs: false, keyIsAttached: false,
+                         libraryOpen: true) == .window),
+
+            ("⌘T over Settings, History or Extensions brings the window the tab lands in "
+             + "forward, rather than opening it out of sight behind them",
+             raises(hasKey: true, targetIsKey: false, keyIsAttached: false)),
+            ("the window already in front is not raised over itself",
+             !raises(hasKey: true, targetIsKey: true, keyIsAttached: false)),
+            ("nor is one a Peek, a popover or a sheet hangs off — taking key from the child "
+             + "is how it dismisses itself",
+             !raises(hasKey: true, targetIsKey: false, keyIsAttached: true)),
+            ("with no key window Timo is not the app in front, and pulls nothing over it",
+             !raises(hasKey: false, targetIsKey: false, keyIsAttached: false)),
+
+            ("a window nobody holds the keyboard in hands it back to the page, so ⌘V, ⌘C and "
+             + "⌘A still reach it after the command bar or the find bar goes",
+             handsKeyboardBack(nobodyHasIt: true, hasPage: true, libraryOpen: false)),
+            ("it is never taken off whatever does hold it",
+             !handsKeyboardBack(nobodyHasIt: false, hasPage: true, libraryOpen: false)),
+            ("and never invented for a window with no page in it",
+             !handsKeyboardBack(nobodyHasIt: true, hasPage: false, libraryOpen: false)),
+            ("nor handed to a page the Library is standing in front of — ⌘F there is the "
+             + "panel's search, not find-in-page",
+             !handsKeyboardBack(nobodyHasIt: true, hasPage: true, libraryOpen: true)),
+        ]
+    }
+}
+
+/// Which `TabStore` a window is showing right now.
+///
+/// A window hops profiles in place — Arc's Spaces strip runs across every profile — so the
+/// store is not fixed for the window's life. One small object, watched by the chrome and
+/// written by `Windows.hop`, is the whole of that.
+@MainActor final class ShownStore: ObservableObject {
+    @Published var store: TabStore
+    init(_ store: TabStore) { self.store = store }
+}
+
+/// The window owns this root's frame. Propagate a native size change through
+/// SwiftUI immediately so WebKit receives its viewport before the next commit.
+/// Only update the hosting root here; walking every native descendant's layout
+/// during the resize also reflows the sidebar's retained controls unnecessarily.
+@MainActor final class BrowserHostingView<Content: View>: NSHostingView<Content> {
+    private var applyingFrame = false
+
+    override var needsLayout: Bool {
+        get { super.needsLayout }
+        set { if !newValue || !BufferedResizeLayout.hold(self) { super.needsLayout = newValue } }
+    }
+    override func layout() { if !BufferedResizeLayout.hold(self) { super.layout() } }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let previous = frame.size
+        super.setFrameSize(newSize)
+        guard previous != newSize, window != nil, !isHiddenOrHasHiddenAncestor,
+              !applyingFrame else { return }
+        guard (window as? TimoWindow)?.isCommittingBufferedPageResize != true else { return }
+        applyingFrame = true
+        defer { applyingFrame = false }
+        super.layout()
+    }
+}
+
+/// `NSWindow.setFrame` resizes the theme frame, lays the view tree out, and only
+/// then resizes the content view. The first step's safe-area and window-geometry
+/// notifications dirty every hosting root, so that layout ran SwiftUI's graphs at
+/// the old size before the real pass at the new one: a quarter of the main thread
+/// per live-resize frame. While the buffer installs its own frame, hosting roots
+/// hold those requests; the window re-asserts them once the frame is in place, so
+/// the display cycle lays the tree out once, at the new size, in the same commit.
+/// A request already pending when the commit begins cannot be withdrawn (AppKit
+/// keeps its flag through `needsLayout = false`), so they hold `layout()` itself too.
+@MainActor enum BufferedResizeLayout {
+    private final class Held { weak var view: NSView?; init(_ view: NSView) { self.view = view } }
+    private static var held: [Held] = []
+
+    /// True when `view`'s layout request waits for `release()`.
+    static func hold(_ view: NSView) -> Bool {
+        guard (view.window as? TimoWindow)?.isCommittingBufferedPageResize == true else { return false }
+        if !held.contains(where: { $0.view === view }) { held.append(Held(view)) }
+        return true
+    }
+
+    static func release() {
+        let views = held
+        held.removeAll()
+        views.forEach { $0.view?.needsLayout = true }
+    }
+}
+
+/// An empty search layer must pass clicks through to the page and sidebar.
+private final class BrowserPaletteLayer: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
+    }
+}
+
+private final class BrowserPaletteHost: NSHostingView<AnyView> {
+    weak var store: TabStore?
+
+    /// No stale-size relayout inside a buffered window commit; see `BufferedResizeLayout`.
+    override var needsLayout: Bool {
+        get { super.needsLayout }
+        set { if !newValue || !BufferedResizeLayout.hold(self) { super.needsLayout = newValue } }
+    }
+    override func layout() { if !BufferedResizeLayout.hold(self) { super.layout() } }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard store?.palette != nil else { return nil }
+        return super.hitTest(point)
+    }
+}
+
+/// Retained native hosts per profile preserve SwiftUI state and WebKit backing
+/// frames. Search has its own layer above both live chrome and native Space travel.
+@MainActor final class BrowserWindowHost: NSView {
+    let footerPresentation = SpaceFooterPresentation()
+    private struct ProfileHosts {
+        let content: NSView
+        let palette: BrowserPaletteHost
+        var views: [NSView] { [content, palette] }
+    }
+    private var hosts: [ObjectIdentifier: ProfileHosts] = [:]
+    private let paletteLayer = BrowserPaletteLayer()
+    private var current: ObjectIdentifier?
+    private var subscription: AnyCancellable?
+    private(set) var spaceSlide: ProfileSpaceSlide?
+    private var queuedSpaceSelection: (slide: ProfileSpaceSlide, target: Space)?
+    private var queueRevision = UUID()
+
+    func clearQueuedSpaceSelection() {
+        queuedSpaceSelection = nil
+        queueRevision = UUID()
+    }
+
+    func queueSpaceSelection(_ target: Space, after slide: ProfileSpaceSlide) {
+        clearQueuedSpaceSelection()
+        queuedSpaceSelection = (slide, target)
+    }
+
+    func takeQueuedSpaceSelection() -> Space? {
+        let target = queuedSpaceSelection?.target
+        clearQueuedSpaceSelection()
+        return target
+    }
+
+    func beginSpaceSlide(_ slide: ProfileSpaceSlide, preservingGround: Bool = false) {
+        // Capture before cancel resolves the old selection's final wash. The replacement
+        // sidebar continues its presentation, so its background must continue it too.
+        let ground = preservingGround ? spaceSlide.flatMap { $0.isActive ? $0.captureGroundPresentation() : nil } : nil
+        cancelSpaceSlide()
+        slide.groundStart = ground
+        spaceSlide = slide
+        // Idle surfaces are already above the live host. Re-adding one detaches its
+        // backing layer until AppKit's next display turn, leaving hidden live rows blank.
+        if slide.superview !== self {
+            mountSpaceSlide(slide)
+            // A cold insertion has no committed backing hierarchy yet. Complete that
+            // AppKit display pass before track/start transfers visibility from live rows.
+            if slide.layer?.superlayer !== layer { window?.displayIfNeeded() }
+        }
+    }
+
+    /// Warm preparations and cold gestures share the same native stacking order.
+    func mountSpaceSlide(_ slide: ProfileSpaceSlide) {
+        addSubview(slide, positioned: .below, relativeTo: paletteLayer)
+    }
+
+    func didFinishSpaceSlide(_ slide: ProfileSpaceSlide) {
+        guard spaceSlide === slide else { return }
+        spaceSlide = nil
+        guard let queued = queuedSpaceSelection, queued.slide === slide else { return }
+        queuedSpaceSelection = nil
+        let revision = queueRevision
+        let arrivedID = slide.completedSpaceID
+        let window = window
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.window === window, self.queueRevision == revision,
+                  self.spaceSlide == nil,
+                  let arriving = TabStore.all.first(where: { $0.window === window }),
+                  arriving.currentSpaceID == arrivedID, !arriving.libraryOpen,
+                  arriving.sidebarShown || arriving.sidebarPeeking else { return }
+            // The visible destination has reached rest and its live rows are drawn.
+            // Revalidate the last requested Space through the arriving profile's monitor.
+            arriving.spaceGesture.monitor.select(queued.target, in: arriving)
+        }
+    }
+
+    func cancelSpaceSlide() {
+        clearQueuedSpaceSelection()
+        spaceSlide?.cancel()
+        spaceSlide = nil
+    }
+
+    init(shown: ShownStore) {
+        super.init(frame: .zero)
+        paletteLayer.frame = bounds
+        paletteLayer.autoresizingMask = [.width, .height]
+        addSubview(paletteLayer)
+        subscription = shown.$store.sink { [weak self] store in self?.show(store) }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func profileHosts(for store: TabStore) -> ProfileHosts {
+        let id = ObjectIdentifier(store)
+        if let existing = hosts[id] { return existing }
+        let content = BrowserHostingView(rootView: BrowserWindow(presentsPalette: false)
+            .environmentObject(store)
+            .environmentObject(ProfileManager.shared)
+            .environment(\.spaceFooterPresentation, footerPresentation)
+            .font(Look.text))
+        // The outer native container supplies the frame; do not separately
+        // measure minimum, ideal and maximum sizes on each resize.
+        content.sizingOptions = []
+        let palette = BrowserPaletteHost(rootView: AnyView(BrowserPaletteOverlay()
+            .environmentObject(store)
+            .environmentObject(ProfileManager.shared)
+            .spaceChrome(store)
+            .timoMotionPolicy()
+            .font(Look.text)
+            .ignoresSafeArea()))
+        palette.store = store
+        palette.sizingOptions = []
+        let host = ProfileHosts(content: content, palette: palette)
+        hosts[id] = host
+        return host
+    }
+
+    func prepare(_ store: TabStore) {
+        guard let window, store.window == nil, store.parkedIn === window,
+              !store.profileVisible else { return }
+        let host = profileHosts(for: store)
+        let visible = current.flatMap { hosts[$0]?.content }
+        for view in host.views {
+            view.isHidden = true
+            view.frame = bounds
+            view.autoresizingMask = [.width, .height]
+        }
+        if host.content.superview !== self {
+            addSubview(host.content, positioned: .below, relativeTo: visible ?? paletteLayer)
+        }
+        if host.palette.superview !== paletteLayer { paletteLayer.addSubview(host.palette) }
+        host.content.needsLayout = true
+        host.palette.needsLayout = true
+        host.content.layoutSubtreeIfNeeded()
+        host.palette.layoutSubtreeIfNeeded()
+        CATransaction.flush()
+    }
+
+    /// A committed profile already has its captured native rows. Prepare the
+    /// displayed roots without walking the parked profiles' pending layouts.
+    func layoutDisplayedProfile() {
+        guard let current, let host = hosts[current] else { return }
+        host.content.layoutSubtreeIfNeeded()
+        host.palette.layoutSubtreeIfNeeded()
+    }
+
+    private func show(_ store: TabStore) {
+        let id = ObjectIdentifier(store)
+        footerPresentation.activate(store)
+        guard current != id else { return }
+        // Profile deletion can release a parked store. Do not keep its interface alive.
+        let kept = Set(TabStore.all.map(ObjectIdentifier.init)).union([id])
+        for stale in Array(hosts.keys) where !kept.contains(stale) {
+            hosts.removeValue(forKey: stale)?.views.forEach { $0.removeFromSuperview() }
+        }
+        let host = profileHosts(for: store)
+        let departing = current.flatMap { hosts[$0] }
+        for view in host.views {
+            view.frame = bounds
+            view.autoresizingMask = [.width, .height]
+        }
+        if host.content.superview !== self {
+            addSubview(host.content, positioned: .below, relativeTo: (spaceSlide as NSView?) ?? paletteLayer)
+        }
+        if host.palette.superview !== paletteLayer { paletteLayer.addSubview(host.palette) }
+        // Keep both trees mounted when parking a profile, including a typed query.
+        if let departing, let holder = window?.firstResponder as? NSView,
+           departing.views.contains(where: { holder.isDescendant(of: $0) }) {
+            window?.makeFirstResponder(nil)
+        }
+        departing?.views.forEach { $0.isHidden = true }
+        host.views.forEach { $0.isHidden = false }
+        current = id
+    }
+}
+
+/// Native previews use the same theme as live chrome. The search overlay and its
+/// scrim composite above them, including during search's appearance/dismissal fade.
+private struct NativeSpacePreview: View {
+    let preview: SpacePreviewList
+    let scope: SidebarNativeReadinessScope
+    let theme: SpaceChromeTheme
+    let windowWidth: CGFloat
+
+    var body: some View {
+        preview.equatable()
+            .environment(\.sidebarWindowWidth, windowWidth)
+            .environment(\.sidebarNativeReadinessScope, scope)
+            .environment(\.spaceChromeTheme, theme)
+            .environment(\.colorScheme, preview.colorScheme)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+/// Keep the same two sidebar surfaces on a native track from finger movement through
+/// landing, including page selection underneath it and a profile host handoff.
+@MainActor final class ProfileSpaceSlide: NSView {
+    private(set) var outgoing: NSView
+    private var incoming: NSView
+    private var direction: Int
+    private var targetID: UUID
+    private var originPreview: SpacePreviewList
+    private var targetPreview: SpacePreviewList
+    private var preparedOrigin: Space
+    private var preparedTarget: Space
+    private let preparedFrame: NSRect
+    private weak var source: TabStore?
+    private weak var destination: TabStore?
+    private var finished = false
+    private var ownsSidebarVisibility = false
+    private var completingSelection = false
+    private let includesFavorites: Bool
+    private let travelWidth: CGFloat
+    private let contentInset: CGFloat
+    private var completion: (() -> Void)?
+    private var lastTracking: (offset: CGFloat, time: TimeInterval)?
+    private var trackingVelocity: CGFloat = 0
+    private var lastPublishedDrag: CGFloat
+    private var progressLink: CADisplayLink?
+    private weak var retirementStore: TabStore?
+    private var retirementSpaceID: UUID?
+    private var retirementScheduled = false
+    private var retirementTimeout: DispatchWorkItem?
+    private var retirementReadinessObservation: UUID?
+    private var retired = false
+    private var wasAttachedToWindow = false
+    private let requiresNativePopulation: Bool
+    private let outgoingReadinessScope: SidebarNativeReadinessScope
+    private let incomingReadinessScope: SidebarNativeReadinessScope
+    private var sidebarAcknowledgements: [ObjectIdentifier: (spaceID: UUID?, atRest: Bool)] = [:]
+    var offset: CGFloat { (outgoing.layer?.presentation()?.frame.minX ?? outgoing.frame.minX) - contentInset }
+    private var motionObserver: NSObjectProtocol?
+
+    init(frame: NSRect, outgoing: SpacePreviewList, incoming: SpacePreviewList,
+         drag: CGFloat, direction: Int, source: TabStore, includesFavorites: Bool, travelWidth: CGFloat) {
+        requiresNativePopulation = NativeCachedSidebarBatchesExperiment.enabled
+        let outgoingScope = SidebarNativeReadinessScope(store: source, spaceID: outgoing.space.id, surfaceID: UUID())
+        let incomingScope = SidebarNativeReadinessScope(store: source, spaceID: incoming.space.id, surfaceID: UUID())
+        outgoingReadinessScope = outgoingScope
+        incomingReadinessScope = incomingScope
+        let outgoingTheme = SpaceChromeTheme(space: outgoing.space, fallback: source.profile.colorHex)
+        let incomingFallback = ProfileManager.shared.profiles.first { $0.id == incoming.space.profileID }?.colorHex
+            ?? source.profile.colorHex
+        let incomingTheme = SpaceChromeTheme(space: incoming.space, fallback: incomingFallback)
+        let windowWidth = source.window?.contentView?.bounds.width ?? .infinity
+        let outgoingHost = NSHostingView(rootView: NativeSpacePreview(
+            preview: outgoing, scope: outgoingScope, theme: outgoingTheme, windowWidth: windowWidth))
+        let incomingHost = NSHostingView(rootView: NativeSpacePreview(
+            preview: incoming, scope: incomingScope, theme: incomingTheme, windowWidth: windowWidth))
+        // Both captures have an explicit native frame. Intrinsic/min/max fitting
+        // probes otherwise lay out the frozen rows again during window layout.
+        outgoingHost.sizingOptions = []
+        incomingHost.sizingOptions = []
+        self.outgoing = outgoingHost
+        self.incoming = incomingHost
+        self.direction = direction
+        targetID = incoming.space.id
+        originPreview = outgoing
+        targetPreview = incoming
+        preparedOrigin = outgoing.space
+        preparedTarget = incoming.space
+        preparedFrame = frame
+        self.includesFavorites = includesFavorites
+        self.travelWidth = travelWidth
+        lastPublishedDrag = drag
+        contentInset = max(0, (travelWidth - frame.width) / 2)
+        self.source = source
+        super.init(frame: frame.insetBy(dx: -contentInset, dy: 0))
+        wantsLayer = true
+        layer?.masksToBounds = true
+        self.outgoing.wantsLayer = true
+        self.incoming.wantsLayer = true
+        self.outgoing.frame = NSRect(origin: NSPoint(x: drag + contentInset, y: 0), size: frame.size)
+        self.incoming.frame = NSRect(origin: NSPoint(x: drag + CGFloat(direction) * travelWidth + contentInset, y: 0), size: frame.size)
+        addSubview(self.outgoing)
+        addSubview(self.incoming)
+        motionObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    if Motion.spaceReduced { self?.finish() }
+                }
+            }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { wasAttachedToWindow = true }
+        else if wasAttachedToWindow, !retired { cancel() }
+    }
+
+    /// A completed cover can remain mounted for presentation handoff. Its identity is
+    /// still useful for cleanup, but it must never reacquire input or animation ownership.
+    var isActive: Bool { !finished }
+    /// Failure-only fixture evidence; reading this must not advance the handoff.
+    var retirementDiagnosticString: String {
+        let store = retirementStore ?? destination ?? source
+        let acknowledgement = store.flatMap { sidebarAcknowledgements[ObjectIdentifier($0)] }
+        let ready = retirementStore.map {
+            SidebarNativeReadinessCoordinator.shared.isReady(
+                SidebarNativeReadinessScope(store: $0, spaceID: retirementSpaceID),
+                allowingUnregistered: !requiresNativePopulation)
+        }
+        let sections = store?.spaceGesture.sectionsView
+        return "finished=\(finished) retired=\(retired) completingSelection=\(completingSelection)"
+            + " hasStartedLanding=\(hasStartedLanding) animationID=\(String(describing: animationID))"
+            + " ownsSidebarVisibility=\(ownsSidebarVisibility) requiresNativePopulation=\(requiresNativePopulation)"
+            + " retirementStore=\(String(describing: retirementStore.map { ObjectIdentifier($0) }))"
+            + " store=\(String(describing: store.map { ObjectIdentifier($0) }))"
+            + " currentSpaceID=\(String(describing: store?.currentSpaceID)) retirementSpaceID=\(String(describing: retirementSpaceID))"
+            + " acknowledgement=\(String(describing: acknowledgement)) populationReady=\(String(describing: ready))"
+            + " swiping=\(String(describing: store?.spaceSwiping)) profileSliding=\(String(describing: store?.spaceGesture.profileSliding))"
+            + " drag=\(String(describing: store?.spaceDrag)) attached=\(window != nil)"
+            + " storeWindowMatches=\(store?.window != nil && store?.window === window)"
+            + " sectionsWindowMatches=\(sections?.window != nil && sections?.window === window)"
+            + " sectionsFrame=\(String(describing: sections?.frame)) sectionsBounds=\(String(describing: sections?.bounds))"
+            + " retirementScheduled=\(retirementScheduled) observingReadiness=\(retirementReadinessObservation != nil)"
+            + " hasRetirementTimeout=\(retirementTimeout != nil) offset=\(offset)"
+    }
+    private var restingSpaceID: UUID?
+    fileprivate var completedSpaceID: UUID { restingSpaceID ?? targetID }
+    func isDestination(_ store: TabStore) -> Bool { destination === store }
+    func isSource(_ store: TabStore) -> Bool { source === store }
+
+    func attach(_ store: TabStore) {
+        // Activation can replace the profile host during travel or inside completion.
+        // Both keep this overlay until the arriving sidebar acknowledges its rest state.
+        guard (!finished || completingSelection), destination !== store else { return }
+        destination = store
+        ownsSidebarVisibility = true
+        store.spaceGesture.withPresentationUpdate {
+            store.spaceSwiping = true
+            store.spaceGesture.outgoing = originPreview
+            store.spaceGesture.neighbour = preparedTarget
+            store.spaceGesture.previewDirection = direction
+            store.spaceGesture.nativeDrag = lastPublishedDrag
+            store.spaceGesture.profileSlidesFavorites = includesFavorites
+            store.spaceGesture.profileSliding = true
+        }
+        // Paint before BrowserWindowHost exposes a cached root. Its old settled
+        // wash must not appear for a frame before the progress display link runs.
+        // Until CA commits a new animation, offset can still report its old/model
+        // endpoint; retain the progress actually published for this landing.
+        store.spaceGesture.trackGround?(Double(min(1, abs(lastPublishedDrag / travelWidth))))
+        store.spaceGesture.nativeGroundDidUpdate = { [weak self] in self?.joinDestinationGround() }
+        joinDestinationGround()
+    }
+
+    private weak var joinedDestinationSurface: ThemeWashSurface?
+    private var finishDestinationGround: ((Space?) -> Void)?
+
+    private func joinDestinationGround() {
+        guard isActive, let source, let destination, source !== destination,
+              let origin = source.spaceGesture.groundSurface,
+              let arriving = destination.spaceGesture.groundSurface,
+              arriving !== joinedDestinationSurface else { return }
+        finishDestinationGround?(destination.swipeSpace)
+        finishDestinationGround = destination.spaceGesture.joinNativeGround?(origin)
+        if finishDestinationGround != nil { joinedDestinationSurface = arriving }
+    }
+
+    private func releaseDestinationGround() {
+        destination?.spaceGesture.nativeGroundDidUpdate = nil
+        finishDestinationGround?(destination?.swipeSpace)
+        finishDestinationGround = nil
+        joinedDestinationSurface = nil
+    }
+
+    func follows(_ target: Space, direction: Int) -> Bool {
+        !finished && targetID == target.id && self.direction == direction
+    }
+
+    func preparedFor(origin: Space, target: Space, frame: NSRect, width: CGFloat) -> Bool {
+        !finished && preparedOrigin == origin && preparedTarget == target
+            && preparedFrame == frame && travelWidth == width
+    }
+
+    /// Catch a returning strip or reverse a committed landing. Rebase the same native
+    /// rows around the selected page, retaining their actual compositor positions.
+    func resumeTracking(in store: TabStore, dx: CGFloat) -> CGFloat? {
+        guard isActive, completion != nil, isSource(store) || isDestination(store) else { return nil }
+        let rebase = store.currentSpaceID == preparedTarget.id
+        guard rebase ? dx * CGFloat(direction) > 0 : store.currentSpaceID == preparedOrigin.id else { return nil }
+        let presentedOffset = offset
+        animationID = nil
+        completion = nil
+        progressLink?.invalidate()
+        progressLink = nil
+        source?.spaceGesture.monitor.interruptLanding()
+        destination?.spaceGesture.monitor.interruptLanding()
+        releaseDestinationGround()
+        finishGround?(source?.swipeSpace)
+        finishGround = nil
+        if let previous = source, previous !== store {
+            Motion.spaceHandoff {
+                previous.spaceDrag = 0
+                previous.spaceSwiping = false
+                previous.spaceGesture.profileSliding = false
+            }
+        }
+        var drag = presentedOffset
+        if rebase {
+            drag += CGFloat(direction) * travelWidth
+            swap(&outgoing, &incoming)
+            swap(&originPreview, &targetPreview)
+            swap(&preparedOrigin, &preparedTarget)
+            targetID = preparedTarget.id
+            direction = -direction
+        }
+        source = store
+        destination = nil
+        restingSpaceID = nil
+        lastTracking = nil
+        trackingVelocity = 0
+        outgoing.layer?.removeAnimation(forKey: "space-position")
+        incoming.layer?.removeAnimation(forKey: "space-position")
+        Motion.spaceHandoff {
+            store.spaceSwiping = true
+            store.spaceGesture.outgoing = originPreview
+            store.spaceGesture.neighbour = preparedTarget
+            store.spaceGesture.previewDirection = direction
+            store.spaceGesture.travelsFavorites = includesFavorites
+            store.spaceGesture.drag = drag
+            track(drag: drag)
+            publishProgress(drag)
+        }
+        return drag
+    }
+
+    var preparedPopulationReady: Bool {
+        guard requiresNativePopulation else { return true }
+        // Frozen previews currently use eager/lazy rows; their native markers
+        // provide readiness. Honor coordinator requirements if a native section
+        // is introduced, without requiring registrations from the existing path.
+        return SidebarNativeReadinessCoordinator.shared.isReady(outgoingReadinessScope, allowingUnregistered: true)
+            && SidebarNativeReadinessCoordinator.shared.isReady(incomingReadinessScope, allowingUnregistered: true)
+            && SidebarPreviewPopulation.isReady(in: outgoing)
+            && SidebarPreviewPopulation.isReady(in: incoming)
+    }
+
+    /// Finger tracking changes only layer positions; the two hosted lists are laid out once.
+    func track(drag: CGFloat, at now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        guard isActive else { return }
+        ownsSidebarVisibility = true
+        lastPublishedDrag = drag
+        if let previous = lastTracking {
+            let dt = now - previous.time
+            if dt > 0.001, dt < 0.1 { trackingVelocity = (drag - previous.offset) / dt }
+            else { trackingVelocity = 0 }
+        }
+        lastTracking = (drag, now)
+        if let gesture = source?.spaceGesture {
+            if gesture.profileSlidesFavorites != includesFavorites { gesture.profileSlidesFavorites = includesFavorites }
+            if !gesture.profileSliding { gesture.profileSliding = true }
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        outgoing.setFrameOrigin(NSPoint(x: drag + contentInset, y: 0))
+        incoming.setFrameOrigin(NSPoint(x: drag + CGFloat(direction) * travelWidth + contentInset, y: 0))
+        CATransaction.commit()
+        (superview as? BrowserWindowHost)?.footerPresentation.track(
+            origin: preparedOrigin.id, target: preparedTarget.id,
+            fraction: Double(min(1, abs(drag / travelWidth))))
+    }
+
+    func prepare() {
+        outgoing.layoutSubtreeIfNeeded()
+        incoming.layoutSubtreeIfNeeded()
+    }
+
+    /// Scrolling changes the viewport, not the captured row structure. Bring the
+    /// existing outgoing clip view to the live offset when the gesture claims it.
+    func updatePreparedScrollOffset(_ offset: CGFloat) -> Bool {
+        guard let scroll = SidebarSectionsViewport.scrollView(in: outgoing) else { return false }
+        if abs(scroll.documentVisibleRect.minY - offset) > 0.5 {
+            scroll.contentView.scroll(to: NSPoint(x: scroll.contentView.bounds.minX, y: offset))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        return preparedPopulationReady
+    }
+
+    fileprivate var groundStart: ThemeWashPresentation?
+    fileprivate func captureGroundPresentation() -> ThemeWashPresentation? {
+        (destination ?? source)?.spaceGesture.captureGround?()
+    }
+    private var finishGround: ((Space?) -> Void)?
+    private var animationID: UUID?
+    private(set) var hasStartedLanding = false
+    private var committedTrackingVelocity: CGFloat?
+
+    private func freshTrackingVelocity(at now: TimeInterval) -> CGFloat {
+        guard let lastTracking,
+              now - lastTracking.time < 0.1 else { return 0 }
+        return trackingVelocity
+    }
+
+    /// Selection stays queued until after its input action returns. A sidebar
+    /// hidden before that turn must still finish the committed profile change.
+    func armLanding(to target: Space, at now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+                    completion: @escaping () -> Void) {
+        guard isActive else { return }
+        // A committed release owns this sample even if page preparation takes
+        // longer than the finger-event freshness window.
+        committedTrackingVelocity = freshTrackingVelocity(at: now)
+        ownsSidebarVisibility = true
+        self.completion = completion
+        restingSpaceID = target.id
+        source?.spaceGesture.withPresentationUpdate {
+            source?.spaceGesture.profileSlidesFavorites = includesFavorites
+            source?.spaceGesture.profileSliding = true
+        }
+    }
+
+    func start(duration: TimeInterval, returning: Bool = false, completion: @escaping () -> Void) {
+        guard isActive else { return }
+        let releaseVelocity = committedTrackingVelocity ?? freshTrackingVelocity(at: ProcessInfo.processInfo.systemUptime)
+        committedTrackingVelocity = nil
+        hasStartedLanding = true
+        ownsSidebarVisibility = true
+        self.completion = completion
+        restingSpaceID = returning ? preparedOrigin.id : targetID
+        let animationID = UUID()
+        self.animationID = animationID
+        let presentedGround = groundStart ?? (finishGround != nil ? captureGroundPresentation() : nil)
+        groundStart = nil
+        sidebarAcknowledgements.removeAll()
+        publishProgress(offset)
+        source?.spaceGesture.profileSlidesFavorites = includesFavorites
+        source?.spaceGesture.profileSliding = true
+        prepare()
+        guard let outgoingLayer = outgoing.layer, let incomingLayer = incoming.layer else {
+            finish()
+            return
+        }
+        let fromOutgoing = outgoingLayer.presentation()?.position ?? outgoingLayer.position
+        let fromIncoming = incomingLayer.presentation()?.position ?? incomingLayer.position
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let endpoint: CGFloat = returning ? 0 : -CGFloat(direction) * travelWidth
+        outgoing.setFrameOrigin(NSPoint(x: endpoint + contentInset, y: 0))
+        incoming.setFrameOrigin(NSPoint(x: endpoint + CGFloat(direction) * travelWidth + contentInset, y: 0))
+        CATransaction.commit()
+
+        let rate = Float(window?.screen?.maximumFramesPerSecond ?? 60)
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(duration)
+        CATransaction.setCompletionBlock { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.animationID == animationID else { return }
+                self.finish()
+            }
+        }
+        let animationStart = CACurrentMediaTime()
+        var groundTiming: CABasicAnimation?
+        var groundFraction = 0.0
+        for (layer, from) in [(outgoingLayer, fromOutgoing), (incomingLayer, fromIncoming)] {
+            let animation: CABasicAnimation
+            if returning {
+                let spring = CASpringAnimation(keyPath: "position")
+                // Match Look.spaceReturn's response and damping, retaining finger velocity.
+                let frequency = 2 * Double.pi / 0.16
+                spring.mass = 1
+                spring.stiffness = frequency * frequency
+                spring.damping = 2 * 0.9 * frequency
+                let distance = layer.position.x - from.x
+                if distance != 0 { spring.initialVelocity = Double(trackingVelocity / distance) }
+                spring.duration = spring.settlingDuration
+                animation = spring
+            } else {
+                let spring = CASpringAnimation(keyPath: "position")
+                // Same non-bouncy response as Look.spaceSlide. Scale the physics
+                // with custom durations so the sidebar, footer and wash land together.
+                let response = Look.spaceSlideResponse * max(duration, 0.001) / Look.spaceSlideDuration
+                let frequency = 2 * Double.pi / response
+                spring.mass = 1
+                spring.stiffness = frequency * frequency
+                spring.damping = 2 * frequency
+                let distance = layer.position.x - from.x
+                if distance != 0 {
+                    // Critical damping stays monotonic up to this normalized speed.
+                    // Preserve the flick without allowing a fast release to overshoot.
+                    spring.initialVelocity = max(0, min(frequency, Double(releaseVelocity / distance)))
+                }
+                spring.duration = duration
+                animation = spring
+            }
+            // Resolve one shared clock before copying the curve to the wash and
+            // footer, including a destination joining on a later display turn.
+            animation.beginTime = layer.convertTime(animationStart, from: nil)
+            animation.fromValue = NSValue(point: from)
+            animation.toValue = NSValue(point: layer.position)
+            animation.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+            layer.add(animation, forKey: "space-position")
+            if layer === outgoingLayer {
+                groundTiming = animation
+                groundFraction = Double(min(1, abs((from.x - outgoingLayer.bounds.width * outgoingLayer.anchorPoint.x - contentInset) / travelWidth)))
+            }
+        }
+        CATransaction.commit()
+        // Completion belongs to the two visible row surfaces. The source wash
+        // can be parked, and its retained copies deliberately hold their last
+        // frame until finish() releases them; they must not gate that release.
+        if let groundTiming {
+            releaseDestinationGround()
+            finishGround?(source?.swipeSpace)
+            finishGround = source?.spaceGesture.animateGround?(preparedOrigin, preparedTarget,
+                groundFraction, returning ? 0 : 1, groundTiming, presentedGround)
+            if let destination {
+                destination.spaceGesture.nativeGroundDidUpdate = { [weak self] in self?.joinDestinationGround() }
+                joinDestinationGround()
+            }
+            let footerTiming = groundTiming.copy() as! CABasicAnimation
+            // Footer markers own different layers; pass the shared media time
+            // explicitly so each marker can convert it to its own local clock.
+            footerTiming.beginTime = animationStart
+            (superview as? BrowserWindowHost)?.footerPresentation.animate(
+                origin: preparedOrigin.id, target: preparedTarget.id,
+                from: groundFraction, to: returning ? 0 : 1, timing: footerTiming)
+        }
+        if let screen = window?.screen ?? NSScreen.main {
+            progressLink?.invalidate()
+            let link = screen.displayLink(target: self, selector: #selector(advanceProgress(_:)))
+            let rate = Float(screen.maximumFramesPerSecond)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+            progressLink = link
+            link.add(to: .main, forMode: .common)
+        }
+    }
+
+    @objc private func advanceProgress(_ link: CADisplayLink) {
+        guard !finished, let presentation = outgoing.layer?.presentation() else { return }
+        publishProgress(presentation.frame.minX - contentInset)
+    }
+
+    private func publishProgress(_ drag: CGFloat) {
+        lastPublishedDrag = drag
+        guard let window else { return }
+        for store in [source, destination].compactMap({ $0 }) {
+            // A parked source no longer presents this gesture. Publishing into its
+            // footer would render stale metadata and leave a drag for the next visit.
+            guard store.window === window else { continue }
+            let gesture = store.spaceGesture
+            Motion.instant { gesture.nativeDrag = drag }
+            gesture.trackGround?(Double(min(1, abs(drag / travelWidth))))
+        }
+    }
+
+    func cancel() {
+        completion = nil
+        if finished { retire() }
+        else { finish() }
+    }
+
+    /// The sidebar owning this overlay has closed. Complete committed selection once,
+    /// then uncover the page without waiting for an acknowledgement from a removed tree.
+    func sidebarDidDisappear(_ store: TabStore) {
+        guard !completingSelection, (destination ?? source) === store,
+              !store.sidebarShown, !store.sidebarPeeking else { return }
+        (superview as? BrowserWindowHost)?.clearQueuedSpaceSelection()
+        // An in-flight completion may attach a different, visible sidebar. Let
+        // finish() evaluate that arrival; only an already-finished hidden owner can cut.
+        if finished { retire() }
+        else { finish() }
+    }
+
+    /// An unused idle surface has never owned the gesture's visibility state.
+    func discardPreparation() {
+        finished = true
+        releaseDestinationGround()
+        finishGround?(source?.swipeSpace)
+        finishGround = nil
+        progressLink?.invalidate()
+        progressLink = nil
+        if let motionObserver { NSWorkspace.shared.notificationCenter.removeObserver(motionObserver) }
+        motionObserver = nil
+        removeFromSuperview()
+    }
+
+    func finish() {
+        guard !finished else { return }
+        finished = true
+        animationID = nil
+        progressLink?.invalidate()
+        progressLink = nil
+        if let motionObserver { NSWorkspace.shared.notificationCenter.removeObserver(motionObserver) }
+        motionObserver = nil
+        let complete = completion
+        completion = nil
+        completingSelection = true
+        complete?()
+        completingSelection = false
+        // The wash belongs to the source host. A profile hop parks that host for
+        // reuse, so restore its own Space rather than caching the arriving profile's
+        // colour. Within one profile, source already selects the destination Space.
+        releaseDestinationGround()
+        finishGround?(source?.swipeSpace)
+        finishGround = nil
+        Motion.spaceHandoff {
+            destination?.spaceDrag = 0
+            destination?.spaceSwiping = false
+        }
+        if let host = superview as? BrowserWindowHost, host.spaceSlide === self {
+            host.footerPresentation.finishProgress()
+        }
+        // Keep the native rows until the live tree acknowledges its resting identity.
+        // The two surfaces contain translucent ink: leaving both visible for extra
+        // display frames brightens every row, including a canceled swipe's origin.
+        if complete != nil, !Motion.spaceReduced, let window {
+            let arriving = destination ?? source
+            if let arriving, !arriving.sidebarShown, !arriving.sidebarPeeking {
+                retire()
+                return
+            }
+            if let arriving, requiresNativePopulation || arriving.currentSpaceID != preparedOrigin.id
+                || arriving.spaceGesture.sectionsView != nil
+                || sidebarAcknowledgements[ObjectIdentifier(arriving)] != nil {
+                retirementStore = arriving
+                retirementSpaceID = arriving.currentSpaceID
+                let readinessScope = SidebarNativeReadinessScope(store: arriving, spaceID: arriving.currentSpaceID)
+                retirementReadinessObservation = SidebarNativeReadinessCoordinator.shared.observe(readinessScope) { [weak self] in
+                    self?.retireIfAcknowledged()
+                }
+                // A disconnected window may never update its anchor. Bound that
+                // exceptional wait; visible sidebar retirement is acknowledged.
+                let timeout = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    // A timer cannot prove delayed native population is ready. Detached
+                    // windows cancel unconditionally in viewDidMoveToWindow instead.
+                    if self.requiresNativePopulation { self.retireIfAcknowledged() }
+                    else { self.retire() }
+                }
+                retirementTimeout = timeout
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: timeout)
+                retireIfAcknowledged()
+            } else {
+                scheduleRetirement(in: window)
+            }
+        } else { retire() }
+    }
+
+    /// Called by the live sections' representable after SwiftUI updates their identity
+    /// and removes the gesture offset. A display tick alone cannot establish that.
+    func sidebarDidUpdate(_ store: TabStore, renderedSpaceID: UUID?, atRest: Bool) {
+        // NSHostingView may acknowledge synchronously during completion's final state
+        // publication, before finish() knows the arriving store. Retain that rendered
+        // identity/rest pair instead of waiting for a second update that may never come.
+        guard finished else { return }
+        sidebarAcknowledgements[ObjectIdentifier(store)] = (renderedSpaceID, atRest)
+        retireIfAcknowledged()
+    }
+
+    private func retireIfAcknowledged() {
+        guard finished, let store = retirementStore,
+              store.currentSpaceID == retirementSpaceID, !store.spaceSwiping,
+              SidebarNativeReadinessCoordinator.shared.isReady(
+                SidebarNativeReadinessScope(store: store, spaceID: retirementSpaceID),
+                allowingUnregistered: !requiresNativePopulation) else { return }
+        // Completing the animation does not make the replacement native rows
+        // ready. Keep the covered live tree hidden until population can take
+        // over, then wait for SwiftUI's actual visibility/rest acknowledgement.
+        releaseSidebarVisibility()
+        guard let rendered = sidebarAcknowledgements[ObjectIdentifier(store)], rendered.atRest,
+              rendered.spaceID == retirementSpaceID, !store.spaceGesture.profileSliding else { return }
+        // This acknowledgement is issued by SwiftUI while committing the live opacity
+        // and identity. Remove the native list in that same transaction, not two frames
+        // later when both lists would already have painted their translucent text.
+        retire()
+    }
+
+    private func scheduleRetirement(in window: NSWindow) {
+        guard !retirementScheduled else { return }
+        retirementScheduled = true
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self else { return }
+            guard let window, self.window === window else { self.retire(); return }
+            self.superview?.layoutSubtreeIfNeeded()
+            _ = SpaceLandingFrame(window: window) { [weak self] in self?.retire() }
+        }
+    }
+
+    private func retire() {
+        guard !retired else { return }
+        retired = true
+        releaseSidebarVisibility()
+        SidebarNativeReadinessCoordinator.shared.removeObservation(retirementReadinessObservation)
+        retirementReadinessObservation = nil
+        retirementTimeout?.cancel()
+        retirementTimeout = nil
+        retirementStore = nil
+        sidebarAcknowledgements.removeAll()
+        let host = superview as? BrowserWindowHost
+        removeFromSuperview()
+        host?.didFinishSpaceSlide(self)
+    }
+
+    private func releaseSidebarVisibility() {
+        // Discarding an unused prepared preview must not unhide a different
+        // native cover's live rows. Clear ownership before reentrant publication.
+        guard ownsSidebarVisibility else { return }
+        ownsSidebarVisibility = false
+        Motion.spaceHandoff {
+            source?.spaceGesture.profileSliding = false
+            destination?.spaceGesture.profileSliding = false
+        }
+    }
+}
+
+extension TabStore {
+    /// This window, brought to the front on the way past.
+    ///
+    /// What every command that *makes or shows a tab* acts through — New Tab, ⌘L, Reopen
+    /// Closed Tab, switching Space — so the tab it opens is one the user can see and type
+    /// into rather than one hidden behind Settings. A passive query (which page is playing,
+    /// what the zoom is) still reads `Windows.current` and moves nothing. The rule is
+    /// `Windows.raises`, proved offline.
+    var shown: TabStore {
+        let key = NSApp.keyWindow
+        guard let window,
+              Windows.raises(hasKey: key != nil, targetIsKey: window.isKeyWindow,
+                             keyIsAttached: key?.parent != nil || key?.sheetParent != nil)
+        else { return self }
+        window.makeKeyAndOrderFront(nil)
+        return self
+    }
+
+    /// Hand the keyboard back to the page once a bar over it has gone — see
+    /// `Windows.handsKeyboardBack` for what goes wrong without it.
+    ///
+    /// A turn later: SwiftUI takes the bar's field out of the view hierarchy on its next pass,
+    /// and AppKit only drops the first responder then. The same turn `PaletteView.activate`
+    /// already waits for, and for the same reason.
+    ///
+    /// "Nobody has it" is either of AppKit's two spellings — the window is its own first
+    /// responder, or the first responder is a view that has already left the window — so the
+    /// answer does not depend on which of the two happens first.
+    func focusPage(from previousPage: NSView? = nil, remaining: Int = 12,
+                   waitingFor dismissedResponder: NSResponder? = nil) {
+        DispatchQueue.main.async { [weak self, weak previousPage, weak dismissedResponder] in
+            guard let self, let window, palette == nil,
+                  NSApp.modalWindow == nil, window.attachedSheet == nil else { return }
+            let holder = window.firstResponder
+            let heldPreviousPage = previousPage.map { previous in
+                (holder as? NSView).map { $0 === previous || $0.isDescendant(of: previous) } ?? false
+            } ?? false
+            let nobody = holder == nil || holder === window || heldPreviousPage
+                || (holder as? NSView).map { $0.window !== window } ?? false
+            let page = activePageResponder
+            if Windows.handsKeyboardBack(nobodyHasIt: nobody, hasPage: page != nil,
+                                         libraryOpen: libraryOpen), let page,
+               page.window === window, window.makeFirstResponder(page) { return }
+            guard !libraryOpen,
+                  nobody || dismissedResponder == nil || holder === dismissedResponder else { return }
+            // Search creates its tab on the next turn, and its dismissed field can remain
+            // mounted during the exit transition. Wait for that same responder to leave;
+            // another control taking focus or a new overlay cancels the handoff.
+            if remaining > 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+                    self?.focusPage(from: previousPage, remaining: remaining - 1,
+                                    waitingFor: dismissedResponder ?? holder)
+                }
+            }
+        }
+    }
+
+    /// F6 crosses the page/chrome boundary even when WebKit keeps Tab inside its document.
+    func focusNextArea() {
+        guard let window, palette == nil, window.attachedSheet == nil,
+              NSApp.modalWindow == nil else { return }
+        let holder = window.firstResponder
+        let page = activePageResponder
+        let onPage = (holder as? NSView).map { responder in
+            page.map { responder === $0 || responder.isDescendant(of: $0) } ?? false
+        } ?? false
+        if !onPage, holder != nil, holder !== window,
+           let page, page.window === window {
+            window.makeFirstResponder(page)
+            return
+        }
+        if libraryOpen || !sidebarShown {
+            Motion.list {
+                libraryOpen = false
+                sidebarShown = true
+            }
+            // The address pill must be enabled by the time chrome focus is delivered.
+            librarySidebarCover.settle()
+        } else {
+            librarySwipeMonitor.cancelPendingActivation(toward: false)
+            if mountedAddressEndpoint?.takeFocus(from: holder) == true { return }
+        }
+        DispatchQueue.main.async { [weak self, weak holder] in
+            guard let self, let window = self.window, self.palette == nil,
+                  window.attachedSheet == nil, NSApp.modalWindow == nil,
+                  window.firstResponder === holder else { return }
+            self.chromeFocusRequested = true
+        }
+    }
+
+    /// A profile hop replaces the whole SwiftUI tree. Its new WebHost may mount one or two
+    /// turns after the old first responder disappears, so a single `focusPage()` can run too
+    /// early and leave the window holding the keyboard. Retry briefly while nobody else has
+    /// taken focus; a newly opened command bar or a clicked field stops the handoff.
+    func focusPageAfterHop(remaining: Int = 6) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+            guard let self, let window, palette == nil, !libraryOpen,
+                  let page = activePageResponder else { return }
+            let holder = window.firstResponder
+            let nobody = holder === window || (holder as? NSView).map { $0.window !== window } ?? false
+            // A cached profile can restore its previously focused favourite even when
+            // reveal selected a different tab. Keep actual text fields alone, but move
+            // focus from a stale page to the page this handoff selected.
+            let stalePage = holder is WKWebView && holder !== page
+            guard nobody || stalePage else { return }
+            if page.window === window { window.makeFirstResponder(page) }
+            let stillNobody = window.firstResponder === window
+                || (window.firstResponder as? NSView).map { $0.window !== window } ?? false
+            let stillStalePage = window.firstResponder is WKWebView && window.firstResponder !== page
+            if (stillNobody || stillStalePage) && remaining > 1 {
+                focusPageAfterHop(remaining: remaining - 1)
+            }
+        }
+    }
+}
+
+/// Reopen what was open last time. Private windows are deliberately never written down.
+/// One file per profile — the default profile's is still `session.json`.
+@MainActor enum Session {
+    private static var restoring = false
+    private static func file(_ profileID: UUID) -> URL {
+        ProfileManager.sessionURL(for: profileID, in: Store.directory)
+    }
+
+    /// One tab as the session file remembers it. `state` is a base64 `interactionState`:
+    /// the back/forward list, the current item and its scroll offset.
+    struct Entry: Codable, Equatable, Sendable {
+        var id: String?
+        var url: String
+        var title: String?
+        var state: String?
+        var kind: TabKind?
+        var home: String?
+        var customName: String?
+        var needsRecovery: Bool?
+
+        private enum CodingKeys: String, CodingKey { case id, url, title, state, kind, home, customName, needsRecovery }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            url = (try? values.decode(String.self, forKey: .url)) ?? ""
+            id = try? values.decode(String.self, forKey: .id)
+            title = try? values.decode(String.self, forKey: .title)
+            state = try? values.decode(String.self, forKey: .state)
+            kind = try? values.decode(TabKind.self, forKey: .kind)
+            customName = try? values.decode(String.self, forKey: .customName)
+            home = try? values.decode(String.self, forKey: .home)
+            needsRecovery = try? values.decode(Bool.self, forKey: .needsRecovery)
+        }
+
+        init(id: String? = nil, url: String, title: String? = nil, state: String? = nil,
+             kind: TabKind? = nil, home: String? = nil, customName: String? = nil, needsRecovery: Bool? = nil) {
+            self.id = id
+            self.url = url
+            self.title = title
+            self.state = state
+            self.kind = kind
+            self.home = home
+            self.customName = customName
+            self.needsRecovery = needsRecovery
+        }
+    }
+
+    private struct Disk: Codable, Sendable {
+        var version: Int
+        var windows: [[Entry]]
+        /// Each window's split views, as the urls of their panes. Optional, so a v2 file —
+        /// written before splits existed — still decodes into a session with none.
+        var splits: [[Split.Saved]]?
+        /// Which Space each window was showing, aligned index-for-index with `windows`.
+        /// Optional so a session written before this existed still decodes, and `""` for a
+        /// window that was in none, including a profile whose last Space was deleted.
+        var spaces: [String]?
+        /// Selected tab identity per window. Optional so every v1-v3 file still decodes.
+        var selected: [String?]?
+    }
+
+    /// One validated generation supplies every restoration field. Keep the file choice
+    /// with its metadata so a recovery fallback never needs a second primary-file read.
+    struct RestorationSnapshot: Sendable {
+        let windows: [[Entry]]
+        let splits: [[Split.Saved]]
+        let spaces: [UUID?]
+        let selected: [UUID?]
+        let hasIdentityFormat: Bool
+
+        var urls: [URL] {
+            var seen = Set<String>()
+            return windows.flatMap { $0 }.compactMap { URL(string: $0.url) }
+                .filter { seen.insert($0.absoluteString).inserted }
+        }
+    }
+
+    static func load(_ file: URL, read: (URL) -> Data? = { try? Data(contentsOf: $0) })
+        -> (snapshot: RestorationSnapshot, recoveringFile: Bool)? {
+        for (index, candidate) in [file, file.appendingPathExtension("previous")].enumerated() {
+            if let data = read(candidate), let snapshot = restorationSnapshot(data) {
+                return (snapshot, index != 0)
+            }
+        }
+        return nil
+    }
+
+    /// Recover damaged optional identity metadata one row at a time. Healthy rows keep
+    /// their state and identity; duplicate identifiers keep their first unambiguous use.
+    static func normalizedEntries(_ entries: [Entry]) -> [Entry] {
+        var seen = Set<UUID>()
+        return entries.map { entry in
+            var result = entry
+            if let id = entry.id.flatMap(UUID.init(uuidString:)), seen.insert(id).inserted {
+                result.id = id.uuidString
+            } else {
+                var replacement = UUID()
+                while !seen.insert(replacement).inserted { replacement = UUID() }
+                result.id = replacement.uuidString
+            }
+            if result.kind == nil { result.kind = .today }
+            return result
+        }
+    }
+
+    /// v3 adds the splits and the per-window Space. v2 is a dictionary so it is
+    /// self-describing; v1 was a bare `[[String]]` of urls and is still read, because a
+    /// session written by the previous build has to come back — just without the extra
+    /// fidelity.
+    /// ponytail: no writer for v1 or v2. Downgrading loses the session once, and a browser
+    /// that can be downgraded mid-session is not a thing anyone does twice.
+    nonisolated static func encode(_ windows: [[Entry]], splits: [[Split.Saved]] = [],
+                       spaces: [String] = [], selected: [String?] = []) -> Data? {
+        try? JSONEncoder().encode(Disk(version: 4, windows: windows,
+                                       splits: splits.contains { !$0.isEmpty } ? splits : nil,
+                                       spaces: spaces.isEmpty ? nil : spaces,
+                                       selected: selected.isEmpty ? nil : selected))
+    }
+
+    static func decode(_ data: Data) -> [[Entry]] { disk(data).windows }
+
+    /// Keep optional row-metadata tolerance, but never mistake corruption or a future
+    /// schema for a successfully saved empty session.
+    nonisolated static func readable(_ data: Data) -> Bool { restorationSnapshot(data) != nil }
+
+    private nonisolated static func restorationSnapshot(_ data: Data) -> RestorationSnapshot? {
+        if let saved = try? JSONDecoder().decode(Disk.self, from: data) {
+            guard (2...4).contains(saved.version),
+                  saved.windows.flatMap({ $0 }).allSatisfy({ TabAddress.restorable(URL(string: $0.url)) })
+            else { return nil }
+            return RestorationSnapshot(windows: saved.windows, splits: saved.splits ?? [],
+                spaces: saved.windows.indices.map { index in
+                    saved.spaces.flatMap { $0.indices.contains(index) ? UUID(uuidString: $0[index]) : nil }
+                }, selected: saved.windows.indices.map { index in
+                    saved.selected.flatMap { $0.indices.contains(index) ? $0[index].flatMap(UUID.init(uuidString:)) : nil }
+                }, hasIdentityFormat: saved.version == 4)
+        }
+        guard let legacy = try? JSONDecoder().decode([[String]].self, from: data),
+              legacy.flatMap({ $0 }).allSatisfy({ TabAddress.restorable(URL(string: $0)) }) else { return nil }
+        return RestorationSnapshot(windows: legacy.map { $0.map { Entry(url: $0) } }, splits: [],
+                                   spaces: legacy.map { _ in nil }, selected: legacy.map { _ in nil },
+                                   hasIdentityFormat: false)
+    }
+
+    /// Restore previews must distinguish an empty session from a damaged file. Keep
+    /// the browsing reader's legacy tolerance, but require a known schema at import.
+    nonisolated static func validateBackup(_ data: Data) throws -> (windows: [[Entry]], spaces: [UUID?]) {
+        if let legacy = try? JSONDecoder().decode([[String]].self, from: data) {
+            return (legacy.map { $0.map { Entry(url: $0) } }, legacy.map { _ in nil })
+        }
+        let saved: Disk
+        do { saved = try JSONDecoder().decode(Disk.self, from: data) }
+        catch { throw BackupError.invalid("The session file is damaged.") }
+        guard (2...4).contains(saved.version),
+              saved.spaces.map({ $0.count == saved.windows.count }) ?? true,
+              saved.selected.map({ $0.count == saved.windows.count }) ?? true,
+              saved.splits.map({ $0.count == saved.windows.count }) ?? true else {
+            throw BackupError.invalid("Unsupported or inconsistent session metadata.")
+        }
+        for rows in saved.splits ?? [] {
+            for split in rows {
+                guard (2...4).contains(split.urls.count), split.urls.indices.contains(split.active),
+                      split.ids.map({ $0.count == split.urls.count && $0.allSatisfy { UUID(uuidString: $0) != nil } }) ?? true,
+                      split.urls.allSatisfy({ TabAddress.restorable(URL(string: $0)) }) else {
+                    throw BackupError.invalid("Invalid split view metadata.")
+                }
+            }
+        }
+        for id in saved.spaces ?? [] where !id.isEmpty && UUID(uuidString: id) == nil { throw BackupError.invalid("Invalid window Space identity.") }
+        for id in (saved.selected ?? []).compactMap({ $0 }) where UUID(uuidString: id) == nil { throw BackupError.invalid("Invalid selected tab identity.") }
+        for row in saved.windows.flatMap({ $0 }) {
+            if let id = row.id, UUID(uuidString: id) == nil { throw BackupError.invalid("Invalid session tab identity.") }
+        }
+        return (saved.windows, saved.windows.indices.map { index in
+            saved.spaces.flatMap { $0.indices.contains(index) ? UUID(uuidString: $0[index]) : nil }
+        })
+    }
+
+    /// Each window's splits, in the same order as `decode`'s windows. Empty for a file that
+    /// predates them.
+    static func decodeSplits(_ data: Data) -> [[Split.Saved]] { disk(data).splits ?? [] }
+
+    /// The Space each of `decode`'s windows was in, padded to the same length so the two
+    /// lists can be zipped whatever wrote the file.
+    static func decodeSpaces(_ data: Data) -> [UUID?] {
+        let d = disk(data)
+        let ids = d.spaces ?? []
+        return d.windows.indices.map { i in
+            ids.indices.contains(i) ? UUID(uuidString: ids[i]) : nil
+        }
+    }
+
+    /// The selected tab in each window, padded to the windows list like `decodeSpaces`.
+    static func decodeSelected(_ data: Data) -> [UUID?] {
+        let d = disk(data)
+        let ids = d.selected ?? []
+        return d.windows.indices.map { i in
+            ids.indices.contains(i) ? ids[i].flatMap(UUID.init(uuidString:)) : nil
+        }
+    }
+
+    private static func disk(_ data: Data)
+        -> (windows: [[Entry]], splits: [[Split.Saved]]?, spaces: [String]?, selected: [String?]?) {
+        if let disk = try? JSONDecoder().decode(Disk.self, from: data) {
+            return (disk.windows, disk.splits, disk.spaces, disk.selected)
+        }
+        let legacy = (try? JSONSerialization.jsonObject(with: data)) as? [[String]] ?? []
+        return (legacy.map { $0.map { Entry(url: $0) } }, nil, nil, nil)
+    }
+
+    /// Every page the session file holds for a profile, in window order and deduped. What
+    /// the one-off migration folds into the profile's first Space: before the Space existed
+    /// these tabs were the whole of "the window's tabs", written nowhere else.
+    static func urls(for profileID: UUID, in dir: URL = Store.directory) -> [URL] {
+        load(ProfileManager.sessionURL(for: profileID, in: dir))?.snapshot.urls ?? []
+    }
+
+    /// url → what we knew about it, for `TabStore.init`. Entries with neither a title nor a
+    /// state — i.e. every entry from a v1 file — are left out, so those tabs load eagerly
+    /// exactly as they do today.
+    /// ponytail: keyed by url, so the same page open in two tabs of one window comes back
+    /// twice on the same scroll position. Nobody has ever noticed.
+    static func parked(_ entries: [Entry]) -> [String: Parked] {
+        var out: [String: Parked] = [:]
+        for e in entries where e.title != nil || e.state != nil || e.needsRecovery == true {
+            out[e.url] = Parked(title: e.title ?? "",
+                                state: e.state.flatMap { Data(base64Encoded: $0) }, needsRecovery: e.needsRecovery == true)
+        }
+        return out
+    }
+
+    /// Remove a moved Space's old window row even if its source profile has no open store.
+    /// `save()` only rewrites profiles with live stores, so it cannot clear a closed
+    /// profile's prior crash snapshot. Keep every other window and its aligned metadata.
+    @discardableResult
+    static func forget(space id: UUID, in profileID: UUID) -> Bool {
+        let destination = file(profileID)
+        return SessionPersistence.shared.sync(file: destination, requiresPendingWrite: true) { forgetFile(space: id, file: destination) }
+    }
+
+    @discardableResult
+    static func forgetAsync(space id: UUID, in profileID: UUID) async -> Bool {
+        let destination = file(profileID)
+        return await SessionPersistence.shared.perform(file: destination, requiresPendingWrite: true) { forgetFile(space: id, file: destination) }
+    }
+
+    struct StagedForget: Sendable {
+        fileprivate let file: URL
+        fileprivate let before: RecoverySnapshots.Generations
+        fileprivate let after: RecoverySnapshots.Generations
+        fileprivate let ownership: SessionPersistence.Ownership
+    }
+    static func stageForget(space id: UUID, in profileID: UUID) async -> (succeeded: Bool, change: StagedForget?) {
+        await stageForget(spaces: [id], in: profileID)
+    }
+    static func stageForget(spaces: Set<UUID>, in profileID: UUID) async -> (succeeded: Bool, change: StagedForget?) {
+        let destination = file(profileID)
+        let edit = await SessionPersistence.shared.mutate(file: destination, requiresPendingWrite: true, ownsResult: { $0.1 != nil && $0.2 != nil }) {
+            () -> (Bool, RecoverySnapshots.Generations?, RecoverySnapshots.Generations?) in
+            guard let before = try? RecoverySnapshots.Generations.capture(destination) else { return (false, nil, nil) }
+            let succeeded = forgetFile(spaces: spaces, file: destination)
+            return (succeeded, before, try? RecoverySnapshots.Generations.capture(destination))
+        }
+        guard let edit else { return (false, nil) }
+        guard let before = edit.value.1, let after = edit.value.2 else { return (false, nil) }
+        return (edit.value.0, StagedForget(file: destination, before: before, after: after,
+            ownership: edit.ownership))
+    }
+    static func repair(_ change: StagedForget) async -> Bool {
+        await SessionPersistence.shared.repair(change.ownership) { ownsFile in
+            guard ownsFile else { return (true, .unchanged) }
+            guard let current = try? RecoverySnapshots.Generations.capture(change.file) else { return (false, .failed) }
+            guard current == change.after else { return (true, .unchanged) }
+            let restored = change.before.restore(change.file)
+            return (restored, restored ? .rolledBack : .failed)
+        } ?? true
+    }
+
+    private nonisolated static func forgetFile(space id: UUID, file: URL) -> Bool {
+        forgetFile(spaces: [id], file: file)
+    }
+    private nonisolated static func forgetFile(spaces removed: Set<UUID>, file: URL) -> Bool {
+        let removedIDs = Set(removed.map(\.uuidString))
+        // A stale fallback is safe to preview/restore, but cannot authorize deleting or
+        // moving a Space out of an unreadable current session.
+        let data: Data
+        do { data = try Data(contentsOf: file) }
+        catch CocoaError.fileReadNoSuchFile { return true }
+        catch { return false }
+        guard readable(data), var snapshot = try? JSONDecoder().decode(Disk.self, from: data) else { return false }
+        guard let spaces = snapshot.spaces else { return snapshot.windows.isEmpty }
+        guard spaces.count >= snapshot.windows.count else { return false }
+        let kept = snapshot.windows.indices.filter {
+            !spaces.indices.contains($0) || !removedIDs.contains(spaces[$0])
+        }
+        guard kept.count != snapshot.windows.count else { return true }
+        snapshot.windows = kept.map { snapshot.windows[$0] }
+        snapshot.splits = snapshot.splits.map { list in kept.map { list.indices.contains($0) ? list[$0] : [] } }
+        snapshot.spaces = kept.map { spaces.indices.contains($0) ? spaces[$0] : "" }
+        snapshot.selected = snapshot.selected.map { list in kept.map { list.indices.contains($0) ? list[$0] : nil } }
+        guard let updated = try? JSONEncoder().encode(snapshot) else { return false }
+        return RecoverySnapshots.write(updated, to: file, valid: readable)
+    }
+
+    /// Every profile's open windows, each into its own file. A profile whose windows are all
+    /// closed keeps the session it already had — only profiles with a live window are
+    /// rewritten, so quitting from profile B does not erase profile A's session.
+    @discardableResult
+    static func save() -> Bool { captureSave(background: false) }
+
+    @discardableResult
+    static func enqueueSave() -> Bool { captureSave(background: true) }
+
+    /// Async backup and quit boundary. Every job already admitted is durable, or a
+    /// failure is returned so the dirty marker / existing originals remain intact.
+    static func flushPersistence() async -> Bool {
+        let boosts = await SiteBoosts.flushPersistence()
+        let session = await SessionPersistence.shared.flush()
+        return boosts && session
+    }
+
+    private static func captureSave(background: Bool) -> Bool {
+        guard !restoring else { return false }
+        let ownsSnapshots = Tab.captureSnapshots == nil
+        if ownsSnapshots { Tab.captureSnapshots = [:] }
+        defer { if ownsSnapshots { Tab.captureSnapshots = nil } }
+        var succeeded = true
+        // A row's interactionState travels raw; base64 is applied with the JSON off main.
+        var byProfile: [UUID: [(entries: [(entry: Entry, state: Data?)], splits: [Split.Saved], space: String,
+                                       selected: String?)]] = [:]
+        // Restore opens each window in sequence. Save back-to-front so the window the
+        // user was working in comes forward last, regardless of its creation order.
+        let frontToBack = NSApp.orderedWindows
+        let orderedStores = TabStore.all.enumerated().sorted { left, right in
+            let a = left.element.window.flatMap { window in frontToBack.firstIndex { $0 === window } }
+                ?? Int.max
+            let b = right.element.window.flatMap { window in frontToBack.firstIndex { $0 === window } }
+                ?? Int.max
+            return a == b ? left.offset < right.offset : a > b
+        }.map(\.element)
+        // Nothing private is written down, and neither is a Little Arc: it is a link
+        // someone followed once, not a window to come back up in.
+        for store in orderedStores where !store.isPrivate && !store.isLittle {
+            // Deleted profiles can keep a visible window until relaunch. Their retired
+            // destinations intentionally reject writes and are no longer session owners.
+            guard !SessionPersistence.shared.isRetired(file(store.profileID)) else { continue }
+            if !store.saveCurrentSpace() { succeeded = false }
+            // A store parked behind another profile in the same window has just had its Space
+            // written, which is where its tabs actually live — but it is not a window of its
+            // own, and writing it down as one would bring a second window up for that profile
+            // on the next launch, beside the window it is really a part of. See `Windows.hop`.
+            //
+            // Listed with no window rather than left out, though: a profile left out keeps the
+            // session it already had, and what it *had* is this — so the row written back when
+            // it was last a window of its own would come back holding pages its Space has
+            // since moved on from. A profile with no windows left restores nothing and opens
+            // in its Space, which is exactly where the hop left it. A profile that also has a
+            // real window elsewhere is unaffected: the empty row is filtered out below.
+            guard !store.isParked else {
+                byProfile[store.profileID, default: []]
+                    .append((entries: [], splits: [], space: "", selected: nil))
+                continue
+            }
+            let entries = store.tabs.compactMap { tab -> (entry: Entry, state: Data?)? in
+                // currentURL, not web.url: a suspended tab has no live page and would
+                // otherwise drop out of its own session.
+                guard let u = tab.currentURL,
+                      TabAddress.restorable(u) else { return nil }
+                let snap = tab.snapshot
+                return (Entry(id: tab.id.uuidString, url: u.absoluteString, title: snap.title,
+                              kind: tab.kind, home: tab.homeURL?.absoluteString, customName: tab.workspaceName,
+                              needsRecovery: tab.needsRecovery ? true : nil), snap.state)
+            }
+            byProfile[store.profileID, default: []]
+                .append((entries, store.savedSplits, store.currentSpaceID?.uuidString ?? "",
+                         store.current?.uuidString))
+        }
+        for (profileID, windows) in byProfile {
+            // Windows are dropped as whole rows, so a window's splits and its Space never
+            // end up filed under the next window's tabs.
+            let kept = windows.filter { !$0.entries.isEmpty }
+            let destination = file(profileID)
+            let rows = kept.map(\.entries), splits = kept.map(\.splits)
+            let spaces = kept.map(\.space), selected = kept.map(\.selected)
+            let write: @Sendable () -> Bool = {
+                let entries = rows.map { window in window.map { row in
+                    var entry = row.entry
+                    entry.state = row.state?.base64EncodedString()
+                    return entry
+                } }
+                guard let data = encode(entries, splits: splits, spaces: spaces, selected: selected) else { return false }
+                return RecoverySnapshots.write(data, to: destination, valid: readable)
+            }
+            if background {
+                if !SessionPersistence.shared.enqueue(file: destination, write) { succeeded = false }
+            }
+            else if !SessionPersistence.shared.sync(file: destination, write) { succeeded = false }
+        }
+        return succeeded
+    }
+
+    /// Returns false when there was nothing to restore, so the caller opens a fresh window.
+    @discardableResult
+    static func restore(profile: Profile? = nil) -> Bool {
+        guard let profile else {
+            let manager = ProfileManager.shared
+            // Open the active profile last, so its last-used window finishes in front.
+            let profiles = manager.profiles.filter { $0.id != manager.active.id } + [manager.active]
+            var restored = false
+            for profile in profiles { if restore(profile: profile) { restored = true } }
+            return restored
+        }
+        guard let loaded = load(file(profile.id)) else { return false }
+        let snapshot = loaded.snapshot
+        let recoveringFile = loaded.recoveringFile
+        let wasRestoring = restoring
+        restoring = true
+        defer { restoring = wasRestoring }
+        let saved = snapshot.splits
+        // Each window comes back into the Space it was in. A session row for a deleted or
+        // moved Space is skipped: its pages must not reappear in the source profile.
+        // Sessions predating per-window Spaces still use the profile's last-used Space.
+        // The one place session urls may be migrated into a Space: this is the session being
+        // restored, so folding a pre-Spaces file's tabs in is right. `Spaces.resolve` — every
+        // other way a window opens — passes none, or "Start Fresh" would put back exactly the
+        // pages it was told not to.
+        let spaces = ProfileManager.shared.ensureSpaces(
+            for: profile, sessionTabs: snapshot.urls)
+        let inSpace = snapshot.spaces
+        let selected = snapshot.selected
+        let hasIdentityFormat = snapshot.hasIdentityFormat
+        let knownSpaces = Set(spaces.map(\.id))
+        let windows = snapshot.windows.enumerated().filter {
+            !$0.element.isEmpty && (inSpace[$0.offset].map { knownSpaces.contains($0) } ?? true)
+        }
+        guard !windows.isEmpty else { return false }
+        for (i, entries) in windows {
+            let entries = entries.map { entry in
+                var entry = entry
+                if recoveringFile { entry.needsRecovery = true }
+                return entry
+            }
+            let identified = hasIdentityFormat || entries.allSatisfy { $0.id.flatMap(UUID.init(uuidString:)) != nil
+                                                  && $0.kind != nil }
+            let store = Windows.open(urls: identified ? [] : entries.compactMap { URL(string: $0.url) },
+                                     profile: profile, space: spaces.first { $0.id == inSpace[i] },
+                                     parked: identified ? [:] : parked(entries),
+                                     session: identified ? normalizedEntries(entries) : nil,
+                                     selected: selected.indices.contains(i) ? selected[i] : nil,
+                                     restoringLegacySession: !identified, recoveringSession: recoveringFile || Crash.didCrashLastLaunch)
+            // After the window exists, because a split is named by its panes' urls and the
+            // tabs that carry them are made by `TabStore.init`.
+            store.applySplits(saved.indices.contains(i) ? saved[i] : [])
+        }
+        return !TabStore.all.isEmpty
+    }
+}
+
+/// ⌘⇧T. Keep the last 32 closed pages in memory, without retaining their tabs,
+/// web views, website data stores or password UI. Nothing in this stack is persisted.
+@MainActor enum ClosedTabs {
+    struct Entry {
+        let url: URL
+        let profileID: UUID
+        let snapshot: Parked
+
+        /// Reopen as a new Today row in the current context, just like opening its URL.
+        /// Session state stays inside its originating profile; a different profile or a
+        /// private window gets a fresh URL load using that destination's website data.
+        @MainActor @discardableResult
+        func reopen(in store: TabStore) -> Tab? {
+            guard !AppLifecycle.shared.persistenceExitInProgress else { return nil }
+            let destination = store.isLittle ? LittleArc.open(nil, isPrivate: store.isPrivate) : store
+            let tab = destination.newBlankTab(focus: false)
+            let parked = !destination.isPrivate && destination.profileID == profileID ? snapshot : Parked()
+            tab.park(url: url, parked)
+            destination.palette = nil
+            destination.current = tab.id   // selection resumes the parked history, with URL fallback
+            return tab
+        }
+    }
+
+    private static var stack: [Entry] = []
+    static func push(_ tab: Tab) {
+        guard !tab.isPrivate, let url = tab.currentURL, TabAddress.restorable(url) else { return }
+        var snapshot = tab.snapshot
+        // Reopening is an explicit request to load the URL. Do not replay state that
+        // crash recovery deliberately withheld, or carry its resume blocker into a new row.
+        if snapshot.needsRecovery { snapshot.state = nil; snapshot.needsRecovery = false }
+        stack.append(Entry(url: url, profileID: tab.profileID, snapshot: snapshot))
+        if stack.count > 32 { stack.removeFirst() }
+    }
+    static func pop() -> Entry? { stack.popLast() }
+}

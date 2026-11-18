@@ -1,0 +1,1351 @@
+import AppKit
+import SwiftUI
+import WebKit
+
+// MARK: - Keybinding
+
+/// One key plus its modifiers. The empty key is "unassigned" and displays as `---`.
+///
+/// Everything here is a pure value: no window server, no defaults, so `selfcheck --pure`
+/// can prove the formatting and the round-trips on a headless box.
+struct Keybinding: Codable, Hashable, Sendable {
+
+    /// ponytail: our own flag set rather than `NSEvent.ModifierFlags`, purely because that
+    /// one is not Codable and this has to survive in UserDefaults.
+    struct Mods: OptionSet, Codable, Hashable, Sendable {
+        let rawValue: Int
+        static let control = Mods(rawValue: 1 << 0)
+        static let option  = Mods(rawValue: 1 << 1)
+        static let shift   = Mods(rawValue: 1 << 2)
+        static let command = Mods(rawValue: 1 << 3)
+    }
+
+    /// Always canonical: lowercased, one character (or one function-key scalar). Empty
+    /// means unassigned.
+    private(set) var key: String
+    private(set) var mods: Mods
+
+    static let unassigned = Keybinding("", [])
+
+    /// The only initialiser, so every binding — a default, a decoded one, a recorded one —
+    /// goes through the same canonicalisation and can therefore be compared with `==`.
+    init(_ key: String, _ mods: Mods = []) {
+        var key = key, mods = mods
+        // Backtab is just shift-tab spelled as a control character (AppKit's
+        // NSBackTabCharacter). Store one spelling so a recorded ⌃⇧⇥ equals the default.
+        if key == "\u{19}" {
+            key = "\t"
+            mods.insert(.shift)
+        }
+        // A shifted punctuation glyph already says "shift" — "+" *is* shift-"=" — and
+        // `charactersIgnoringModifiers` hands us the shifted glyph. Storing the flag as
+        // well would make a recorded ⌘+ differ from the ⌘+ the menu uses today.
+        // ponytail ceiling: US-ish layouts. On a layout where "+" needs no shift this
+        // drops a modifier the user really pressed; the fix is a keyCode-based binding,
+        // which is a lot of table for a case nobody has hit yet.
+        if key.count == 1, let s = key.unicodeScalars.first,
+           (0x21...0x7E).contains(s.value), !CharacterSet.alphanumerics.contains(s) {
+            mods.remove(.shift)
+        }
+        self.key = key.lowercased()
+        self.mods = mods
+    }
+
+    /// From a key-down event, so a recorder view can capture one. Nil for events that
+    /// carry no character at all (modifier presses, dead keys).
+    init?(event: NSEvent) {
+        guard let chars = event.charactersIgnoringModifiers, !chars.isEmpty else { return nil }
+        var mods: Mods = []
+        let flags = event.modifierFlags
+        if flags.contains(.control) { mods.insert(.control) }
+        if flags.contains(.option)  { mods.insert(.option) }
+        if flags.contains(.shift)   { mods.insert(.shift) }
+        if flags.contains(.command) { mods.insert(.command) }
+        self.init(chars, mods)
+    }
+
+    var isAssigned: Bool { !key.isEmpty }
+
+    // MARK: Display
+
+    /// Conventional macOS order: ⌃⌥⇧⌘ then the key. `---` when unassigned.
+    var display: String {
+        guard isAssigned else { return "---" }
+        var out = ""
+        if mods.contains(.control) { out += "⌃" }
+        if mods.contains(.option)  { out += "⌥" }
+        if mods.contains(.shift)   { out += "⇧" }
+        if mods.contains(.command) { out += "⌘" }
+        return out + Self.label(key)
+    }
+
+    /// How a key prints on its own. Everything not in the table is just uppercased, which
+    /// is what letters and digits want.
+    static func label(_ key: String) -> String {
+        guard let s = key.unicodeScalars.first, key.unicodeScalars.count == 1 else {
+            return key.uppercased()
+        }
+        switch s.value {
+        case 0x09, 0x19: return "⇥"                       // tab / backtab
+        case 0x08, 0x7F: return "⌫"                       // backspace / delete
+        case 0x1B:       return "⎋"
+        case 0x0D:       return "⏎"
+        case 0x03:       return "⌤"                       // numeric-keypad enter
+        case 0x20:       return "␣"
+        case 0xF700:     return "↑"
+        case 0xF701:     return "↓"
+        case 0xF702:     return "←"
+        case 0xF703:     return "→"
+        case 0xF728:     return "⌦"                       // forward delete
+        case 0xF729:     return "↖"                       // home
+        case 0xF72B:     return "↘"                       // end
+        case 0xF72C:     return "⇞"
+        case 0xF72D:     return "⇟"
+        case 0xF704...0xF726: return "F\(s.value - 0xF704 + 1)"
+        default:         return key.uppercased()
+        }
+    }
+
+    // MARK: Conversions
+
+    /// What `NSMenuItem.keyEquivalent` wants. Shift-tab goes back to being backtab, which
+    /// is the spelling AppKit matches on.
+    var menuKeyEquivalent: String {
+        key == "\t" && mods.contains(.shift) ? "\u{19}" : key
+    }
+
+    var menuModifierMask: NSEvent.ModifierFlags {
+        var f: NSEvent.ModifierFlags = []
+        if mods.contains(.control) { f.insert(.control) }
+        if mods.contains(.option)  { f.insert(.option) }
+        if mods.contains(.shift)   { f.insert(.shift) }
+        if mods.contains(.command) { f.insert(.command) }
+        return f
+    }
+
+    var eventModifiers: SwiftUI.EventModifiers {
+        var f: SwiftUI.EventModifiers = []
+        if mods.contains(.control) { f.insert(.control) }
+        if mods.contains(.option)  { f.insert(.option) }
+        if mods.contains(.shift)   { f.insert(.shift) }
+        if mods.contains(.command) { f.insert(.command) }
+        return f
+    }
+
+    /// Nil when unassigned — `.keyboardShortcut(nil)` is how SwiftUI spells "no shortcut".
+    var keyboardShortcut: KeyboardShortcut? {
+        guard let c = key.first, key.count == 1 else { return nil }
+        return KeyboardShortcut(KeyEquivalent(c), modifiers: eventModifiers)
+    }
+}
+
+// MARK: - Commands
+
+/// Every rebindable action, by stable id. The raw value is what lands in UserDefaults, so
+/// renaming a case renames the user's setting — don't.
+enum Command: String, CaseIterable, Codable, Sendable {
+    // File
+    case newWindow, newPrivateWindow, newTab, reopenClosedTab, closeTab, closeWindow
+    case newEasel, captureToEasel, showEasels
+    case newLittleArc
+    case printPage, settings
+    case openFile, savePageAs, sharePage, capturePage, captureFullPage
+    // View
+    case reload, hardReload, openLocation, find, toggleSidebar
+    case nextFocusArea
+    case findNext, findPrevious
+    case actualSize, zoomIn, zoomOut, fullScreen
+    case copyPageURL, showLibrary
+    case showReader, biggerReaderText, smallerReaderText, readerSerif
+    case saveForOffline, readingQueue
+    // History / Archive
+    case back, forward, clearHistory
+    case viewArchive, viewHistory, showDownloads, clearArchive
+    // Bookmarks
+    case bookmarkPage
+    // Passwords
+    case fillPassword, importPasswords, importHistoryAndBookmarks, importFromArc
+    case manageSavedPasswords
+    // Sites
+    case blockAds, addFilterList, makeDefaultBrowser
+    case forgetCertificateExceptions, resetMediaPermissions
+    // Extensions
+    case installExtension
+    // Develop
+    case showWebInspector, showJavaScriptConsole, viewSource, allowWebInspector, toggleDeveloperMode
+    // Profiles
+    case newProfile, renameProfile, deleteProfile
+    // Spaces
+    case newSpace, nextSpace, previousSpace
+    case goToSpace1, goToSpace2, goToSpace3, goToSpace4
+    case goToSpace5, goToSpace6, goToSpace7, goToSpace8, goToSpace9
+    // Tabs
+    case nextTab, previousTab
+    case tabSwitcher, tabSwitcherBackwards
+    case selectTab1, selectTab2, selectTab3, selectTab4
+    case selectTab5, selectTab6, selectTab7, selectTab8, selectLastTab
+    case pictureInPicture
+    case tidyTabs, undoTidyTabs, clearTabs
+    case favouriteTab, pinTab
+    case muteTab
+    case addSplit, removeSplit, nextPane
+    case commandPalette, searchTabs
+    // Window / Help
+    case minimizeWindow
+    case timoHelp, keyboardShortcutsHelp
+
+    enum Category: String, CaseIterable, Sendable {
+        case file = "File", view = "View", history = "History", bookmarks = "Bookmarks"
+        case passwords = "Passwords", sites = "Sites", extensions = "Extensions"
+        case develop = "Develop", profiles = "Profiles", spaces = "Spaces", tabs = "Tabs"
+        case window = "Window", help = "Help"
+    }
+
+    var title: String {
+        switch self {
+        case .newEasel: "New Easel"
+        case .captureToEasel: "Capture Page to Easel"
+        case .showEasels: "Show Easels"
+        case .newWindow: "New Window"
+        case .newPrivateWindow: "New Private Window"
+        case .newLittleArc: "New Little Timo Window"
+        case .newTab: "New Tab"
+        case .reopenClosedTab: "Reopen Closed Tab"
+        case .closeTab: "Archive Tab"
+        case .closeWindow: "Close Window"
+        case .printPage: "Print…"
+        case .settings: "Settings…"
+        case .openFile: "Open File…"
+        case .savePageAs: "Save Page As…"
+        case .sharePage: "Share…"
+        case .capturePage: "Capture a Portion of This Page"
+        case .captureFullPage: "Capture Full Page"
+        case .reload: "Reload Page"
+        case .hardReload: "Reload Ignoring Cache"
+        case .openLocation: "Open Location…"
+        case .find: "Find…"
+        case .findNext: "Find Next"
+        case .findPrevious: "Find Previous"
+        case .toggleSidebar: "Toggle Sidebar"
+        case .nextFocusArea: "Next Focus Area"
+        case .actualSize: "Actual Size"
+        case .zoomIn: "Zoom In"
+        case .zoomOut: "Zoom Out"
+        case .fullScreen: "Enter Full Screen"
+        case .copyPageURL: "Copy Page URL"
+        case .showLibrary: "Show Library"
+        case .showReader: "Show Reader"
+        case .saveForOffline: "Save for Offline"
+        case .readingQueue: "Reading Queue"
+        case .biggerReaderText: "Bigger Reader Text"
+        case .smallerReaderText: "Smaller Reader Text"
+        case .readerSerif: "Reader Uses Serif"
+        case .back: "Back"
+        case .forward: "Forward"
+        case .clearHistory: "Clear History…"
+        case .viewArchive: "View Archive"
+        case .viewHistory: "View History"
+        case .showDownloads: "Downloads"
+        case .clearArchive: "Clear Archive…"
+        case .bookmarkPage: "Bookmark This Page"
+        case .fillPassword: "Fill Password"
+        case .importPasswords: "Import Passwords…"
+        case .importHistoryAndBookmarks: "Import History & Bookmarks…"
+        case .importFromArc: "Import from Arc…"
+        case .manageSavedPasswords: "Manage Saved Passwords…"
+        case .blockAds: "Block Ads and Trackers"
+        case .addFilterList: "Add Filter List…"
+        case .makeDefaultBrowser: "Make Timo the Default Browser"
+        case .forgetCertificateExceptions: "Forget Certificate Exceptions…"
+        case .resetMediaPermissions: "Reset Camera & Microphone Permissions…"
+        case .installExtension: "Install Extension…"
+        case .showWebInspector: "Show Web Inspector"
+        case .showJavaScriptConsole: "Show JavaScript Console"
+        case .toggleDeveloperMode: "Toggle Developer Mode"
+        case .viewSource: "View Source"
+        case .allowWebInspector: "Allow Web Inspector"
+        case .newProfile: "New Profile…"
+        case .renameProfile: "Rename Profile…"
+        case .deleteProfile: "Delete Profile…"
+        case .newSpace: "New Space…"
+        case .nextSpace: "Next Space"
+        case .previousSpace: "Previous Space"
+        case .goToSpace1: "Go to Space 1"
+        case .goToSpace2: "Go to Space 2"
+        case .goToSpace3: "Go to Space 3"
+        case .goToSpace4: "Go to Space 4"
+        case .goToSpace5: "Go to Space 5"
+        case .goToSpace6: "Go to Space 6"
+        case .goToSpace7: "Go to Space 7"
+        case .goToSpace8: "Go to Space 8"
+        case .goToSpace9: "Go to Space 9"
+        case .nextTab: "Next Tab"
+        case .previousTab: "Previous Tab"
+        case .tabSwitcher: "Tab Switcher"
+        case .tabSwitcherBackwards: "Tab Switcher Backwards"
+        case .selectTab1: "Select Tab 1"
+        case .selectTab2: "Select Tab 2"
+        case .selectTab3: "Select Tab 3"
+        case .selectTab4: "Select Tab 4"
+        case .selectTab5: "Select Tab 5"
+        case .selectTab6: "Select Tab 6"
+        case .selectTab7: "Select Tab 7"
+        case .selectTab8: "Select Tab 8"
+        case .selectLastTab: "Select Last Tab"
+        case .pictureInPicture: "Picture in Picture"
+        case .tidyTabs: "Tidy Tabs"
+        case .undoTidyTabs: "Undo Tidy Tabs"
+        case .clearTabs: "Clear Tabs"
+        case .favouriteTab: "Favourite Tab"
+        case .pinTab: "Pin Tab"
+        case .muteTab: "Mute Tab"
+        case .addSplit: "Add Split View"
+        case .removeSplit: "Remove Split"
+        case .nextPane: "Next Pane"
+        case .commandPalette: "Search…"
+        case .searchTabs: "Search Tabs…"
+        case .minimizeWindow: "Minimize"
+        case .timoHelp: "Timo Help"
+        case .keyboardShortcutsHelp: "Keyboard Shortcuts"
+        }
+    }
+
+    var category: Category {
+        switch self {
+        case .newEasel, .captureToEasel, .showEasels, .newWindow, .newPrivateWindow, .newTab, .newLittleArc, .reopenClosedTab,
+             .closeTab, .closeWindow, .printPage, .settings, .openFile, .savePageAs,
+             .sharePage, .capturePage, .captureFullPage: .file
+        case .reload, .hardReload, .openLocation, .find, .findNext, .findPrevious, .nextFocusArea,
+             .toggleSidebar, .actualSize,
+             .zoomIn, .zoomOut, .fullScreen, .showReader, .biggerReaderText,
+             .smallerReaderText, .readerSerif, .saveForOffline, .readingQueue, .copyPageURL, .showLibrary: .view
+        case .back, .forward, .clearHistory, .viewArchive, .viewHistory, .showDownloads,
+             .clearArchive: .history
+        case .bookmarkPage: .bookmarks
+        case .fillPassword, .importPasswords, .importHistoryAndBookmarks, .importFromArc,
+             .manageSavedPasswords: .passwords
+        case .blockAds, .addFilterList, .makeDefaultBrowser, .forgetCertificateExceptions,
+             .resetMediaPermissions: .sites
+        case .installExtension: .extensions
+        case .showWebInspector, .showJavaScriptConsole, .viewSource, .allowWebInspector,
+             .toggleDeveloperMode: .develop
+        case .newProfile, .renameProfile, .deleteProfile: .profiles
+        case .newSpace, .nextSpace, .previousSpace, .goToSpace1, .goToSpace2, .goToSpace3,
+             .goToSpace4, .goToSpace5, .goToSpace6, .goToSpace7, .goToSpace8,
+             .goToSpace9: .spaces
+        case .minimizeWindow: .window
+        case .timoHelp, .keyboardShortcutsHelp: .help
+        default: .tabs
+        }
+    }
+
+    /// What the app ships with. These must stay equal to the key equivalents Menu.swift
+    /// and UI.swift hardcode today, or upgrading would silently move somebody's keys.
+    var defaultBinding: Keybinding {
+        switch self {
+        case .newEasel:         Keybinding("e", [.command, .option])
+        case .captureToEasel:   Keybinding("e", [.command, .shift])
+        case .showEasels:       .unassigned
+        case .newWindow:        Keybinding("n", .command)
+        case .newPrivateWindow: Keybinding("n", [.command, .shift])
+        // Arc's ⌥⌘N. See LittleArc.swift for why it is not a system-wide hotkey.
+        case .newLittleArc:     Keybinding("n", [.command, .option])
+        case .newTab:           Keybinding("t", .command)
+        case .reopenClosedTab:  Keybinding("t", [.command, .shift])
+        case .closeTab:         Keybinding("w", .command)
+        case .closeWindow:      Keybinding("w", [.command, .shift])
+        case .printPage:        Keybinding("p", .command)
+        case .settings:         Keybinding(",", .command)
+        case .reload:           Keybinding("r", .command)
+        case .hardReload:       Keybinding("r", [.command, .shift])
+        case .openLocation:     Keybinding("l", .command)
+        case .openFile:         Keybinding("o", .command)
+        // Arc's ⌘S is the sidebar, and Save Page As is one modifier up — see §G.
+        case .savePageAs:       Keybinding("s", [.command, .shift])
+        // Like ⌘+, store the shifted glyph that charactersIgnoringModifiers sends.
+        case .capturePage:      Keybinding("@", .command) // ⌘⇧2 on a US layout
+        case .find:             Keybinding("f", .command)
+        case .findNext:         Keybinding("g", .command)
+        case .findPrevious:     Keybinding("g", [.command, .shift])
+        case .toggleSidebar:    Keybinding("s", .command)
+        case .nextFocusArea:    Keybinding("\u{F709}") // F6, like other browsers
+        case .actualSize:       Keybinding("0", .command)
+        case .zoomIn:           Keybinding("+", .command)
+        case .zoomOut:          Keybinding("-", .command)
+        case .fullScreen:       Keybinding("f", [.command, .control])
+        case .showReader:       Keybinding("r", [.command, .option])
+        case .back:             Keybinding("[", .command)
+        case .forward:          Keybinding("]", .command)
+        // Arc's ⌘D pins the tab. Bookmarking keeps the adjacent ⌥⌘D it already had, and
+        // Favourite ships unbound — Arc gives it no default either, it is a menu item and
+        // a right-click. ⇧⌘D is left free (Arc spends it on the toolbar, which Timo has
+        // no equivalent of).
+        case .bookmarkPage:     Keybinding("d", [.command, .option])
+        case .pinTab:           Keybinding("d", .command)
+        case .clearTabs:        Keybinding("k", [.command, .shift])
+        case .copyPageURL:      Keybinding("c", [.command, .shift])
+        // ⌘⇧L is Arc's Library; Fill Password moves to the adjacent ⌥⌘L.
+        case .showLibrary:      Keybinding("l", [.command, .shift])
+        case .fillPassword:     Keybinding("l", [.command, .option])
+        case .nextSpace:        Keybinding("\u{F703}", [.command, .option])
+        case .previousSpace:    Keybinding("\u{F702}", [.command, .option])
+        case .goToSpace1:       Keybinding("1", .control)
+        case .goToSpace2:       Keybinding("2", .control)
+        case .goToSpace3:       Keybinding("3", .control)
+        case .goToSpace4:       Keybinding("4", .control)
+        case .goToSpace5:       Keybinding("5", .control)
+        case .goToSpace6:       Keybinding("6", .control)
+        case .goToSpace7:       Keybinding("7", .control)
+        case .goToSpace8:       Keybinding("8", .control)
+        case .goToSpace9:       Keybinding("9", .control)
+        case .showWebInspector: Keybinding("i", [.command, .option])
+        case .showJavaScriptConsole: Keybinding("c", [.command, .option])
+        case .toggleDeveloperMode: Keybinding("d", .option)          // Arc's ⌥D
+        case .viewSource:       Keybinding("u", [.command, .option])
+        // Arc: ⌥⌘↑/↓ walk the sidebar, ⌃⇥ is the switcher and goes *forwards*.
+        // The init folds backtab + ⌃⇧ to tab + ⌃⇧.
+        case .nextTab:          Keybinding("\u{F701}", [.command, .option])
+        case .previousTab:      Keybinding("\u{F700}", [.command, .option])
+        case .tabSwitcher:      Keybinding("\t", .control)
+        case .tabSwitcherBackwards: Keybinding("\u{19}", [.control, .shift])
+        case .selectTab1:       Keybinding("1", .command)
+        case .selectTab2:       Keybinding("2", .command)
+        case .selectTab3:       Keybinding("3", .command)
+        case .selectTab4:       Keybinding("4", .command)
+        case .selectTab5:       Keybinding("5", .command)
+        case .selectTab6:       Keybinding("6", .command)
+        case .selectTab7:       Keybinding("7", .command)
+        case .selectTab8:       Keybinding("8", .command)
+        case .selectLastTab:    Keybinding("9", .command)
+        case .pictureInPicture: Keybinding("p", [.command, .option])
+        case .tidyTabs:         Keybinding("t", [.command, .control])
+        case .undoTidyTabs:     .unassigned
+        case .muteTab:          Keybinding("m", [.command, .option])
+        // Arc's three, as they print on a US layout: ⌃⇧= sends "+" and ⌃⇧- sends "_", and
+        // `Keybinding.init` folds the shift into the glyph it already produced — the same
+        // fold Zoom In's ⌘+ has always relied on.
+        case .addSplit:         Keybinding("+", [.control, .shift])
+        case .removeSplit:      Keybinding("_", [.control, .shift])
+        case .nextPane:         Keybinding("n", [.control, .shift])
+        case .commandPalette:   Keybinding("p", [.command, .shift])
+        case .searchTabs:       Keybinding("a", [.command, .shift])
+        case .viewHistory:      Keybinding("y", .command)
+        case .showDownloads:    Keybinding("j", [.command, .shift])
+        case .minimizeWindow:   Keybinding("m", .command)
+        // Timo Help ships unbound, exactly as Safari's does. ⇧⌘/ — which arrives as ⌘? —
+        // is macOS's own "Show Help menu": it opens this menu and puts the caret in its
+        // search field from anywhere in the app, and no Apple app spends it on its own help
+        // item. `reserved` refuses it so nobody can bind it either.
+        // Everything else ships unbound — it is a menu item with no key equivalent today.
+        default: .unassigned
+        }
+    }
+}
+
+// MARK: - Store
+
+/// The model a Shortcuts pane binds to: read a binding, rebind it, reset it, and route a
+/// key event to whatever action the app registered.
+@MainActor enum Keybindings {
+
+    /// Whether the browser or the page gets first refusal on a key.
+    enum Priority: String, Codable, Sendable { case browser, page }
+
+    /// Swapped out under `check()` so assertions never touch the user's real preferences.
+    static var defaults: UserDefaults = .timo
+    private static let storeKey = "keybindings.v1"
+
+    private struct Saved: Codable {
+        var bindings: [String: Keybinding] = [:]
+        var priorities: [String: Priority] = [:]
+        /// Optional so a blob written before migrations existed still decodes; nil is 0.
+        var migrated: Int?
+    }
+
+    // MARK: Migration
+
+    /// Defaults that moved after they had already shipped, and what they used to be.
+    /// A *saved* binding equal to the old default is not a decision anybody made about
+    /// those keys — it is the default they were handed, written down by a pane that stores
+    /// whatever it records — so it is dropped and the new default takes over. A binding
+    /// the user actually chose is left exactly where it is, even if that now collides.
+    nonisolated static let movedDefaults: [Command: Keybinding] = [
+        .nextTab: Keybinding("\u{19}", [.control, .shift]),
+        .previousTab: Keybinding("\t", .control),
+        .favouriteTab: Keybinding("d", .command),
+        .pinTab: Keybinding("d", [.command, .shift]),
+    ]
+
+    /// The version a saved table is stamped with, so each migration runs once per user.
+    /// A future move is a *new* step, never an edit to an old one: bump this and add a
+    /// matching `from < N` block to `migrate`, leaving the blocks already there as they are —
+    /// they belong to the tables that were saved before them.
+    nonisolated static let migration = 2
+
+    /// Pure, so `selfcheck --pure` can prove the rule without a defaults suite. `from` is the
+    /// version the table was saved at: each step runs only for a table old enough to need it,
+    /// so a table already at 2 comes back untouched.
+    nonisolated static func migrate(_ bindings: [String: Keybinding],
+                                    moved: [Command: Keybinding],
+                                    from: Int) -> [String: Keybinding] {
+        var out = bindings
+        if from < 1 {
+            for (command, old) in moved where out[command.rawValue] == old {
+                out[command.rawValue] = nil
+            }
+        }
+        // Anything `reserved` refuses today. ⌘C and its neighbours were bindable before the
+        // table in Standard.swift existed, and a saved one still wins: the key monitor runs
+        // ahead of AppKit, so that binding takes Copy away from every text field in the app
+        // and from every page. Dropping it puts the command back on its shipped default, and
+        // the pane will not let it be chosen again. A deliberate *unbinding* is not reserved,
+        // so it survives.
+        if from < 2 {
+            for (id, binding) in out where reserved(binding) != nil {
+                out[id] = nil
+            }
+        }
+        return out
+    }
+
+    private static var cached: Saved?
+    private static var state: Saved {
+        get {
+            if let cached { return cached }
+            var s = defaults.data(forKey: storeKey)
+                .flatMap { try? JSONDecoder().decode(Saved.self, from: $0) } ?? Saved()
+            if (s.migrated ?? 0) < migration {
+                s.bindings = migrate(s.bindings, moved: movedDefaults, from: s.migrated ?? 0)
+                s.migrated = migration
+                // Not `state = s`: this is the getter, and the setter would re-enter it.
+                if let d = try? JSONEncoder().encode(s) { defaults.set(d, forKey: storeKey) }
+            }
+            cached = s
+            return s
+        }
+        set {
+            cached = newValue
+            if let d = try? JSONEncoder().encode(newValue) { defaults.set(d, forKey: storeKey) }
+        }
+    }
+
+    /// Adopt a portable table written by iCloud through the same defaults owner.
+    static func reloadICloudPreferences() { cached = nil }
+
+    // MARK: Bindings
+
+    static func binding(for command: Command) -> Keybinding {
+        state.bindings[command.rawValue] ?? command.defaultBinding
+    }
+
+    /// Setting `.unassigned` is a real choice (unbind it), not a reset — it is stored.
+    static func set(_ binding: Keybinding, for command: Command) {
+        state.bindings[command.rawValue] = binding
+    }
+
+    static func reset(_ command: Command) {
+        state.bindings[command.rawValue] = nil
+        state.priorities[command.rawValue] = nil
+    }
+
+    static func resetAll() {
+        state = Saved()
+    }
+
+    /// Every command already holding these keys. Unassigned collides with nothing —
+    /// forty unbound commands are not forty conflicts.
+    static func conflicts(_ binding: Keybinding) -> [Command] {
+        guard binding.isAssigned else { return [] }
+        return Command.allCases.filter { Keybindings.binding(for: $0) == binding }
+    }
+
+    // MARK: Priority
+
+    static func priority(for command: Command) -> Priority {
+        state.priorities[command.rawValue] ?? .browser
+    }
+
+    static func setPriority(_ p: Priority, for command: Command) {
+        state.priorities[command.rawValue] = p
+    }
+
+    // MARK: Reserved
+
+    /// A reason the system (or Timo's own app menu) will take this combination first, or
+    /// nil if it is free. Returning the reason lets the UI warn instead of just refusing.
+    ///
+    /// Pure and `nonisolated`: `migrate` is the other caller, and it runs wherever the store
+    /// is first read.
+    nonisolated static func reserved(_ binding: Keybinding) -> String? {
+        guard binding.isAssigned else { return nil }
+        let m = binding.mods
+        let isFunctionKey = binding.key.unicodeScalars.first.map {
+            (0xF704...0xF726).contains($0.value)
+        } ?? false
+        // A binding with no ⌘/⌃/⌥ fires while you are typing into a text field.
+        if m.isDisjoint(with: [.command, .control, .option]), !isFunctionKey {
+            return "Needs at least one of ⌘, ⌃ or ⌥ — otherwise it fires while you type."
+        }
+        switch (binding.key, m) {
+        case ("q", [.command]):                  return "⌘Q quits Timo."
+        case ("q", [.command, .shift]):          return "⌘⇧Q logs you out of macOS."
+        case ("q", [.command, .control]):        return "⌃⌘Q locks the screen."
+        case ("\t", [.command]), ("\t", [.command, .shift]):
+            return "macOS keeps ⌘⇥ for the app switcher; apps never see it."
+        case (" ", [.command]), (" ", [.control]), (" ", [.command, .option]):
+            return "macOS keeps this for Spotlight and input-source switching."
+        case ("\u{1b}", [.command, .option]):    return "⌥⌘⎋ opens Force Quit."
+        case ("3", [.command, .shift]), ("4", [.command, .shift]), ("5", [.command, .shift]):
+            return "macOS keeps this for screenshots."
+        case ("h", [.command]):                  return "⌘H hides Timo."
+        case ("m", [.command]):                  return "⌘M minimises the window."
+        // ⇧⌘/ arrives as "?" — the shifted glyph carries its own shift. macOS keeps it for
+        // "Show Help menu", which opens the Help menu and puts the caret in its search field
+        // from anywhere in any app; no Mac app binds its own help item to it.
+        case ("?", [.command]):
+            return "macOS keeps ⇧⌘/ for the Help menu's search."
+        default:                                 break
+        }
+        // The chords AppKit answers for itself — Copy, Paste, Undo, Select All. Timo's key
+        // monitor runs *ahead* of the menu, so a command bound onto one of these would not
+        // merely shadow a menu item: it would take ⌘C away from every text field in the app
+        // and from every page. See Standard.swift for the table.
+        if let row = Standard.rows.first(where: { $0.key == binding }), row.selectorName != nil {
+            return "\(binding.display) is macOS's \u{201C}\(row.title)\u{201D}, "
+                + "and belongs to whatever you are typing in."
+        }
+        return nil
+    }
+
+    // MARK: Search
+
+    /// Matches a command by name *or* by shortcut, so "new tab", "⌘T", "cmd t" and
+    /// "command+t" all land on New Tab. Pure — no defaults, no AppKit.
+    static func search(_ query: String) -> [Command] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return Command.allCases }
+        // Shortcut matches first: typing "cmd t" is a deliberate spelling of ⌘T, and it
+        // would otherwise lose to a fuzzy name hit ("Command Palette" contains c, m, d…).
+        var hits: [Command] = []
+        if let wanted = parseShortcut(q) {
+            hits = Command.allCases.filter { c in
+                let b = binding(for: c)
+                guard b.isAssigned else { return false }
+                // A modifiers-only query ("⌥⌘") lists everything using them.
+                return wanted.isAssigned ? b == wanted : b.mods.isSuperset(of: wanted.mods)
+            }
+        }
+        // Then names, best-ranked: the palette's matcher already does this well and a
+        // second fuzzy scorer would be a second thing to keep honest.
+        hits += Palette.rank(q, Command.allCases, key: \.title).filter { !hits.contains($0) }
+        return hits
+    }
+
+    private static let modWords: [(String, Keybinding.Mods)] = [
+        ("command", .command), ("cmd", .command),
+        ("control", .control), ("ctrl", .control),
+        ("option", .option), ("opt", .option), ("alt", .option),
+        ("shift", .shift),
+    ]
+    private static let modSymbols: [Character: Keybinding.Mods] = [
+        "⌘": .command, "⌃": .control, "⌥": .option, "⇧": .shift,
+    ]
+    private static let keyWords: [String: String] = [
+        "tab": "\t", "space": " ", "esc": "\u{1b}", "escape": "\u{1b}",
+        "return": "\r", "enter": "\r", "delete": "\u{7f}", "backspace": "\u{7f}",
+        "up": "\u{F700}", "down": "\u{F701}", "left": "\u{F702}", "right": "\u{F703}",
+    ]
+
+    /// "cmd shift t" / "⇧⌘T" / "control+tab" → a binding. Nil when the text does not read
+    /// as a shortcut at all, which is the common case ("new tab") and means "name search
+    /// only".
+    private static func parseShortcut(_ query: String) -> Keybinding? {
+        var rest = Substring(query.lowercased())
+        var mods: Keybinding.Mods = []
+        func trimSeparators() {
+            while let c = rest.first, c == " " || c == "+" || c == "-", rest.count > 1 {
+                rest.removeFirst()
+            }
+        }
+        var consumed = true
+        while consumed {
+            consumed = false
+            trimSeparators()
+            if let c = rest.first, let m = modSymbols[c] {
+                mods.insert(m); rest.removeFirst(); consumed = true; continue
+            }
+            for (word, m) in modWords where rest.hasPrefix(word) {
+                // "optionally" is a word, not ⌥ + "ally": require a separator after it.
+                let after = rest.dropFirst(word.count)
+                guard after.isEmpty || after.first == " " || after.first == "+"
+                        || after.first == "-" else { continue }
+                mods.insert(m); rest = after; consumed = true; break
+            }
+        }
+        trimSeparators()
+        let tail = String(rest)
+        if tail.isEmpty { return mods.isEmpty ? nil : Keybinding("", mods) }
+        if let named = keyWords[tail] { return Keybinding(named, mods) }
+        if tail.count >= 2, tail.first == "f", let n = Int(tail.dropFirst()), (1...20).contains(n) {
+            return Keybinding(String(UnicodeScalar(0xF704 + n - 1)!), mods)
+        }
+        return tail.count == 1 ? Keybinding(tail, mods) : nil
+    }
+
+    // MARK: Routing
+
+    /// Populated from Menu.swift. A command with no entry simply does not fire, which is
+    /// what keeps this file from importing the rest of the app.
+    static var actions: [Command: @MainActor () -> Void] = [:]
+
+    static func command(for binding: Keybinding) -> Command? {
+        guard binding.isAssigned else { return nil }
+        return Command.allCases.first { Keybindings.binding(for: $0) == binding }
+    }
+
+    /// A second chord for a command, on top of the one the menu shows and the Shortcuts pane
+    /// rebinds. Arc binds Back and Forward to both ⌘[ / ⌘] and ⌘← / ⌘→, and the arrows are
+    /// the pair most people reach for.
+    ///
+    /// It is also how Timo honours the standard chords Arc spends elsewhere: ⇧⌘[ and ⇧⌘]
+    /// walk the tabs in every other Mac browser, and ⌘= zooms in on a keyboard where ⌘+
+    /// needs a shift — none of which Arc's own ⌥⌘↑/↓ and ⌘+ can give up.
+    ///
+    /// ponytail: a small table read only by `handle`, rather than a second binding per
+    /// command everywhere. `binding(for:)` still answers with the one chord a menu item can
+    /// display, `conflicts` still compares the one the user can change, and rebinding Back
+    /// leaves the arrows where Arc has them. Ceiling: the alias is not rebindable and not
+    /// listed in the Shortcuts pane.
+    ///
+    /// A chord a text field could want must not be claimed by the browser while one is being
+    /// typed into — that is `caretAliases` below, and the guard in
+    /// `alias(_:fieldEditor:pageEditable:)`.
+    ///
+    /// ponytail: ⇧⌘[ and ⇧⌘] are matched as the glyphs a US-ish layout sends — `{` and `}`
+    /// out of `charactersIgnoringModifiers` — so on a German or French layout, where those
+    /// keys send something else entirely, the two aliases simply never fire. Nothing else
+    /// breaks: Arc's own ⌥⌘↑/↓ still walk the tabs there, and they are what the menu shows.
+    /// The upgrade path is to match the physical key instead — `event.keyCode` 33 and 30 are
+    /// `[` and `]` on every layout — which means a second kind of binding, and a keyCode
+    /// table beside the character one, for two chords nobody has yet reported missing.
+    nonisolated static let aliases: [Command: Keybinding] = [
+        .back: Keybinding("\u{F702}", .command),
+        .forward: Keybinding("\u{F703}", .command),
+        // The three every other Mac browser answers to, on top of Arc's own. ⇧⌘[ and ⇧⌘]
+        // arrive as ⌘{ and ⌘} and ⌘= is the unshifted twin of ⌘+ — all three are the shifted
+        // glyph the keyboard actually sends, folded by `Keybinding.init` the way ⌘+ has
+        // always been. Arc's ⌥⌘↑/↓ and ⌘+ are untouched and still what the menu shows.
+        .previousTab: Keybinding("{", .command),
+        .nextTab: Keybinding("}", .command),
+        .zoomIn: Keybinding("=", .command),
+        .nextFocusArea: Keybinding("\u{F709}", .shift),
+    ]
+
+    /// The alias chords a caret could want for itself. ⌘← and ⌘→ move the insertion point in
+    /// every text field on macOS, so they are the browser's only while nothing is being typed
+    /// into; ⌘{, ⌘} and ⌘= are nobody's editing keys, and holding them back while a comment
+    /// box has the focus would only mean a tab you cannot switch away from.
+    nonisolated static let caretAliases: Set<Keybinding> = [
+        Keybinding("\u{F702}", .command),
+        Keybinding("\u{F703}", .command),
+    ]
+
+    /// Which command an alias chord fires, or nil when something that types should keep the
+    /// keystroke: a field editor in the chrome (the url bar, a rename field, the find bar), or
+    /// an input, textarea or contenteditable on the page. One rule said about the two places
+    /// a caret can be — ⌘← belongs to the caret wherever there is one, and navigating away
+    /// from a half-filled form is the one outcome nobody means. Only the chords in
+    /// `caretAliases` are held back that way; ⌘{, ⌘} and ⌘= are nobody's editing keys.
+    ///
+    /// Pure, so `selfcheck --pure` can prove the guards with no page and no first responder.
+    nonisolated static func alias(_ b: Keybinding, fieldEditor: Bool,
+                                  pageEditable: Bool) -> Command? {
+        guard let hit = aliases.first(where: { $0.value == b })?.key else { return nil }
+        guard !caretAliases.contains(b) || (!fieldEditor && !pageEditable) else { return nil }
+        return hit
+    }
+
+    /// Whether one of Timo's own commands may run at all right now.
+    ///
+    /// A modal session owns the app — the "Quit Timo?" card, an alert, a print or save panel
+    /// — and nothing of Timo's may run behind one. Both routes into a command have to ask.
+    /// The key monitor still sees every keystroke a modal session gets, so ⌘W archived a tab
+    /// under the quit card's scrim and ⌘T opened one behind it; and AppKit still offers key
+    /// equivalents to the main menu while a session is up, where a closure-backed item answers
+    /// its own action — so the menu has to refuse them too (`Act.validateMenuItem`).
+    ///
+    /// Refusing rather than swallowing: the dialog in front is what the keystroke is for. The
+    /// same question `Standard.minimizeTarget` already asks for ⌘M.
+    ///
+    /// Pure, so `selfcheck --pure` proves it with no dialog on screen.
+    nonisolated static func runs(modal: Bool) -> Bool { !modal }
+
+    /// Install with:
+    ///   NSEvent.addLocalMonitorForEvents(matching: .keyDown) { Keybindings.handle($0) ? nil : $0 }
+    /// True means "consumed" — the caller must swallow the event.
+    static func handle(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, let b = Keybinding(event: event) else { return false }
+        guard runs(modal: NSApp.modalWindow != nil) else { return false }
+        guard let cmd = command(for: b), let action = actions[cmd] else {
+            return alias(b, in: event.window ?? NSApp.keyWindow)
+        }
+        // ponytail: WKWebView gives no synchronous "did the page take it?", so `.page`
+        // means "hands off whenever web content has focus" and Timo's action is simply
+        // unreachable there. Ceiling: doing better needs a JS keydown listener reporting
+        // defaultPrevented back over a message handler, i.e. an async round-trip per key.
+        if keepsKeyForResponder(b, in: event.window ?? NSApp.keyWindow) { return false }
+        action()
+        return true
+    }
+
+    /// The alias chords, tried only after the real bindings — a user who rebinds something
+    /// onto ⌘← gets what they asked for, and Arc's arrows are what is left.
+    ///
+    /// Both guards are read here, synchronously, because this monitor runs *ahead* of
+    /// AppKit's dispatch: without them Timo would win ⌘← before WebKit ever saw it, and a
+    /// user typing in a comment box would lose the box. The page's half is a flag the page
+    /// keeps up to date on its own — see `PageFocus` — rather than a round trip per key.
+    private static func alias(_ b: Keybinding, in window: NSWindow?) -> Bool {
+        // Cheapest question first: every keystroke in the app comes through here, and only
+        // two chords are worth walking the responder chain for.
+        guard aliases.values.contains(b) else { return false }
+        let r = window?.firstResponder
+        guard let cmd = alias(b, fieldEditor: r is NSText || r is NSTextView,
+                              pageEditable: focusedTab(in: window)?.editableFocused == true),
+              let action = actions[cmd] else { return false }
+        // The alias is the same command, so it obeys the same priority: someone who has given
+        // Back to the page has given it both chords, not one.
+        if priority(for: cmd) == .page, webContentHasFocus(in: window) { return false }
+        action()
+        return true
+    }
+
+    /// The tab whose page holds the keyboard, by walking up from the first responder to the
+    /// WKWebView it lives inside. Not "the window's current tab": a split view has two live
+    /// pages, and only the one being typed in may keep the chord.
+    private static func focusedTab(in window: NSWindow?) -> Tab? {
+        var view = window?.firstResponder as? NSView
+        while let v = view {
+            if let web = v as? WKWebView {
+                if let popup = WebsitePopupWindow.tab(in: window), popup.existingWeb === web { return popup }
+                return TabStore.all.lazy.flatMap(\.tabs).first { $0.existingWeb === web }
+            }
+            view = v.superview
+        }
+        return nil
+    }
+
+    /// The monitor and AppKit's menu fallback must both stand down for website priority
+    /// and text entry. Option-only bindings otherwise take characters and caret commands
+    /// from an editor (the shipped Option-D would prevent typing ∂).
+    static func keepsKeyForResponder(_ binding: Keybinding, in window: NSWindow?) -> Bool {
+        guard let command = command(for: binding)
+                ?? aliases.first(where: { $0.value == binding })?.key else { return false }
+        let functionKey = binding.key.unicodeScalars.first.map {
+            (0xF704...0xF726).contains($0.value)
+        } ?? false
+        if binding.mods.isDisjoint(with: [.command, .control]), !functionKey {
+            let responder = window?.firstResponder
+            if responder is NSText || focusedTab(in: window)?.editableFocused == true { return true }
+        }
+        return priority(for: command) == .page && webContentHasFocus(in: window)
+    }
+
+    private static func webContentHasFocus(in window: NSWindow?) -> Bool {
+        var view = window?.firstResponder as? NSView
+        while let v = view {
+            if v is WKWebView { return true }
+            view = v.superview
+        }
+        return false
+    }
+}
+
+// MARK: - Is the page being typed into
+
+/// Whether the page has a caret in something of its own — an input, a textarea, a
+/// contenteditable — kept on the Tab so a key monitor can ask synchronously.
+///
+/// WebKit has no synchronous "what is focused" API: `document.activeElement` is an
+/// `evaluateJavaScript` away, and a key monitor has to answer before the keystroke moves on.
+/// So the page reports its own focus as it changes and Swift caches the last answer — the
+/// same shape as `StatusBar`'s hovered link, and for the same reason.
+///
+/// **Per frame, not per tab.** Each frame reports about itself, so one boolean would be
+/// last-writer-wins: clicking from an iframe's field into a top-level one posts `true` from
+/// the top frame and then, one turn later, `false` from the iframe's deferred focusout — and
+/// the tab would look idle with a caret in it. So a frame identifies itself and the Tab keeps
+/// the *set* of frames reporting a caret; anything in it means "typing".
+///
+/// Its own content world, like `PictureInPicture`: `__timoEdit` is then not on the page's
+/// `window` at all, and a page cannot null out `webkit.messageHandlers` to make Timo believe
+/// its field is not focused.
+///
+/// ponytail: a token per frame and a set per tab, not a description of *what* is focused.
+/// The only question anyone asks is "would this keystroke be typing". Ceiling: focus that
+/// moves in the same turn as the keystroke is read one event late; a frame torn down without
+/// firing `pagehide` leaves its token behind until the next top-level navigation
+/// (which clears the set); and a page whose frames block user scripts reports nothing.
+@MainActor enum PageFocus {
+    static let messageName = "timoedit"
+
+    /// Out of the page's reach — see the note above.
+    static let world = WKContentWorld.world(name: "timo-edit")
+
+    /// All frames: a comment box is as likely to be in an iframe as not. `focusout` fires
+    /// *before* focus lands, so it re-reads on the next turn rather than trusting
+    /// `activeElement` mid-move; the trailing call covers a field focused before the listeners
+    /// existed (`autofocus`); `pagehide` takes the frame's token back out when the frame
+    /// goes, and `pageshow` restores it when WebKit brings back a cached document.
+    static let script = """
+    (function () {
+      if (window.__timoEdit) return; window.__timoEdit = true;
+      var frame = "f" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      var last = null;
+      var plain = " button submit reset checkbox radio file image range color hidden ";
+      function editable(el) {
+        if (!el) return false;
+        var tag = (el.tagName || "").toLowerCase();
+        if (tag === "textarea") return true;
+        if (tag === "input") {
+          return plain.indexOf(" " + ((el.type || "text").toLowerCase()) + " ") < 0;
+        }
+        return !!el.isContentEditable;
+      }
+      function post(v) {
+        if (v === last) return;
+        last = v;
+        try {
+          webkit.messageHandlers.\(messageName).postMessage({ frame: frame, editable: v });
+        } catch (e) {}
+      }
+      function send() {
+        var el = document.activeElement;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+          el = el.shadowRoot.activeElement;
+        }
+        post(editable(el));
+      }
+      document.addEventListener("focusin", send, true);
+      document.addEventListener("focusout", function () { setTimeout(send, 0); }, true);
+      window.addEventListener("pagehide", function () { post(false); });
+      window.addEventListener("pageshow", send);
+      send();
+    })();
+    """
+
+    /// One frame's report folded into the tab's set: the frame is in it while it says it has
+    /// a caret and out of it the moment it says it has not. A body that is not one of our own
+    /// messages changes nothing — leaving the set as it was is the only answer that cannot
+    /// invent a caret or take a real one away.
+    static func frames(_ body: Any, in set: Set<String>) -> Set<String> {
+        guard let msg = body as? [String: Any], let frame = msg["frame"] as? String,
+              !frame.isEmpty else { return set }
+        let editable = (msg["editable"] as? Bool) ?? (msg["editable"] as? NSNumber)?.boolValue
+        guard let editable else { return set }
+        var out = set
+        if editable { out.insert(frame) } else { out.remove(frame) }
+        return out
+    }
+}
+
+// MARK: - check
+
+extension Keybindings {
+    /// Runs `body` against a throwaway defaults suite that is deleted afterwards, with the
+    /// cache dropped on the way in and put back on the way out: nothing inside can read — or
+    /// write — the user's real preferences. Nil only when the suite cannot be made at all,
+    /// which is the one failure a caller has to report rather than swallow.
+    ///
+    /// Not private: `Standard.check` plants a customised binding through it, which is the
+    /// only honest way to assert that a customised install still passes.
+    static func withScratchDefaults<T>(_ name: String, _ body: () -> T) -> T? {
+        let suite = "timo.check.\(name).\(ProcessInfo.processInfo.processIdentifier)"
+        guard let scratch = UserDefaults(suiteName: suite) else { return nil }
+        let real = defaults
+        let realCache = cached
+        defaults = scratch
+        cached = nil
+        defer {
+            defaults = real
+            cached = realCache
+            UserDefaults.dropScratchSuite(suite)
+        }
+        return body()
+    }
+
+    /// Everything asserted here is offline, and none of it touches the user's preferences.
+    static func check() -> [(String, Bool)] {
+        withScratchDefaults("keys", checks) ?? [("scratch defaults suite is available", false)]
+    }
+
+    private static func checks() -> [(String, Bool)] {
+        let t = Keybinding("t", [.command, .shift])
+        let all = Keybinding("x", [.control, .option, .shift, .command])
+        var out: [(String, Bool)] = [
+            ("modifiers print in ⌃⌥⇧⌘ order", all.display == "⌃⌥⇧⌘X"),
+            ("a letter prints uppercase after its modifiers", t.display == "⇧⌘T"),
+            ("⌥⌘I formats the way the Develop menu shows it",
+             Keybinding("i", [.command, .option]).display == "⌥⌘I"),
+            ("an unassigned binding displays as ---", Keybinding.unassigned.display == "---"),
+            ("tab, delete and escape print as glyphs",
+             Keybinding("\t").display == "⇥" && Keybinding("\u{7f}").display == "⌫"
+                && Keybinding("\u{1b}").display == "⎋"),
+            ("return and the arrows print as glyphs",
+             Keybinding("\r").display == "⏎" && Keybinding("\u{F700}").display == "↑"
+                && Keybinding("\u{F701}").display == "↓" && Keybinding("\u{F702}").display == "←"
+                && Keybinding("\u{F703}").display == "→"),
+            ("function keys print as F1…F12",
+             Keybinding("\u{F704}").display == "F1" && Keybinding("\u{F70E}").display == "F11"),
+            ("case does not make two different bindings",
+             Keybinding("T", .command) == Keybinding("t", .command)),
+            ("backtab is stored as shift-tab", Keybinding("\u{19}", .control).display == "⌃⇧⇥"),
+            ("…and turns back into backtab for the menu",
+             Keybinding("\u{19}", .control).menuKeyEquivalent == "\u{19}"),
+            ("a shifted punctuation glyph does not also carry ⇧",
+             Keybinding("+", [.command, .shift]).display == "⌘+"),
+            ("the menu mask matches the modifiers",
+             t.menuModifierMask == [.command, .shift] && t.menuKeyEquivalent == "t"),
+            ("an unassigned binding has no SwiftUI shortcut",
+             Keybinding.unassigned.keyboardShortcut == nil && t.keyboardShortcut != nil),
+        ]
+
+        // Codable, then the same trip through UserDefaults.
+        let encoded = try? JSONEncoder().encode(t)
+        let decoded = encoded.flatMap { try? JSONDecoder().decode(Keybinding.self, from: $0) }
+        out.append(("a binding round-trips through Codable", decoded == t))
+
+        // Defaults, spot-checked against the key equivalents Menu.swift/UI.swift hardcode.
+        out += [
+            ("New Tab defaults to ⌘T", binding(for: .newTab).display == "⌘T"),
+            ("Reopen Closed Tab defaults to ⇧⌘T", binding(for: .reopenClosedTab).display == "⇧⌘T"),
+            ("Reload Ignoring Cache defaults to ⇧⌘R", binding(for: .hardReload).display == "⇧⌘R"),
+            ("Show Web Inspector defaults to ⌥⌘I", binding(for: .showWebInspector).display == "⌥⌘I"),
+            ("Enter Full Screen defaults to ⌃⌘F", binding(for: .fullScreen).display == "⌃⌘F"),
+            ("Back defaults to ⌘[", binding(for: .back).display == "⌘["),
+            ("Fill Password defaults to ⌥⌘L", binding(for: .fillPassword).display == "⌥⌘L"),
+            ("Show Library defaults to ⇧⌘L, the way Arc binds it",
+             binding(for: .showLibrary).display == "⇧⌘L"),
+            ("Pin Tab defaults to ⌘D, the way Arc binds it",
+             binding(for: .pinTab).display == "⌘D"),
+            ("Favourite Tab ships unbound, as Arc does",
+             binding(for: .favouriteTab).display == "---"),
+            ("⇧⌘D is left free", conflicts(Keybinding("d", [.command, .shift])).isEmpty),
+            ("Bookmark This Page keeps ⌥⌘D",
+             binding(for: .bookmarkPage).display == "⌥⌘D"),
+            ("Clear Tabs defaults to ⇧⌘K", binding(for: .clearTabs).display == "⇧⌘K"),
+            ("Copy Page URL defaults to ⇧⌘C", binding(for: .copyPageURL).display == "⇧⌘C"),
+            ("⌘W archives rather than closes, the way Arc names it",
+             Command.closeTab.title == "Archive Tab" && binding(for: .closeTab).display == "⌘W"),
+            ("Next and Previous Space default to ⌥⌘→ and ⌥⌘←",
+             binding(for: .nextSpace).display == "⌥⌘→"
+                && binding(for: .previousSpace).display == "⌥⌘←"),
+            ("Go to Space N defaults to ⌃N",
+             binding(for: .goToSpace1).display == "⌃1" && binding(for: .goToSpace9).display == "⌃9"),
+            ("the Tab Switcher goes forwards on ⌃⇥, not backwards",
+             binding(for: .tabSwitcher).display == "⌃⇥"
+                && binding(for: .tabSwitcherBackwards).display == "⌃⇧⇥"),
+            ("Next and Previous Tab walk the sidebar on ⌥⌘↓ and ⌥⌘↑",
+             binding(for: .nextTab).display == "⌥⌘↓"
+                && binding(for: .previousTab).display == "⌥⌘↑"),
+            ("View History defaults to ⌘Y", binding(for: .viewHistory).display == "⌘Y"),
+            ("Downloads defaults to ⇧⌘J", binding(for: .showDownloads).display == "⇧⌘J"),
+            ("Minimize defaults to ⌘M", binding(for: .minimizeWindow).display == "⌘M"),
+            ("Timo Help ships unbound, the way Safari's Help item does — ⇧⌘/ is macOS's own",
+             binding(for: .timoHelp).display == "---"),
+            ("Open File defaults to ⌘O", binding(for: .openFile).display == "⌘O"),
+            ("Save Page As defaults to ⇧⌘S, leaving ⌘S the sidebar's",
+             binding(for: .savePageAs).display == "⇧⌘S"
+                && binding(for: .toggleSidebar).display == "⌘S"),
+            ("Find Next and Previous default to ⌘G and ⇧⌘G",
+             binding(for: .findNext).display == "⌘G"
+                && binding(for: .findPrevious).display == "⇧⌘G"),
+            ("Select Tab 1 defaults to ⌘1", binding(for: .selectTab1).display == "⌘1"),
+            // The local monitor sees every keyDown in the app. If a bare keystroke ever
+            // resolved to a command, typing would stop working everywhere.
+            ("a bare letter matches no command", command(for: Keybinding("a", [])) == nil),
+            ("a bare digit matches no command", command(for: Keybinding("1", [])) == nil),
+            ("shift alone matches no command", command(for: Keybinding("A", [.shift])) == nil),
+            ("an unassigned binding matches no command", command(for: .unassigned) == nil),
+            ("Command Palette defaults to ⇧⌘P", binding(for: .commandPalette).display == "⇧⌘P"),
+            ("Zoom In defaults to ⌘+", binding(for: .zoomIn).display == "⌘+"),
+            ("Import Passwords ships unbound", binding(for: .importPasswords).display == "---"),
+            // Arc's split keys. ⌃⇧= and ⌃⇧- arrive as ⌃+ and ⌃_ because the shifted glyph
+            // already carries the shift — the same fold ⌘+ has always gone through.
+            ("Add Split View defaults to Arc's ⌃⇧=", binding(for: .addSplit).display == "⌃+"),
+            ("Remove Split defaults to Arc's ⌃⇧-", binding(for: .removeSplit).display == "⌃_"),
+            ("Next Pane defaults to ⌃⇧N", binding(for: .nextPane).display == "⌃⇧N"),
+        ]
+
+        // Conflicts.
+        out.append(("the shipped defaults do not collide with each other",
+                    Command.allCases.filter { binding(for: $0).isAssigned }
+                        .allSatisfy { conflicts(binding(for: $0)) == [$0] }))
+        // The same thing said about `defaultBinding` itself rather than about what the
+        // store hands back, so a duplicate cannot hide behind an override.
+        let shipped = Command.allCases.map(\.defaultBinding).filter(\.isAssigned)
+        out.append(("no two commands ship with the same default binding",
+                    Set(shipped).count == shipped.count))
+        out.append(("an unassigned binding conflicts with nothing",
+                    conflicts(.unassigned).isEmpty))
+        set(Keybinding("t", .command), for: .newWindow)
+        out.append(("a rebind onto another command's keys is reported",
+                    Set(conflicts(Keybinding("t", .command))) == [.newTab, .newWindow]))
+        out.append(("the override wins over the default",
+                    binding(for: .newWindow).display == "⌘T"))
+
+        // The scratch suite this check runs against is emptied when it returns and its file
+        // deleted when the run ends — see `UserDefaults.dropScratchSuite`. Only the path
+        // arithmetic is pure enough to assert here; that the file actually goes is proved by
+        // the count in ~/Library/Preferences not growing over a run.
+        out.append(("a scratch suite's file is the plist cfprefsd writes for it",
+                    UserDefaults.suitePlist("timo.check.keys.1", home: "/Users/ada")
+                        == "/Users/ada/Library/Preferences/timo.check.keys.1.plist"))
+
+        // Persistence: drop the cache so the read has to come back off the suite.
+        cached = nil
+        out.append(("an override survives a trip through UserDefaults",
+                    binding(for: .newWindow).display == "⌘T"))
+
+        // Migration: the ⌃⇥ swap and ⌘D moving from Favourite to Pin.
+        let stale: [String: Keybinding] = [
+            Command.previousTab.rawValue: Keybinding("\t", .control),
+            Command.favouriteTab.rawValue: Keybinding("d", .command),
+            Command.pinTab.rawValue: Keybinding("f", [.command, .control, .option]),
+            Command.newTab.rawValue: Keybinding("t", .command),
+        ]
+        let migrated = migrate(stale, moved: movedDefaults, from: 0)
+        // The other half of the migration: a binding saved before `reserved` refused it.
+        // Somebody who put Search Tabs on ⌘C back then still has it, and it still wins over
+        // Copy in every text field — the monitor runs ahead of AppKit.
+        let hijacked: [String: Keybinding] = [
+            Command.searchTabs.rawValue: Keybinding("c", .command),
+            Command.commandPalette.rawValue: .unassigned,
+            Command.newWindow.rawValue: Keybinding("n", [.command, .option, .shift]),
+        ]
+        let unhijacked = migrate(hijacked, moved: movedDefaults, from: 0)
+        out += [
+            ("a binding saved onto ⌘C is dropped, so Copy is the field's again",
+             unhijacked[Command.searchTabs.rawValue] == nil),
+            ("a deliberate unbinding is not a reserved chord, so it survives",
+             unhijacked[Command.commandPalette.rawValue] == .unassigned),
+            ("a chord nobody reserves is left alone",
+             unhijacked[Command.newWindow.rawValue] == Keybinding("n", [.command, .option, .shift])),
+            ("a saved binding that was only the old default is dropped",
+             migrated[Command.previousTab.rawValue] == nil
+                && migrated[Command.favouriteTab.rawValue] == nil),
+            ("a binding the user really chose is not touched",
+             migrated[Command.pinTab.rawValue] == Keybinding("f", [.command, .control, .option])),
+            ("a command whose default never moved is not touched",
+             migrated[Command.newTab.rawValue] == Keybinding("t", .command)),
+            ("migrating twice changes nothing more",
+             migrate(migrated, moved: movedDefaults, from: 0) == migrated),
+            ("every moved default is a binding the app no longer ships",
+             movedDefaults.allSatisfy { $0.key.defaultBinding != $0.value }),
+        ]
+        // …and each step runs only for a table old enough to need it, rather than every step
+        // every time: somebody already at 2 gets their table back exactly as they saved it.
+        let both = stale.merging(hijacked) { a, _ in a }
+        let from0 = migrate(both, moved: movedDefaults, from: 0)
+        let from1 = migrate(both, moved: movedDefaults, from: 1)
+        out += [
+            ("a table saved before any migration goes through both steps",
+             from0[Command.favouriteTab.rawValue] == nil
+                && from0[Command.searchTabs.rawValue] == nil),
+            ("a table already past the moved defaults keeps them, and only loses ⌘C",
+             from1[Command.favouriteTab.rawValue] == Keybinding("d", .command)
+                && from1[Command.searchTabs.rawValue] == nil),
+            ("a table at the current version is handed back untouched",
+             migrate(both, moved: movedDefaults, from: 2) == both),
+            ("whatever ran, the table is stamped at 2 and has nothing left to run",
+             migration == 2 && migrate(both, moved: movedDefaults, from: migration) == both),
+        ]
+        // And the same thing through the store, which is where it bites: a table written
+        // before this migration existed, read back once.
+        let old = Saved(bindings: [Command.searchTabs.rawValue: Keybinding("c", .command)],
+                        priorities: [:], migrated: migration - 1)
+        if let blob = try? JSONEncoder().encode(old) {
+            defaults.set(blob, forKey: storeKey)
+            cached = nil
+            out.append(("a table saved before the migration comes back with ⌘C gone",
+                        binding(for: .searchTabs) == Command.searchTabs.defaultBinding
+                            && command(for: Keybinding("c", .command)) == nil))
+        } else {
+            out.append(("a table saved before the migration comes back with ⌘C gone", false))
+        }
+
+        // Reset.
+        reset(.newWindow)
+        out.append(("reset restores the default", binding(for: .newWindow).display == "⌘N"))
+        set(.unassigned, for: .newTab)
+        out.append(("unbinding is a real choice, not a reset",
+                    binding(for: .newTab).display == "---"))
+        resetAll()
+        out.append(("reset all restores every default",
+                    binding(for: .newTab).display == "⌘T" && binding(for: .newWindow).display == "⌘N"))
+
+        // Search.
+        out += [
+            ("an empty query lists everything", search("  ").count == Command.allCases.count),
+            ("search by name", search("new tab").first == .newTab),
+            ("search by name is fuzzy and case-insensitive", search("RLDIGN").first == .hardReload),
+            ("search by shortcut glyphs", search("⌘T").contains(.newTab)),
+            ("search by spelled-out shortcut", search("cmd t").contains(.newTab)),
+            ("search by shortcut with a plus", search("command+t").contains(.newTab)),
+            ("every spelling of a shortcut ranks the same command first",
+             search("⌘T").first == .newTab && search("cmd t").first == .newTab
+                && search("command+t").first == .newTab),
+            ("…including the option key's three names",
+             search("⌥⌘i").first == .showWebInspector
+                && search("option cmd i").first == .showWebInspector
+                && search("alt+command+i").first == .showWebInspector),
+            ("modifiers are order-insensitive in a query",
+             search("shift cmd t").contains(.reopenClosedTab)
+                && search("cmd shift t").contains(.reopenClosedTab)),
+            ("a shortcut query does not return the wrong modifiers",
+             !search("cmd t").contains(.reopenClosedTab)),
+            ("named keys can be typed", search("ctrl tab").contains(.tabSwitcher)),
+            ("a modifiers-only query lists everything using them",
+             search("⌥⌘").contains(.showWebInspector) && !search("⌥⌘").contains(.newTab)),
+            ("a plain word is not mistaken for a shortcut",
+             !search("options").contains(.newTab)),
+            ("a query matching nothing returns nothing", search("zzzz").isEmpty),
+        ]
+
+        // Reserved.
+        out += [
+            ("⌘Q is refused", reserved(Keybinding("q", .command)) != nil),
+            ("⌘⇧Q is refused", reserved(Keybinding("q", [.command, .shift])) != nil),
+            ("⌘⇥ is refused", reserved(Keybinding("\t", .command)) != nil),
+            ("⌘Space is refused", reserved(Keybinding(" ", .command)) != nil),
+            ("a bare key with no ⌘/⌃/⌥ is refused", reserved(Keybinding("t")) != nil),
+            ("a bare function key is allowed", reserved(Keybinding("\u{F704}")) == nil),
+            ("an ordinary binding is allowed", reserved(Keybinding("t", .command)) == nil),
+            ("unassigned is not reserved", reserved(.unassigned) == nil),
+            // Rebinding one of these would take the keystroke off every text field and every
+            // page in the app, because the monitor runs ahead of the menu.
+            ("⌘C, ⌘V, ⌘X, ⌘Z and ⌘A are refused: they are the page's and the field's",
+             ["c", "v", "x", "z", "a"].allSatisfy { reserved(Keybinding($0, .command)) != nil }),
+            ("…and so is ⌥⇧⌘V",
+             reserved(Keybinding("v", [.command, .option, .shift])) != nil),
+            // ⇧⌘/ reaches the app as ⌘?, the shifted glyph carrying its own shift.
+            ("⌘? is refused: ⇧⌘/ opens the Help menu's search in every Mac app",
+             reserved(Keybinding("?", [.command, .shift])) != nil
+                && reserved(Keybinding("?", .command)) != nil),
+            ("a chord Timo itself ships on is not reserved — that is a conflict to warn about, not a refusal",
+             reserved(Keybinding("t", .command)) == nil
+                && reserved(Keybinding("l", .command)) == nil),
+        ]
+
+        // A modal session owns the app: neither route into a command may fire behind one.
+        out += [
+            ("nothing of Timo's own runs while a modal session is up — the quit card, an "
+             + "alert, a save panel — so ⌘W cannot archive a tab under the scrim",
+             !runs(modal: true)),
+            ("with no session up, commands run as usual", runs(modal: false)),
+        ]
+
+        // Priority.
+        out.append(("commands default to browser priority", priority(for: .find) == .browser))
+        setPriority(.page, for: .find)
+        cached = nil
+        out.append(("page priority round-trips through UserDefaults", priority(for: .find) == .page))
+        out.append(("priority is per command", priority(for: .newTab) == .browser))
+        reset(.find)
+        out.append(("reset clears the priority too", priority(for: .find) == .browser))
+
+        // Arc's second chord for Back and Forward, and the two guards on it.
+        let left = Keybinding("\u{F702}", .command), right = Keybinding("\u{F703}", .command)
+        out += [
+            ("Back and Forward also answer to ⌘← and ⌘→",
+             aliases[.back]?.display == "⌘←" && aliases[.forward]?.display == "⌘→"),
+            ("the arrows are a second chord, not a rebind: ⌘[ and ⌘] still stand",
+             binding(for: .back).display == "⌘[" && binding(for: .forward).display == "⌘]"),
+            ("no command ships bound to the alias chords, so nothing is shadowed",
+             aliases.values.allSatisfy { command(for: $0) == nil }),
+            ("⌥⌘← is still Previous Space, not Back",
+             command(for: Keybinding("\u{F702}", [.command, .option])) == .previousSpace
+                && command(for: Keybinding("\u{F703}", [.command, .option])) == .nextSpace),
+            ("with nothing typing, ⌘← goes back and ⌘→ goes forward",
+             alias(left, fieldEditor: false, pageEditable: false) == .back
+                && alias(right, fieldEditor: false, pageEditable: false) == .forward),
+            ("a field editor in the chrome keeps ⌘← for the caret",
+             alias(left, fieldEditor: true, pageEditable: false) == nil
+                && alias(right, fieldEditor: true, pageEditable: false) == nil),
+            ("a text field on the page keeps it too — navigating out of a half-typed form is the one outcome nobody means",
+             alias(left, fieldEditor: false, pageEditable: true) == nil
+                && alias(right, fieldEditor: false, pageEditable: true) == nil),
+            ("both at once is still nothing",
+             alias(left, fieldEditor: true, pageEditable: true) == nil),
+            ("a chord that is not an alias is not one however the guards stand",
+             alias(Keybinding("t", .command), fieldEditor: false, pageEditable: false) == nil),
+            // The standard chords Arc's own keys had spent elsewhere, answered as second
+            // chords. ⇧⌘[ sends "{", ⇧⌘] sends "}" and ⌘= is ⌘+ without the shift — on a
+            // layout that sends those glyphs, which is the ceiling noted on `aliases`.
+            ("⇧⌘[ and ⇧⌘] walk the tabs on a layout that sends { and }",
+             alias(Keybinding("{", .command), fieldEditor: false, pageEditable: false) == .previousTab
+                && alias(Keybinding("}", .command), fieldEditor: false,
+                         pageEditable: false) == .nextTab),
+            ("…and keep working while a page's text box has the caret: they are not editing keys",
+             alias(Keybinding("}", .command), fieldEditor: true, pageEditable: true) == .nextTab),
+            ("⌘= zooms in as well as ⌘+",
+             alias(Keybinding("=", .command), fieldEditor: false, pageEditable: false) == .zoomIn),
+            ("the arrows are still the only chords a caret takes back",
+             caretAliases == [Keybinding("\u{F702}", .command), Keybinding("\u{F703}", .command)]),
+            ("no alias chord is one a command already ships on",
+             aliases.values.allSatisfy { command(for: $0) == nil }),
+            ("no two commands share an alias chord",
+             Set(aliases.values).count == aliases.count),
+        ]
+
+        // The page's half of the guard, as it arrives over the message handler. Per frame,
+        // because each frame only ever speaks for itself.
+        func report(_ frame: String, _ editable: Bool, _ set: Set<String>) -> Set<String> {
+            PageFocus.frames(["frame": frame, "editable": editable], in: set)
+        }
+        let top = "f-top", inner = "f-iframe"
+        out += [
+            ("a frame reporting a caret puts itself in the set",
+             report(top, true, []) == [top]),
+            ("…and reporting a blur takes itself back out",
+             report(top, false, [top]).isEmpty),
+            // The ordering that a single flag got wrong: focus moves from an iframe's field to
+            // a top-level one, and the iframe's deferred focusout lands *after* the top
+            // frame's focusin.
+            ("a frame's blur does not clear another frame's caret", {
+                var live: Set<String> = [inner]        // typing in the iframe
+                live = report(top, true, live)         // clicked into a top-level field
+                live = report(inner, false, live)      // the iframe's deferred focusout
+                return live == [top]
+            }()),
+            ("two frames with carets both have to go quiet before the tab is idle", {
+                var live = report(top, true, [])
+                live = report(inner, true, live)
+                live = report(top, false, live)
+                return live == [inner]
+            }()),
+            ("the same frame saying it twice is still one frame",
+             report(top, true, [top]) == [top]),
+            ("a body that is not one of our messages changes nothing",
+             PageFocus.frames("yes", in: [top]) == [top]
+                && PageFocus.frames(["frame": top], in: [top]) == [top]
+                && PageFocus.frames(["editable": true], in: [top]) == [top]
+                && PageFocus.frames(["frame": "", "editable": true], in: []).isEmpty),
+            ("the script identifies its frame and uses the page-cache lifecycle for focus",
+             PageFocus.script.contains("focusin") && PageFocus.script.contains("focusout")
+                && PageFocus.script.contains("isContentEditable")
+                && PageFocus.script.contains("pagehide") && PageFocus.script.contains("pageshow")
+                && !PageFocus.script.contains("\"unload\"")
+                && PageFocus.script.contains("frame: frame")),
+        ]
+
+        // Routing, minus the NSEvent (which needs an app to be meaningful).
+        out.append(("a binding resolves to its command", command(for: Keybinding("t", .command)) == .newTab))
+        out.append(("an unassigned binding resolves to nothing", command(for: .unassigned) == nil))
+        out.append(("an unbound key resolves to nothing",
+                    command(for: Keybinding("j", [.command, .control, .option])) == nil))
+
+        resetAll()
+        return out
+    }
+}

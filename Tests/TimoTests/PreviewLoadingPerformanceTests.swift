@@ -1,0 +1,518 @@
+import AppKit
+import Network
+import XCTest
+import WebKit
+@testable import timo
+
+private final class PreviewServer: @unchecked Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "timo-preview-load-fixture")
+    private let lock = NSLock()
+    private var hits = 0
+    private var paths: [String] = []
+    private var fragments = 0
+    var requests: Int { lock.withLock { hits } }
+    var requestedPaths: [String] { lock.withLock { paths } }
+    var requestFragments: Int { lock.withLock { fragments } }
+
+    init(body: String = "<html><body><h1>A preview</h1><p>Preview content</p></body></html>") throws {
+        listener = try NWListener(using: .tcp, on: .any)
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
+            connection.start(queue: self.queue)
+            self.receiveRequest(on: connection, body: body)
+        }
+    }
+
+    private func receiveRequest(on connection: NWConnection, body: String, buffered: Data = Data()) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
+            guard let self, let data, !data.isEmpty, error == nil else { connection.cancel(); return }
+            defer { self.lock.withLock { self.fragments += 1 } }
+            let received = buffered + data
+            // Wait for every header, not just the request line. Replying and closing
+            // with unread request bytes can reset the connection during HTML parsing,
+            // leaving a title visible while the redirect script never executes.
+            guard received.range(of: Data("\r\n\r\n".utf8)) != nil,
+                  let lineEnd = received.range(of: Data("\r\n".utf8)) else {
+                if done { connection.cancel() }
+                else { self.receiveRequest(on: connection, body: body, buffered: received) }
+                return
+            }
+            let line = String(decoding: received[..<lineEnd.lowerBound], as: UTF8.self)
+            let path = line.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+            self.lock.withLock {
+                self.hits += 1
+                self.paths.append(path)
+            }
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+            connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in connection.cancel() })
+        }
+    }
+
+    func start() async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .ready:
+                    guard let port = self?.listener.port else { return }
+                    self?.listener.stateUpdateHandler = nil
+                    continuation.resume(returning: URL(string: "http://127.0.0.1:\(port.rawValue)")!)
+                case .failed(let error):
+                    self?.listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default: break
+                }
+            }
+            listener.start(queue: queue)
+        }
+    }
+    func stop() { listener.cancel() }
+}
+
+@MainActor final class PreviewLoadingPerformanceTests: XCTestCase {
+    private var previousBatteryMode: BatterySaver.Mode?
+    override func setUp() async throws {
+        TestEnvironment.prepare()
+        previousBatteryMode = BatterySaver.shared.mode
+        BatterySaver.shared.setMode(.off)
+    }
+    override func tearDown() async throws {
+        if let previousBatteryMode { BatterySaver.shared.setMode(previousBatteryMode) }
+    }
+
+    private func withApplicationLoop(_ body: () async throws -> Void) async throws {
+        // Inheriting .prohibited from an earlier fixture fails once run() turns the
+        // process regular; admit an explicit policy and restore it after the join.
+        let policy = NSApplication.shared.activationPolicy()
+        defer { NSApp.setActivationPolicy(policy) }
+        let loop = try await NativeFixtureApplicationLoop.acquire(activationPolicy: .accessory)
+        var failure: (any Error)?
+        do {
+            try await compatibilityWait { try loop.isReadyForInteraction() }
+            try await body()
+        } catch { failure = error }
+        do { try await loop.close() }
+        catch {
+            if failure == nil { failure = error }
+            else { XCTFail("Preview AppKit loop cleanup also failed: \(error)") }
+        }
+        if let failure { throw failure }
+    }
+
+    func testFixtureWaitsForCompleteRequestHeaders() async throws {
+        let server = try PreviewServer()
+        let base = try await server.start()
+        let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: UInt16(base.port!))!, using: .tcp)
+        defer { connection.cancel(); server.stop() }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    connection.stateUpdateHandler = nil
+                    continuation.resume()
+                case .failed(let error):
+                    connection.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default: break
+                }
+            }
+            connection.start(queue: DispatchQueue(label: "timo-preview-request-fragments"))
+        }
+        connection.stateUpdateHandler = nil
+        try await send("GET /next HTTP/1.1\r\n", to: connection)
+        try await compatibilityWait { server.requestFragments > 0 }
+        guard server.requests == 0 else {
+            return XCTFail("The fixture must consume the full request headers before replying and closing")
+        }
+        try await send("Host: localhost\r\nConnection: close\r\n\r\n", to: connection)
+        try await compatibilityWait { server.requests == 1 }
+        XCTAssertEqual(server.requestedPaths, ["/next"])
+    }
+
+    private func send(_ text: String, to connection: NWConnection) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            connection.send(content: Data(text.utf8), completion: .contentProcessed { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            })
+        }
+    }
+
+    func testDeferredFirstPaintStillProducesOneCompletedImage() async throws {
+        try await withApplicationLoop {
+            let server = try PreviewServer(body: """
+            <title>Deferred article</title><body style='margin:0;background:white'><script>
+            setTimeout(() => { document.body.innerHTML = '<div style="height:240px;background:#1976d2">Deferred article</div><div style="height:240px;background:#e53935"></div><div style="height:240px;background:#43a047"></div>'; }, 1000);
+            </script></body>
+            """)
+            let warm = try PreviewServer(body: "<body style='margin:0'><div style='height:240px;background:#1976d2'>Warm</div>"
+                + "<div style='height:240px;background:#e53935'></div><div style='height:240px;background:#43a047'></div></body>")
+            let base = try await server.start(), warmBase = try await warm.start()
+            let previews = Previews(), tab = Tab(isPrivate: true)
+            let enabled = Previews.enabled
+            Previews.enabled = true
+            defer { previews.cancel(); tab.tearDown(); server.stop(); warm.stop(); Previews.enabled = enabled }
+            // The budget starts at load, so a cold WebContent launch on a slow runner can
+            // spend it before the deferred page's timer even starts. Admit the reused
+            // preview renderer by its own loaded document, not by the paint budget being
+            // measured, then measure as before.
+            previews.request(warmBase, from: tab)
+            try await compatibilityWait {
+                NSApp.windows.contains { ($0.contentView as? WKWebView).map { $0.url?.port == warmBase.port && !$0.isLoading } ?? false }
+            }
+            previews.request(base, from: tab)
+            let deadline = ContinuousClock.now + .seconds(6)
+            while previews.current?.image == nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertNotNil(previews.current?.image, "A blank first capture must retry while the page can still paint within its budget")
+            XCTAssertEqual(previews.current?.loading, false)
+        }
+    }
+
+    func testSnapshotFromBeforeAClientRedirectCannotPublishOrCache() async throws {
+        try await withApplicationLoop {
+            let server = try PreviewServer(body: "<title>Redirect fixture</title><body>Article</body>")
+            let base = try await server.start()
+            let final = base.appendingPathComponent("final")
+            func image(_ first: NSColor) -> NSImage {
+                let image = NSImage(size: .init(width: 120, height: 120))
+                image.lockFocus()
+                for (index, color) in [first, NSColor.systemGreen, NSColor.systemBlue].enumerated() {
+                    color.setFill(); NSRect(x: 0, y: index * 40, width: 120, height: 40).fill()
+                }
+                image.unlockFocus()
+                return image
+            }
+            let oldImage = image(.systemRed), finalImage = image(.systemOrange)
+            var captures = 0
+            let previews = Previews(snapshotCapture: { web in
+                captures += 1
+                if captures == 1 {
+                    web.load(URLRequest(url: final))
+                    try? await compatibilityWait { web.url == final && !web.isLoading }
+                    return oldImage
+                }
+                return finalImage
+            })
+            let tab = Tab(isPrivate: true), enabled = Previews.enabled
+            Previews.enabled = true
+            defer { previews.cancel(); tab.tearDown(); server.stop(); Previews.enabled = enabled }
+            previews.request(base.appendingPathComponent("first"), from: tab)
+            try await compatibilityWait { previews.current?.image != nil }
+            XCTAssertTrue(previews.current?.image === finalImage, "A redirect during capture must reject the previous document's pixels")
+            XCTAssertEqual(captures, 2)
+        }
+    }
+
+    func testPreviewHostCannotAppearOrInterceptClicksWhenMovedOntoScreen() async throws {
+        try await withApplicationLoop { try await checkPreviewHost() }
+    }
+
+    private func checkPreviewHost() async throws {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        let server = try PreviewServer(body: """
+        <title>Hidden preview</title><body style='margin:0'>
+        <div style='height:240px;background:#1976d2'>Preview content</div>
+        <div style='height:240px;background:#e53935'></div>
+        <div style='height:240px;background:#43a047'></div></body>
+        """)
+        let base = try await server.start(), previews = Previews(), tab = Tab(isPrivate: true)
+        let enabled = Previews.enabled
+        Previews.enabled = true
+        var host: NSWindow?
+        defer {
+            previews.cancel(); tab.tearDown(); server.stop(); Previews.enabled = enabled
+            host?.isReleasedWhenClosed = false
+            host?.contentView = nil; host?.close()
+        }
+        previews.request(base, from: tab)
+        let deadline = ContinuousClock.now + .seconds(12)
+        while ContinuousClock.now < deadline {
+            host = NSApp.windows.first { ($0.contentView as? WKWebView)?.url?.port == base.port }
+            if previews.current?.image != nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let window = try XCTUnwrap(host)
+        XCTAssertNotNil(previews.current?.image, "An invisible host must still produce page snapshots")
+        let screen = try XCTUnwrap(NSScreen.main)
+        // Model macOS relocating an offscreen window after a display/Space change.
+        window.setFrameOrigin(screen.visibleFrame.origin)
+        window.orderFront(nil)
+        XCTAssertTrue(window.isVisible, "WebKit retains an ordered host")
+        XCTAssertEqual(window.alphaValue, 0, "Relocation must never reveal a white window")
+        XCTAssertTrue(window.ignoresMouseEvents, "The renderer must never intercept desktop clicks")
+        XCTAssertFalse(window.canBecomeKey)
+        XCTAssertFalse(window.canBecomeMain)
+        XCTAssertTrue(window.isExcludedFromWindowsMenu)
+        XCTAssertTrue(window.collectionBehavior.contains(.ignoresCycle))
+        XCTAssertFalse(window.isRestorable)
+
+        previews.cancel()
+        let blankDeadline = ContinuousClock.now + .seconds(5)
+        let web = try XCTUnwrap(window.contentView as? WKWebView)
+        while (web.url?.absoluteString != "about:blank" || web.isLoading), ContinuousClock.now < blankDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(web.url?.absoluteString, "about:blank")
+        XCTAssertEqual(window.alphaValue, 0, "The reusable blank host must also remain invisible")
+        XCTAssertTrue(window.ignoresMouseEvents)
+    }
+
+    func testCancellationUnloadsThePreviewDocument() async throws {
+        try await withApplicationLoop { try await checkUnloadsDocument(cachedReplacement: false) }
+    }
+
+    func testCachedReplacementUnloadsThePreviousPreviewDocument() async throws {
+        try await withApplicationLoop { try await checkUnloadsDocument(cachedReplacement: true) }
+    }
+
+    func testSourceTeardownUnloadsOnlyItsOwnPreview() async throws {
+        try await withApplicationLoop { try await checkUnloadsDocument(cachedReplacement: false, ownerTeardown: true) }
+    }
+
+    private func checkUnloadsDocument(cachedReplacement: Bool, ownerTeardown: Bool = false) async throws {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        let server = try PreviewServer(body: "<title>Running preview</title><script>window.ticks=0;setInterval(()=>window.ticks++,20)</script>")
+        let base = try await server.start()
+        let previews = ownerTeardown ? Previews.shared : Previews()
+        let tab = Tab(isPrivate: true)
+        let enabled = Previews.enabled
+        Previews.enabled = true
+        var host: NSWindow?
+        defer {
+            previews.cancel(); tab.tearDown(); server.stop(); Previews.enabled = enabled
+            // The singleton keeps its reusable, blank page until this test process exits.
+            if !ownerTeardown {
+                host?.isReleasedWhenClosed = false
+                host?.contentView = nil; host?.close()
+            }
+        }
+        let cachedURL = base.appendingPathComponent("cached")
+        var cached = Previews.Preview(url: cachedURL)
+        cached.image = NSImage(size: NSSize(width: 10, height: 10))
+        previews.publish(cached, for: previews.begin())
+        previews.request(base.appendingPathComponent("running"), from: tab)
+        let deadline = ContinuousClock.now + .seconds(8)
+        var page: WKWebView?
+        while ContinuousClock.now < deadline {
+            host = NSApp.windows.first { ($0.contentView as? WKWebView)?.url?.port == base.port }
+            page = host?.contentView as? WKWebView
+            if page?.title == "Running preview", page?.isLoading == false { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let web = try XCTUnwrap(page)
+        XCTAssertEqual(web.title, "Running preview")
+        let requestsBeforeReplacement = server.requests
+        if cachedReplacement { previews.request(cachedURL, from: tab) }
+        else if ownerTeardown {
+            let other = Tab(isPrivate: true)
+            other.tearDown()
+            XCTAssertEqual(previews.current?.url, base.appendingPathComponent("running"), "Another tab's teardown must preserve this preview")
+            tab.tearDown()
+        } else { previews.cancel() }
+        let measure = ProcessInfo.processInfo.environment["TIMO_LIFECYCLE_MEASURE"] == "1"
+        if measure {
+            try await Task.sleep(for: .seconds(30))
+            let before = (try await web.evaluateJavaScript("window.ticks || 0")) as? Int ?? 0
+            try await Task.sleep(for: .seconds(3))
+            let after = (try await web.evaluateJavaScript("window.ticks || 0")) as? Int ?? 0
+            print("LIFECYCLE preview cachedReplacement=\(cachedReplacement) ownerTeardown=\(ownerTeardown) timer callbacks after 30s settle, 3s sample: \(after - before)")
+        }
+        // URL changes before the old JavaScript context has necessarily gone away.
+        // Wait for the replacement document, rather than treating URL KVO as completion.
+        let settle = ContinuousClock.now + .seconds(8)
+        var timerType: String?
+        while ContinuousClock.now < settle {
+            if web.url?.absoluteString == "about:blank", !web.isLoading {
+                timerType = try await web.evaluateJavaScript("typeof window.ticks") as? String
+                if timerType == "undefined" { break }
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(web.url?.absoluteString, "about:blank", "Dismissal must unload timers/media, not only stop an in-flight load")
+        XCTAssertTrue(host?.contentView === web, "Cancellation should preserve the reusable preview WebView")
+        if cachedReplacement {
+            XCTAssertEqual(previews.current?.url, cachedURL)
+            XCTAssertNotNil(previews.current?.image)
+            XCTAssertEqual(server.requests, requestsBeforeReplacement, "The cached card must not reload its destination")
+        }
+        else { XCTAssertNil(previews.current) }
+        XCTAssertEqual(timerType, "undefined")
+    }
+
+    func testRetiredBlankNavigationAndFrameCannotMutateNewPreview() async throws {
+        try await withApplicationLoop { try await checkRetiredBlankNavigationAndFrame() }
+    }
+
+    private func checkRetiredBlankNavigationAndFrame() async throws {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        XCTAssertTrue(NSApp.isRunning,
+                      "Preview navigation requires an admitted AppKit loop before WebKit starts")
+        let server = try PreviewServer(body: """
+        <title>Current preview</title><body>Fixture<script>
+        window.redirectAttempted = location.pathname === '/next';
+        if (window.redirectAttempted) {
+            location.replace('/final');
+            window.redirectReturned = true;
+        }
+        </script></body>
+        """)
+        let base = try await server.start(), previews = Previews(), tab = Tab(isPrivate: true)
+        let enabled = Previews.enabled
+        Previews.enabled = true
+        var host: NSWindow?
+        defer {
+            previews.cancel(); tab.tearDown(); server.stop(); Previews.enabled = enabled
+            host?.isReleasedWhenClosed = false
+            host?.contentView = nil; host?.close()
+        }
+        previews.request(base.appendingPathComponent("first"), from: tab)
+        let deadline = ContinuousClock.now + .seconds(8)
+        while ContinuousClock.now < deadline {
+            host = NSApp.windows.first { ($0.contentView as? WKWebView)?.url?.port == base.port }
+            if (host?.contentView as? WKWebView)?.isLoading == false { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let web = try XCTUnwrap(host?.contentView as? WKWebView)
+        let blank = try XCTUnwrap(web.load(URLRequest(url: URL(string: "about:blank")!)))
+        let next = base.appendingPathComponent("next")
+        previews.request(next, from: tab)
+        let nextDeadline = ContinuousClock.now + .seconds(8)
+        while web.url != base.appendingPathComponent("final") || web.isLoading
+                || previews.current?.title != "Current preview" {
+            guard ContinuousClock.now < nextDeadline else {
+                let document = try? await web.evaluateJavaScript("JSON.stringify({url:location.href,ready:document.readyState,visibility:document.visibilityState,redirectAttempted:window.redirectAttempted,redirectReturned:window.redirectReturned,script:document.scripts[0]?.textContent})")
+                return XCTFail("Replacement preview did not load: url=\(web.url?.absoluteString ?? "nil") loading=\(web.isLoading) webTitle=\(web.title ?? "nil") previewTitle=\(previews.current?.title ?? "nil") paths=\(server.requestedPaths) appRunning=\(NSApp.isRunning) appActive=\(NSApp.isActive) document=\(String(describing: document))")
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let pageHandler = try await web.evaluateJavaScript("typeof window.webkit?.messageHandlers?.timopreviewmeta") as? String
+        XCTAssertEqual(pageHandler, "undefined", "Previewed pages must not be able to fabricate native metadata")
+        // An about:blank child provides an actual WKScriptMessage with a blank
+        // originating frame while the containing WebView already has a new URL.
+        // The handler exists only in the metadata producer's isolated world.
+        web.callAsyncJavaScript("""
+        var f = document.createElement('iframe'); document.body.appendChild(f);
+        f.contentWindow.webkit.messageHandlers.timopreviewmeta.postMessage('<title>Stale blank</title>'); return true;
+        """, arguments: [:], in: nil, in: WKContentWorld.world(name: "TimoPreviewMetadata"), completionHandler: nil)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertNotEqual(previews.current?.title, "Stale blank")
+        var pending = Previews.Preview(url: next)
+        pending.title = "Current preview"
+        previews.publish(pending, for: previews.begin())
+        web.navigationDelegate?.webView?(web, didFail: blank, withError: NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled))
+        XCTAssertEqual(previews.current?.loading, true, "A retired unload must not finish the new request")
+    }
+
+    func testProfileReplacementReleasesPreviousPreviewViews() async throws {
+        try await withApplicationLoop { try await checkProfileReplacement() }
+    }
+
+    private func checkProfileReplacement() async throws {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        final class WeakView {
+            weak var value: WKWebView?
+            init(_ value: WKWebView) { self.value = value }
+        }
+        let server = try PreviewServer(), base = try await server.start()
+        let previews = Previews()
+        let enabled = Previews.enabled
+        Previews.enabled = true
+        var host: NSWindow?
+        defer {
+            previews.cancel(); server.stop(); Previews.enabled = enabled
+            host?.isReleasedWhenClosed = false
+            host?.contentView = nil; host?.close()
+        }
+        let measure = ProcessInfo.processInfo.environment["TIMO_LIFECYCLE_MEASURE"] == "1"
+        var previous: [WeakView] = []
+        for index in 0..<(measure ? 10 : 3) {
+            autoreleasepool {
+                if let web = host?.contentView as? WKWebView {
+                    previous.append(WeakView(web))
+                }
+            }
+            // Private tabs normalize to Profile.incognito.id. Alternate with the
+            // isolated default profile so each request really replaces the view.
+            let tab = Tab(isPrivate: index.isMultiple(of: 2))
+            defer { tab.tearDown() }
+            let url = base.appendingPathComponent("profile-\(index)")
+            previews.request(url, from: tab)
+            let deadline = ContinuousClock.now + .seconds(8)
+            while ContinuousClock.now < deadline {
+                let loaded = autoreleasepool {
+                    host = NSApp.windows.first { ($0.contentView as? WKWebView)?.url == url } ?? host
+                    guard let web = host?.contentView as? WKWebView else { return false }
+                    return web.url == url && !web.isLoading
+                }
+                if loaded { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            autoreleasepool {
+                let web = host?.contentView as? WKWebView
+                XCTAssertEqual(web?.url, url)
+                if let previous = previous.last?.value {
+                    XCTAssertFalse(web === previous, "This fixture must actually replace the profile's view")
+                }
+            }
+        }
+        previews.cancel()
+        if measure { try await Task.sleep(for: .seconds(30)) }
+        let deadline = ContinuousClock.now + .seconds(3)
+        while previous.contains(where: { $0.value != nil }), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let retained = previous.filter { $0.value != nil }.count
+        print("LIFECYCLE replaced preview WebViews retained: \(retained)/\(previous.count), settling: \(measure ? 30 : 0)s")
+        XCTAssertEqual(retained, 0, "Changing profiles must release the previous profile's preview view")
+    }
+
+    func testBriefHoverDoesNotVisitDestinationButSettledHoverDoes() async throws {
+        try await withApplicationLoop { try await checkBriefHover() }
+    }
+
+    private func checkBriefHover() async throws {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        guard NSApp.isRunning else {
+            return XCTFail("Preview WebKit work requires an admitted AppKit application loop")
+        }
+        let server = try PreviewServer(), base = try await server.start()
+        let debounce = DebounceFixture()
+        let previews = Previews(debounceSleep: debounce.sleep), tab = Tab(isPrivate: true)
+        let enabled = Previews.enabled
+        let batteryMode = BatterySaver.shared.mode
+        Previews.enabled = true
+        BatterySaver.shared.setMode(.off)
+        var host: NSWindow?
+        defer {
+            previews.cancel(); debounce.finish(); tab.tearDown(); server.stop()
+            Previews.enabled = enabled; BatterySaver.shared.setMode(batteryMode)
+            host?.isReleasedWhenClosed = false
+            host?.contentView = nil; host?.close()
+        }
+        previews.request(base.appendingPathComponent("brief"), from: tab)
+        try await debounce.waitUntil { debounce.count == 1 }
+        previews.cancel()
+        debounce.release(0)
+        try await debounce.waitUntil { debounce.completed.contains(0) }
+        XCTAssertEqual(server.requestedPaths, [], "Moving past a link must not start a page load")
+
+        let settled = base.appendingPathComponent("settled")
+        previews.request(settled, from: tab)
+        try await debounce.waitUntil { debounce.count == 2 }
+        XCTAssertEqual(server.requestedPaths, [], "A pending hover must stay behind the debounce gate")
+        debounce.release(1)
+        try await debounce.waitUntil {
+            host = NSApp.windows.first { ($0.contentView as? WKWebView)?.url?.port == base.port }
+            return server.requestedPaths.contains("/settled")
+        }
+        XCTAssertFalse(server.requestedPaths.contains("/brief"), "Canceled hovers must never reach the server")
+        XCTAssertTrue(server.requestedPaths.contains("/settled"), "A deliberate hover still loads its preview")
+    }
+}

@@ -1,0 +1,417 @@
+import SwiftUI
+
+/// A stable two-colour base and optional third-colour overlay. Animating its components keeps the visible wash alive
+/// through both gesture landing and an interrupted switch, without removing a gradient.
+struct ThemeWash: VectorArithmetic {
+    private var values: [Double]
+
+    init(colors: [ThemeColor], strength: Double, opacity: Double, grain: Double, dark: Bool = false) {
+        let colors = colors.isEmpty ? [ThemeColor(red: 0.5, green: 0.5, blue: 0.5)] : colors
+        values = []
+        // Preserve the same evenly spaced gradient for one, two, or three colours.
+        for position in [0.0, 0.5, 1.0] {
+            let index = position * Double(colors.count - 1)
+            let low = Int(index), high = min(low + 1, colors.count - 1), f = index - Double(low)
+            let a = colors[low].ground(strength: strength, dark: dark), b = colors[high].ground(strength: strength, dark: dark)
+            values += [a.red + (b.red - a.red) * f, a.green + (b.green - a.green) * f,
+                       a.blue + (b.blue - a.blue) * f]
+        }
+        values += [opacity, grain, colors.count == 3 ? 1 : 0]
+    }
+
+    /// Resolve gesture endpoints from their captured Spaces, even before SwiftUI has
+    /// rendered the first input sample or the newly selected page.
+    static func space(_ space: Space?, fallback: Profile, profiles: [Profile], systemDark: Bool) -> Self {
+        // Incognito is an opaque black surface, independent of the desktop behind
+        // the window and the neutral mixing used by ordinary Space themes.
+        if fallback.id == Profile.incognito.id {
+            return Self(colors: [ThemeColor(red: 0, green: 0, blue: 0)],
+                        strength: 1, opacity: 1, grain: 0)
+        }
+        let dark = space?.appearance == "dark" ? true : space?.appearance == "light" ? false : systemDark
+        var palette = space.map(Spaces.palette(of:)) ?? []
+        if palette.isEmpty {
+            let owner = space.flatMap { item in profiles.first { $0.id == item.profileID } } ?? fallback
+            palette = [ThemeColor(hex: owner.colorHex) ?? ThemeColor(red: 0.5, green: 0.5, blue: 0.5)]
+        }
+        let strength = space?.tint ?? Look.defaultTint
+        return Self(colors: palette, strength: strength,
+                    opacity: Look.groundOpacity(dark: dark, strength: strength),
+                    grain: space?.grain ?? 0, dark: dark)
+    }
+
+    private init(values: [Double]) { self.values = values }
+    static var zero: Self { Self(values: Array(repeating: 0, count: 12)) }
+    static func + (lhs: Self, rhs: Self) -> Self { Self(values: zip(lhs.values, rhs.values).map(+)) }
+    static func - (lhs: Self, rhs: Self) -> Self { Self(values: zip(lhs.values, rhs.values).map(-)) }
+    mutating func scale(by rhs: Double) { values = values.map { $0 * rhs } }
+    var magnitudeSquared: Double { values.reduce(0) { $0 + $1 * $1 } }
+
+    var colors: [ThemeColor] {
+        stride(from: 0, to: 9, by: 3).map { ThemeColor(red: values[$0], green: values[$0 + 1], blue: values[$0 + 2]) }
+    }
+    var opacity: Double { values[9] }
+    var grain: Double { values[10] }
+    var overlay: Double { values[11] }
+    var baseEnd: ThemeColor {
+        let a = colors[2], b = colors[1]
+        return ThemeColor(red: a.red + (b.red - a.red) * overlay,
+                          green: a.green + (b.green - a.green) * overlay,
+                          blue: a.blue + (b.blue - a.blue) * overlay)
+    }
+
+    func mixed(towards target: Self, fraction: Double) -> Self {
+        var delta = target - self
+        delta.scale(by: min(max(fraction, 0), 1))
+        return self + delta
+    }
+}
+
+struct ThemeWashView: View, Animatable {
+    nonisolated var wash: ThemeWash
+    nonisolated var animatableData: ThemeWash {
+        get { wash }
+        set { wash = newValue }
+    }
+
+    var body: some View {
+        ZStack {
+            ZStack {
+                LinearGradient(colors: [wash.colors[0].color, wash.baseEnd.color],
+                               startPoint: .leading, endPoint: .trailing)
+                LinearGradient(colors: [.clear, wash.colors[2].color],
+                               startPoint: .top, endPoint: .bottom)
+                    .opacity(wash.overlay)
+            }
+            .opacity(wash.opacity)
+            Image(nsImage: Look.grain)
+                .resizable(resizingMode: .tile)
+                .interpolation(.none)
+                .opacity(wash.grain * Look.grainMax)
+        }
+    }
+}
+
+/// Actual compositor values survive replacement even when the selected page is already
+/// the previous destination. A new landing must not infer them from that model selection.
+struct ThemeWashPresentation {
+    fileprivate let values: [String: Any]
+}
+
+/// Window-sized colour interpolation belongs on the compositor, alongside sidebar travel.
+/// Repeated updates with the same destination must leave an in-flight blend alone.
+struct NativeThemeWash: NSViewRepresentable {
+    let wash: ThemeWash
+    let reduced: Bool
+    let gesture: SpaceGesture
+    let origin: ThemeWash
+    let destination: ThemeWash
+    let fallback: Profile
+    let profiles: [Profile]
+    let systemDark: Bool
+
+    func makeNSView(context: Context) -> ThemeWashSurface { ThemeWashSurface() }
+    func updateNSView(_ view: ThemeWashSurface, context: Context) {
+        gesture.groundSurface = view
+        let from = origin, to = destination
+        let fallback = fallback, profiles = profiles, systemDark = systemDark
+        let gesture = gesture
+        gesture.trackGround = { [weak view, weak gesture] fraction in
+            // A cached profile can arrive before SwiftUI updates this representable.
+            // Its settled endpoints belong to the previous render; the new gesture
+            // already carries the captured Spaces that must be painted on exposure.
+            let origin = gesture?.outgoing.map {
+                ThemeWash.space($0.space, fallback: fallback, profiles: profiles, systemDark: systemDark)
+            } ?? from
+            let destination = gesture?.neighbour.map {
+                ThemeWash.space($0, fallback: fallback, profiles: profiles, systemDark: systemDark)
+            } ?? to
+            view?.track(origin.mixed(towards: destination, fraction: fraction))
+        }
+        gesture.captureGround = { [weak view] in view?.capturePresentation() }
+        gesture.animateGround = { [weak view] origin, destination, start, end, animation, presentedStart in
+            let from = ThemeWash.space(origin, fallback: fallback, profiles: profiles, systemDark: systemDark)
+            let to = ThemeWash.space(destination, fallback: fallback, profiles: profiles, systemDark: systemDark)
+            let token = view?.animateNative(from: from.mixed(towards: to, fraction: start),
+                                to: from.mixed(towards: to, fraction: end), animation: animation, presentedStart: presentedStart)
+            return { [weak view] current in
+                guard let view, let token else { return }
+                let final = current.map { ThemeWash.space($0, fallback: fallback, profiles: profiles, systemDark: systemDark) }
+                    ?? from.mixed(towards: to, fraction: end)
+                view.finishNative(token: token, wash: final)
+            }
+        }
+        let restingWash = wash
+        gesture.joinNativeGround = { [weak view] source in
+            guard let view, let token = view.joinNativeAnimation(from: source) else { return nil }
+            return { [weak view] current in
+                guard let view else { return }
+                let final = current.map { ThemeWash.space($0, fallback: fallback, profiles: profiles, systemDark: systemDark) } ?? restingWash
+                view.finishNative(token: token, wash: final)
+            }
+        }
+        // A cold host can mount after attachment. Join only after both native
+        // callbacks refer to this representable's actual surface.
+        gesture.nativeGroundDidUpdate?()
+        if reduced { view.finishAnimations() }
+        view.apply(wash, duration: !reduced && context.transaction.animation != nil
+            && !context.transaction.disablesAnimations ? gesture.colourDuration : 0)
+    }
+}
+
+/// Repaint the same wash over the page, with the window's gradient coordinates.
+/// The original surface remains the sole owner of native Space transitions.
+struct NativeThemeWashCopy: NSViewRepresentable {
+    let gesture: SpaceGesture
+    func makeNSView(context: Context) -> ThemeWashSurface {
+        ThemeWashSurface(copyOrigin: CGPoint(x: -Look.floatingSidebarGap, y: -Look.floatingSidebarGap))
+    }
+    func updateNSView(_ view: ThemeWashSurface, context: Context) {
+        gesture.groundCopies.add(view)
+        gesture.groundSurface?.addCopy(view)
+    }
+}
+
+private final class ThemeGrainFadeCompletion: NSObject, CAAnimationDelegate {
+    private let completion: @MainActor @Sendable () -> Void
+    init(_ completion: @escaping @MainActor @Sendable () -> Void) { self.completion = completion }
+    func animationDidStop(_ anim: CAAnimation, finished flag: Bool) {
+        // AppKit may still be flushing the transaction that removed this
+        // animation. Change native visibility on the next main-actor turn.
+        if flag { Task { @MainActor [completion] in completion() } }
+    }
+}
+
+@MainActor final class ThemeWashSurface: NSView {
+    let base = CAGradientLayer()
+    private let overlay = CAGradientLayer()
+    private let tint = CALayer()
+    private let grain = ThemeGrainSurface()
+    private var target: ThemeWash?
+    private var nativeToken: UUID?
+    private var followsNativeTimeline = false
+    private var grainFadeToken: UUID?
+    private let copies = NSHashTable<ThemeWashSurface>.weakObjects()
+    private weak var copySource: ThemeWashSurface?
+    private let copyOrigin: CGPoint
+    var nativeAnimating: Bool { nativeToken != nil }
+    override var isFlipped: Bool { true }
+
+    init(copyOrigin: CGPoint = .zero) {
+        self.copyOrigin = copyOrigin
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.addSublayer(tint)
+        tint.addSublayer(base)
+        tint.addSublayer(overlay)
+        base.startPoint = CGPoint(x: 0, y: 0.5)
+        base.endPoint = CGPoint(x: 1, y: 0.5)
+        overlay.startPoint = CGPoint(x: 0.5, y: 0)
+        overlay.endPoint = CGPoint(x: 0.5, y: 1)
+        grain.wantsLayer = true
+        addSubview(grain)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func addCopy(_ copy: ThemeWashSurface) {
+        guard copy !== self, copy.copySource !== self else { return }
+        copy.copySource?.copies.remove(copy)
+        copy.finishAnimations()
+        copy.copySource = self
+        copies.add(copy)
+        if let target { copy.apply(target, duration: 0) }
+        copyInstalledAnimations(to: copy)
+        copy.needsLayout = true
+    }
+
+    private func copyInstalledAnimations(to copy: ThemeWashSurface) {
+        // A newly mounted copy can join a transition already on the compositor.
+        for (source, destination) in zip([base, overlay, tint, grain.layer],
+                                         [copy.base, copy.overlay, copy.tint, copy.grain.layer]) {
+            guard let source, let destination else { continue }
+            for key in source.animationKeys() ?? [] {
+                if let installed = source.animation(forKey: key), let animation = installed.copy() as? CAAnimation {
+                    animation.beginTime = destination.convertTime(source.convertTime(installed.beginTime, to: nil), from: nil)
+                    if source === grain.layer, grainFadeToken != nil {
+                        let token = UUID()
+                        copy.grainFadeToken = token
+                        animation.delegate = copy.grainFadeCompletion(token)
+                    }
+                    destination.add(animation, forKey: key)
+                }
+            }
+        }
+        // A copy joining a fade to zero still has visible presentation grain.
+        copy.grain.isHidden = grain.isHidden
+        for nested in copy.copies.allObjects { copy.copyInstalledAnimations(to: nested) }
+    }
+
+    /// Copy the animation already installed on the compositor, preserving its
+    /// original begin time instead of starting a new blend at profile reveal.
+    func joinNativeAnimation(from source: ThemeWashSurface) -> UUID? {
+        guard source !== self, source.nativeAnimating,
+              let clock = source.base.animation(forKey: "colors"), clock.beginTime != 0 else { return nil }
+        finishAnimations()
+        // Attachment already primed the model at the finger's current progress.
+        // Copy only the curve; adopting the source's endpoint would erase it.
+        source.copyInstalledAnimations(to: self)
+        let token = UUID()
+        nativeToken = token
+        followsNativeTimeline = true
+        return token
+    }
+
+    func track(_ wash: ThemeWash) {
+        guard nativeAnimating else { apply(wash, duration: 0); return }
+        // Preserve point-model reads for a newly exposed host without restarting
+        // or removing the compositor-owned curve above those model values.
+        guard followsNativeTimeline else { return }
+        trackModel(wash)
+    }
+
+    private func trackModel(_ wash: ThemeWash) {
+        target = wash
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        base.colors = [wash.colors[0].nsColor.cgColor, wash.baseEnd.nsColor.cgColor]
+        overlay.colors = [NSColor.clear.cgColor, wash.colors[2].nsColor.cgColor]
+        overlay.opacity = Float(wash.overlay)
+        tint.opacity = Float(wash.opacity)
+        grain.layer?.opacity = Float(wash.grain * Look.grainMax)
+        CATransaction.commit()
+        for copy in copies.allObjects { copy.trackModel(wash) }
+    }
+
+    override func layout() {
+        super.layout()
+        // Sample the resting panel's crop even while its retained host is parked
+        // offscreen. A translation alone need not trigger an AppKit layout pass.
+        let frame = copySource.map { CGRect(origin: copyOrigin, size: $0.bounds.size) } ?? bounds
+        let canvas = CGRect(origin: .zero, size: frame.size)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        tint.frame = frame
+        base.frame = canvas
+        overlay.frame = canvas
+        grain.frame = frame
+        CATransaction.commit()
+        for copy in copies.allObjects { copy.needsLayout = true }
+    }
+
+    func finishAnimations() {
+        if nativeToken != nil, let source = copySource {
+            source.copies.remove(self)
+            copySource = nil
+        }
+        nativeToken = nil
+        followsNativeTimeline = false
+        grainFadeToken = nil
+        for layer in [base, overlay, tint, grain.layer].compactMap({ $0 }) { layer.removeAllAnimations() }
+        grain.isHidden = (target?.grain ?? 0) <= 0
+        for copy in copies.allObjects { copy.finishAnimations() }
+    }
+
+    func capturePresentation() -> ThemeWashPresentation {
+        var values: [String: Any] = [:]
+        for (layer, key, name) in [(base as CALayer, "colors", "base"), (overlay as CALayer, "colors", "overlay"),
+                                   (overlay as CALayer, "opacity", "overlay"), (tint, "opacity", "tint")] {
+            values["\(name).\(key)"] = layer.presentation()?.value(forKeyPath: key) ?? layer.value(forKeyPath: key)
+        }
+        if let layer = grain.layer {
+            values["grain.opacity"] = layer.presentation()?.opacity ?? layer.opacity
+        }
+        return ThemeWashPresentation(values: values)
+    }
+
+    @discardableResult func animateNative(from: ThemeWash, to: ThemeWash, animation: CABasicAnimation,
+                                         presentedStart: ThemeWashPresentation? = nil) -> UUID {
+        nativeToken = nil
+        if presentedStart == nil { apply(from, duration: 0) }
+        followsNativeTimeline = false
+        apply(to, duration: animation.duration, native: animation, start: from, presentedStart: presentedStart)
+        let token = UUID()
+        nativeToken = token
+        return token
+    }
+
+    func finishNative(token: UUID, wash: ThemeWash) {
+        guard nativeToken == token else { return }
+        finishAnimations()
+        apply(wash, duration: 0)
+    }
+
+    private func grainFadeCompletion(_ token: UUID) -> ThemeGrainFadeCompletion {
+        ThemeGrainFadeCompletion { [weak self] in
+            guard let self, self.grainFadeToken == token, !self.nativeAnimating,
+                  (self.target?.grain ?? 0) <= 0 else { return }
+            self.grainFadeToken = nil
+            self.grain.isHidden = true
+        }
+    }
+
+    func apply(_ wash: ThemeWash, duration: TimeInterval, native: CABasicAnimation? = nil, start: ThemeWash? = nil, presentedStart: ThemeWashPresentation? = nil) {
+        guard !nativeAnimating, target != wash || native != nil else { return }
+        let animate = duration > 0 && (target != nil || native != nil)
+        target = wash
+        grainFadeToken = nil
+        let rate = Float(window?.screen?.maximumFramesPerSecond ?? 60)
+        func set(_ layer: CALayer, _ key: String, _ name: String, _ value: Any, _ initial: Any?) {
+            let from = presentedStart?.values["\(name).\(key)"] ?? initial ?? layer.presentation()?.value(forKeyPath: key) ?? layer.value(forKeyPath: key)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.setValue(value, forKeyPath: key)
+            layer.removeAnimation(forKey: key)
+            if animate {
+                let animation = (native?.copy() as? CABasicAnimation) ?? CABasicAnimation(keyPath: key)
+                animation.keyPath = key
+                animation.fromValue = from
+                animation.toValue = value
+                animation.duration = duration
+                if native == nil { animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut) }
+                else {
+                    // Point-model values may lag a joined native timeline. Hold
+                    // its endpoint until the owning landing explicitly releases it.
+                    animation.fillMode = .forwards
+                    animation.isRemovedOnCompletion = false
+                }
+                animation.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+                if name == "grain", native == nil, wash.grain <= 0 {
+                    let token = UUID()
+                    grainFadeToken = token
+                    animation.delegate = grainFadeCompletion(token)
+                }
+                layer.add(animation, forKey: key)
+            }
+            CATransaction.commit()
+        }
+        set(base, "colors", "base", [wash.colors[0].nsColor.cgColor, wash.baseEnd.nsColor.cgColor],
+            start.map { [$0.colors[0].nsColor.cgColor, $0.baseEnd.nsColor.cgColor] })
+        set(overlay, "colors", "overlay", [NSColor.clear.cgColor, wash.colors[2].nsColor.cgColor],
+            start.map { [NSColor.clear.cgColor, $0.colors[2].nsColor.cgColor] })
+        set(overlay, "opacity", "overlay", Float(wash.overlay), start.map { Float($0.overlay) })
+        set(tint, "opacity", "tint", Float(wash.opacity), start.map { Float($0.opacity) })
+        if let layer = grain.layer {
+            let initial = start.map { Float($0.grain * Look.grainMax) }
+            let presented = presentedStart?.values["grain.opacity"] as? Float
+                ?? initial ?? layer.presentation()?.opacity ?? layer.opacity
+            // Opacity zero alone still lets AppKit rasterize this full-window
+            // pattern into a new backing store on resize. Withdraw invisible
+            // grain, but keep it painted throughout a visible fade to zero.
+            grain.isHidden = wash.grain <= 0 && (!animate || presented <= 0)
+            set(layer, "opacity", "grain", Float(wash.grain * Look.grainMax), initial)
+        }
+        for copy in copies.allObjects {
+            copy.apply(wash, duration: duration, native: native, start: start, presentedStart: presentedStart)
+        }
+    }
+}
+
+private final class ThemeGrainSurface: NSView {
+    override var isFlipped: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        NSGraphicsContext.current?.imageInterpolation = .none
+        NSColor(patternImage: Look.grain).setFill()
+        dirtyRect.fill()
+    }
+}

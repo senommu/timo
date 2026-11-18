@@ -1,0 +1,382 @@
+import AppKit
+import WebKit
+import XCTest
+@testable import timo
+
+/// Unshown private documents only: no focus, native loop, input, or capture.
+@MainActor final class PageResizeStyleTests: XCTestCase {
+    func testMotionAdmissionWaitsForEagerRootsAndActualStylesheetLoads() async throws {
+        let response = ResizeStylesheetResponse()
+        let web = try await page(variables: 160, stylesheet: response)
+        defer { web.stopLoading(); response.clear() }
+        _ = try await read(web, """
+        document.body.innerHTML='<react-app app-name="repo" class="loaded"></react-app><react-partial partial-name="header"></react-partial><react-partial data-lazy="true"></react-partial><link rel="stylesheet">'; 'ready'
+        """)
+        let ready = "JSON.stringify(\(ResizeMotionDocumentAdmission.script).loaded)"
+        let pendingRoot = try await read(web, ready)
+        XCTAssertEqual(pendingRoot, "false", "Repository readiness cannot admit a still-rendering page header")
+        _ = try await read(web, "document.querySelector('[partial-name=header]').classList.add('loaded'); 'ready'")
+        let complete = try await read(web, ready)
+        XCTAssertEqual(complete, "true", "Lazy roots and inert stylesheet placeholders are not active render dependencies")
+        _ = try await read(web, "const link=document.createElement('link');link.rel='stylesheet';link.href='timo-fixture-style://fixture/style.css';link.disabled=true;link.id='pending-style';document.head.append(link);'ready'")
+        let disabled = try await read(web, ready)
+        XCTAssertEqual(disabled, "true")
+        _ = try await read(web, "document.getElementById('pending-style').disabled=false;'ready'")
+        try await compatibilityWait { response.pendingCount == 1 }
+        let hasNoSheet = try await read(web, "String(document.getElementById('pending-style').sheet===null)")
+        XCTAssertEqual(hasNoSheet, "true", "Admit an actual withheld stylesheet request, not an already failed unsupported URL")
+        let pendingSheet = try await read(web, ready)
+        XCTAssertEqual(pendingSheet, "false", "An enabled pending stylesheet still changes the first layout")
+        response.finish()
+        try await compatibilityWait {
+            try await self.read(web, "String(Boolean(document.getElementById('pending-style').sheet) && getComputedStyle(document.documentElement).getPropertyValue('--fixture-stylesheet-loaded').trim()==='1')") == "true"
+        }
+        let completedSheet = try await read(web, ready)
+        XCTAssertEqual(completedSheet, "true", "The actual stylesheet response must release document admission")
+        _ = try await read(web, "document.getElementById('pending-style').remove();'ready'")
+        let loaded = try await read(web, ready)
+        XCTAssertEqual(loaded, "true")
+    }
+
+    func testHintTargetsSubtractPublicSafeAreaInsetsBeforePageZoom() async throws {
+        let web = try await page(variables: 160, insets: NSEdgeInsets(top: 21, left: 3, bottom: 5, right: 7))
+        defer { web.stopLoading() }
+        for zoom: CGFloat in [1, 1.5] {
+            web.pageZoom = zoom
+            let before = try await read(web, fingerprint)
+            PageResizeStyle.prepare(web)
+            let json = try await read(web, "JSON.stringify([globalThis.__timoResizeStyle.width,globalThis.__timoResizeStyle.height])", world: PageResizeStyle.world)
+            let sizes = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [Double])
+            XCTAssertEqual(sizes[0], 890 / Double(zoom), accuracy: 0.001)
+            XCTAssertEqual(sizes[1], 574 / Double(zoom), accuracy: 0.001)
+            let after = try await read(web, fingerprint)
+            XCTAssertEqual(after, before)
+        }
+    }
+
+    func testAttachingALoadedPageWarmsWithoutChangingTheDocument() async throws {
+        for mountAfter in [false, true] {
+            let web = try await page(variables: 160)
+            let before = try await read(web, fingerprint)
+            let host = WebHost(mountAfter ? nil : web)
+            let window = ResizeStyleModelWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+                styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+            if mountAfter { host.show(web) }
+            defer { window.contentView = nil; host.removePage(); window.close() }
+            _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+            let warmed = try await read(web, "String(Boolean(globalThis.__timoResizeStyle))", world: PageResizeStyle.world)
+            let sheets = try await read(web, "String(document.adoptedStyleSheets.length)")
+            let after = try await read(web, fingerprint)
+            XCTAssertEqual(warmed, "true")
+            XCTAssertEqual(sheets, "2", "Warmup keeps the author sheet and one bounded invisible helper")
+            XCTAssertEqual(after, before)
+        }
+    }
+
+    func testViewportHintsFollowSidebarDragWithoutRebuildingTheStylesheet() async throws {
+        let web = try await page(variables: 160)
+        let host = WebHost(web)
+        let window = ResizeStyleModelWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; host.removePage(); window.close() }
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        _ = try await read(web, """
+        globalThis.rebuilds=0;const original=CSSStyleSheet.prototype.replaceSync;
+        CSSStyleSheet.prototype.replaceSync=function(...args){globalThis.rebuilds++;return original.apply(this,args)};'ready'
+        """, world: PageResizeStyle.world)
+        let outerFrame = window.frame
+        for zoom: CGFloat in [1, 1.5] {
+            web.pageZoom = zoom
+            var previousCount: Int?
+            // Far beyond the warm band, across a cycle boundary, then reverse.
+            for cssWidth: CGFloat in [700, 702, 704, 818, 820, 822, 820, 798, 839, 880] {
+                let width = cssWidth * zoom
+                host.setFrameSize(NSSize(width: width, height: 600))
+                try await compatibilityWait {
+                    let current = try await web.evaluateJavaScript("innerWidth") as? NSNumber
+                    return abs((current?.doubleValue ?? 0) - cssWidth) <= 1
+                }
+                let count = Int(try await read(web, "String([...getComputedStyle(document.documentElement)].filter(x=>x.startsWith('--timo-resize-')).length)"))
+                XCTAssertNotEqual(count, previousCount, "Each resized CSS pixel must avoid the inherited-variable equality path")
+                previousCount = count
+                XCTAssertEqual(web.frame.width, width, accuracy: 1 / max(window.backingScaleFactor, 1),
+                               "Native autoresizing may align fractional widths to a backing pixel")
+                XCTAssertEqual(window.frame, outerFrame)
+                XCTAssertEqual(web.pageZoom, zoom)
+            }
+        }
+        let rebuilds = try await read(web, "String(globalThis.rebuilds)", world: PageResizeStyle.world)
+        XCTAssertEqual(rebuilds, "0", "Live geometry must not repeatedly invalidate the complete document stylesheet")
+    }
+
+    func testHostResizeReactivatesHintsAfterWindowDragFinishes() async throws {
+        let web = try await page(variables: 160)
+        let host = WebHost(web)
+        let window = ResizeStyleModelWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; host.removePage(); window.close() }
+        PageResizeStyle.finish(web)
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        host.setFrameSize(NSSize(width: 700, height: 600))
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let active = try await read(web, "String(globalThis.__timoResizeStyle.active)", world: PageResizeStyle.world)
+        XCTAssertEqual(active, "true", "The next sidebar drag must work after native window-resize cleanup")
+    }
+
+    func testHiddenOrPreparedHostResizeKeepsHintsRetired() async throws {
+        let web = try await page(variables: 160)
+        let host = WebHost(web)
+        let window = ResizeStyleModelWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; host.removePage(); window.close() }
+        PageResizeStyle.finish(web)
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        host.offscreen = true
+        host.setFrameSize(NSSize(width: 800, height: 600))
+        host.offscreen = false
+        web.autoresizingMask = []
+        host.setFrameSize(NSSize(width: 700, height: 600))
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let active = try await read(web, "String(globalThis.__timoResizeStyle.active)", world: PageResizeStyle.world)
+        XCTAssertEqual(active, "false", "A hidden host or paint coordinator owns its own style lifetime")
+    }
+
+    func testHintPreservesAuthorStylesAttributesAndEveryElementsGeometry() async throws {
+        let web = try await page(variables: 160)
+        defer { web.stopLoading() }
+        let before = try await read(web, fingerprint)
+        for _ in 0..<4 {
+            PageResizeStyle.prepare(web)
+            _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+            let after = try await read(web, fingerprint)
+            XCTAssertEqual(after, before)
+            XCTAssertEqual(web.pageZoom, 1)
+            XCTAssertNil(web.window)
+        }
+    }
+
+    func testFinishRemovesOnlyTheBrowserPropertiesAndReusesOneStylesheet() async throws {
+        let web = try await page(variables: 160)
+        defer { web.stopLoading() }
+        let before = try await read(web, fingerprint)
+        for _ in 0..<3 {
+            PageResizeStyle.prepare(web)
+            _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+            PageResizeStyle.finish(web)
+            _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+            let remaining = try await read(web, "JSON.stringify([...getComputedStyle(document.documentElement)].filter(x=>x.startsWith('--timo-resize-')))")
+            XCTAssertEqual(remaining, "[]")
+            let count = try await read(web, "String(document.adoptedStyleSheets.length)")
+            XCTAssertEqual(count, "2", "One author sheet and at most one reusable browser sheet")
+            let after = try await read(web, fingerprint)
+            XCTAssertEqual(after, before)
+        }
+    }
+
+    func testLightweightPagesDoNotGetAnExtraStylesheet() async throws {
+        let web = try await page(variables: 2)
+        defer { web.stopLoading() }
+        PageResizeStyle.prepare(web)
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let count = try await read(web, "String(document.adoptedStyleSheets.length)")
+        XCTAssertEqual(count, "1")
+    }
+
+    func testCoalescedPreparationsKeepBrowserStorageBounded() async throws {
+        let web = try await page(variables: 160)
+        defer { web.stopLoading() }
+        for _ in 0..<150 { PageResizeStyle.prepare(web) }
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let count = try await read(web, "String([...getComputedStyle(document.documentElement)].filter(x=>x.startsWith('--timo-resize-')).length)")
+        XCTAssertGreaterThan(Int(count) ?? 0, 0)
+        XCTAssertLessThanOrEqual(Int(count) ?? .max, 128)
+        PageResizeStyle.finish(web)
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let cleaned = try await read(web, "String([...getComputedStyle(document.documentElement)].filter(x=>x.startsWith('--timo-resize-')).length)")
+        XCTAssertEqual(cleaned, "0")
+    }
+
+    func testViewportRulesFollowWidthHeightAndUserZoomWithoutChangingLayout() async throws {
+        let web = try await page(variables: 160)
+        defer { web.stopLoading() }
+        for zoom: CGFloat in [1, 1.5] {
+            web.pageZoom = zoom
+            for size in [NSSize(width: 1100, height: 500), NSSize(width: 800, height: 700), NSSize(width: 1250, height: 450)] {
+                PageResizeStyle.prepare(web, nextSize: size)
+                web.setFrameSize(size)
+                try await compatibilityWait {
+                    let width = try await web.evaluateJavaScript("innerWidth") as? NSNumber
+                    return abs((width?.doubleValue ?? 0) - size.width / zoom) <= 1
+                }
+                let json = try await read(web, """
+                JSON.stringify({width:innerWidth,height:innerHeight,
+                  right:document.querySelector('aside').getBoundingClientRect().right,
+                  wide:matchMedia('(min-width:1000px)').matches,
+                  privateCount:[...getComputedStyle(document.documentElement)].filter(x=>x.startsWith('--timo-resize-')).length})
+                """)
+                let values = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+                XCTAssertEqual(try XCTUnwrap(values["right"] as? NSNumber).doubleValue, size.width / zoom, accuracy: 1)
+                XCTAssertEqual(try XCTUnwrap(values["height"] as? NSNumber).doubleValue, size.height / zoom, accuracy: 1)
+                XCTAssertEqual(values["wide"] as? Bool, size.width / zoom >= 1000)
+                XCTAssertLessThanOrEqual(try XCTUnwrap(values["privateCount"] as? NSNumber).intValue, 128)
+                XCTAssertEqual(web.pageZoom, zoom)
+            }
+        }
+    }
+
+    func testAuthorReplacingAdoptedSheetsKeepsItsNewSheetAndOneBrowserSheet() async throws {
+        let web = try await page(variables: 160)
+        defer { web.stopLoading() }
+        PageResizeStyle.prepare(web)
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        _ = try await read(web, "document.adoptedStyleSheets=[globalThis.authorSheet];'replaced'")
+        PageResizeStyle.prepare(web)
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let count = try await read(web, "String(document.adoptedStyleSheets.length)")
+        let author = try await read(web, "String(document.adoptedStyleSheets.includes(globalThis.authorSheet))")
+        XCTAssertEqual(count, "2")
+        XCTAssertEqual(author, "true")
+    }
+
+    func testReleaseDuringQueuedPaintCleansTheFinalPagesHint() async throws {
+        let web = try await page(variables: 160)
+        let host = WebHost(web)
+        let window = ResizeStyleModelWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; host.removePage(); window.close() }
+        var paints: [@MainActor @Sendable () -> Void] = []
+        let resize = WindowResizePreparation(window: window,
+            presenter: { _, callback in paints.append(callback) }, deadline: { _, _ in }) { frame, display in
+                window.setFrame(frame, display: display)
+            }
+        XCTAssertTrue(resize.request(frame: NSRect(x: 0, y: 0, width: 1000, height: 600), display: false))
+        XCTAssertTrue(resize.request(frame: NSRect(x: 0, y: 0, width: 1100, height: 600), display: false))
+        resize.endLiveResize()
+        paints.removeFirst()()
+        try await compatibilityWait { paints.count == 1 }
+        paints.removeFirst()()
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let remaining = try await read(web, "JSON.stringify([...getComputedStyle(document.documentElement)].filter(x=>x.startsWith('--timo-resize-')))")
+        XCTAssertEqual(remaining, "[]")
+        XCTAssertEqual(window.frame.width, 1100)
+    }
+
+    func testCancellationCleansTheHintAndLatePaintCannotRestoreIt() async throws {
+        let web = try await page(variables: 160)
+        let host = WebHost(web)
+        let window = ResizeStyleModelWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; host.removePage(); window.close() }
+        var paint: (@MainActor @Sendable () -> Void)?
+        let resize = WindowResizePreparation(window: window,
+            presenter: { _, callback in paint = callback }, deadline: { _, _ in }) { _, _ in XCTFail("Canceled paint committed") }
+        XCTAssertTrue(resize.request(frame: NSRect(x: 0, y: 0, width: 1000, height: 600), display: false))
+        resize.cancel()
+        paint?()
+        _ = try await read(web, "'ordered'", world: PageResizeStyle.world)
+        let remaining = try await read(web, "JSON.stringify([...getComputedStyle(document.documentElement)].filter(x=>x.startsWith('--timo-resize-')))")
+        XCTAssertEqual(remaining, "[]")
+    }
+
+    private func page(variables: Int, insets: NSEdgeInsets? = nil, stylesheet: ResizeStylesheetResponse? = nil) async throws -> WKWebView {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        if let stylesheet { configuration.setURLSchemeHandler(stylesheet, forURLScheme: "timo-fixture-style") }
+        let web: WKWebView
+        if let insets {
+            let insetWeb = ResizeInsetStyleWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600), configuration: configuration)
+            insetWeb.fixtureInsets = insets
+            web = insetWeb
+        } else { web = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600), configuration: configuration) }
+        let values = (0..<variables).map { "--site-\($0):\($0)px;" }.joined()
+        web.loadHTMLString("""
+        <html data-owner="site"><title>Resize style ready</title><style>
+        :root{\(values)--site-color:rgb(23,50,77)}html[style]{filter:invert(1)}
+        body{margin:0}main{width:100vw;color:var(--site-color)}
+        aside{position:fixed;right:0;width:40px;height:20px;background:currentColor}
+        </style><body><main>Normal scale content<aside></aside></main></body></html>
+        """, baseURL: nil)
+        try await compatibilityWait { !web.isLoading && web.title == "Resize style ready" }
+        _ = try await read(web, """
+        globalThis.authorSheet = new CSSStyleSheet();authorSheet.replaceSync('main{padding-top:7px}');
+        document.adoptedStyleSheets=[authorSheet];'ready'
+        """)
+        return web
+    }
+
+    private var fingerprint: String {
+        """
+        JSON.stringify({attributes:[...document.documentElement.attributes].map(a=>[a.name,a.value]),
+          author:document.adoptedStyleSheets.includes(globalThis.authorSheet),
+          elements:[...document.querySelectorAll('*')].map(el=>{
+            const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+            return [r.x,r.y,r.width,r.height,s.color,s.backgroundColor,s.fontSize,s.display,s.filter,s.transform];
+          })})
+        """
+    }
+
+    private func read(_ web: WKWebView, _ script: String, world: WKContentWorld = .page) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            web.evaluateJavaScript(script, in: nil, in: world) { result in
+                do {
+                    guard let string = try result.get() as? String else { throw NSError(domain: "ResizeStyleRead", code: 1) }
+                    continuation.resume(returning: string)
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+}
+
+/// Keep a real CSS resource pending until the fixture explicitly completes it.
+/// Unsupported schemes can fail before the admission assertion reaches WebKit.
+@MainActor private final class ResizeStylesheetResponse: NSObject, WKURLSchemeHandler {
+    private var pending: [ObjectIdentifier: any WKURLSchemeTask] = [:]
+    var pendingCount: Int { pending.count }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+        pending[ObjectIdentifier(urlSchemeTask)] = urlSchemeTask
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
+        pending.removeValue(forKey: ObjectIdentifier(urlSchemeTask))
+    }
+
+    func finish() {
+        let tasks = Array(pending.values)
+        pending.removeAll()
+        let data = Data(":root{--fixture-stylesheet-loaded:1}".utf8)
+        for task in tasks {
+            guard let url = task.request.url else { XCTFail("Missing fixture stylesheet URL"); continue }
+            task.didReceive(URLResponse(url: url, mimeType: "text/css", expectedContentLength: data.count,
+                                        textEncodingName: "utf-8"))
+            task.didReceive(data)
+            task.didFinish()
+        }
+    }
+
+    func clear() { pending.removeAll() }
+}
+
+private final class ResizeStyleModelWindow: NSWindow {
+    override var isVisible: Bool { true }
+    override var inLiveResize: Bool { true }
+}
+
+private final class ResizeInsetStyleWebView: WKWebView {
+    var fixtureInsets = NSEdgeInsetsZero
+    override var safeAreaInsets: NSEdgeInsets { fixtureInsets }
+}

@@ -1,0 +1,391 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Superseded PRs cancel; each main run has its own group and is preserved.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Change scope and diff checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      app_required: ${{ steps.scope.outputs.app_required }}
+      native_reused: ${{ steps.reuse.outputs.native_reused || 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate diff and choose checks
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci-change-scope.py --base "$BASE_SHA" --head "$HEAD_SHA"
+
+      - name: Verify identical PR native results
+        id: reuse
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.scope.outputs.app_required == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.before }}
+        run: python3 scripts/ci-native-reuse.py
+
+  routing:
+    # Run universal fixtures alongside scope detection so compilation can start early.
+    name: CI routing fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Keep the required aggregate green when native jobs intentionally skip.
+      - name: Fast path regressions
+        run: |
+          python3 scripts/test-ci-native-reuse.py
+          python3 scripts/test-ci-change-scope.py
+          python3 scripts/test-checks-workflow.py
+
+  source:
+    needs: [changes]
+    if: needs.changes.outputs.app_required == 'true'
+    name: Source fixtures
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Source timestamp cache fixture
+        run: python3 scripts/test-ci-source-state.py
+
+      - name: Release workflow fixture
+        run: |
+          python3 scripts/test-release-workflow.py
+          python3 scripts/test-prepare-nightly.py
+          python3 scripts/test-update-channel.py
+
+      - name: Packaged resource regression
+        run: python3 scripts/test-packaged-resources.py
+
+      - name: Default browser prompt build policy
+        run: python3 scripts/test-default-browser-prompt.py
+
+      - name: Native shard coverage fixtures
+        run: python3 scripts/test-native-test-shards.py
+
+      - name: Historical worker UA evidence fixtures
+        run: python3 scripts/test-classify-worker-ua.py
+
+      - name: Shared build artifact fixtures
+        run: python3 scripts/test-ci-build-artifact.py
+
+      - name: Native fixture runner safety
+        run: python3 scripts/test-native-fixture-runner.py
+
+  build:
+    name: Shared debug build
+    needs: [changes]
+    if: needs.changes.outputs.app_required == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Identify Swift toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          swift --version
+          xcodebuild -version
+          KEY=$(python3 scripts/ci-build-artifact.py toolchain)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      # Only checks builds go into this cache. Release builds compile an OAuth secret
+      # into the app, so their build products must never enter a PR-readable cache.
+      # PRs reuse main's cache without leaving a separate archive for every revision.
+      - name: Restore Swift debug build
+        id: swift-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .build
+          key: swift-debug-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ hashFiles('Sources/**', 'Tests/**', 'scripts/ci-source-state.py', 'make-app.sh', '.github/workflows/checks.yml') }}
+          restore-keys: |
+            swift-debug-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-
+            swift-debug-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-
+
+      # Checkout gives even unchanged inputs new mtimes. Restore only content-matching
+      # timestamps for Swift, C/Objective-C bridges, headers and resources. Rebuilding
+      # an unchanged bridge can invalidate all dependent Swift compilation.
+      - name: Restore unchanged source timestamps
+        run: python3 scripts/ci-source-state.py restore
+
+      - name: Build app and native tests once
+        run: swift build -c debug --build-tests --disable-index-store
+
+      - name: Bundle
+        env:
+          TIMO_CI_TOOLCHAIN_KEY: ${{ steps.toolchain.outputs.key }}
+        run: ./make-app.sh debug --skip-app-build
+
+      - name: Package shared debug runtime
+        run: |
+          set -euo pipefail
+          BIN_PATH=$(swift build -c debug --show-bin-path)
+          python3 scripts/ci-build-artifact.py pack \
+            --bin-path "$BIN_PATH" --revision "$GITHUB_SHA" \
+            --archive "$RUNNER_TEMP/timo-debug-runtime.tar.gz"
+
+      - name: Share compiled runtime
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: debug-runtime
+          path: ${{ runner.temp }}/timo-debug-runtime.tar.gz
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      - name: Save source timestamps for the build cache
+        run: python3 scripts/ci-source-state.py save
+
+      - name: Save Swift debug build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.swift-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .build
+          key: ${{ steps.swift-cache.outputs.cache-primary-key }}
+
+  native:
+    # Share compiled products; each shard still owns its own isolated desktop.
+    name: Native regressions (${{ matrix.shard }}/4)
+    needs: [changes, build]
+    if: needs.changes.outputs.app_required == 'true' && needs.changes.outputs.native_reused != 'true'
+    runs-on: macos-26
+    strategy:
+      fail-fast: ${{ github.event_name == 'pull_request' }}
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      NATIVE_SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download compiled runtime
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          # Preserve v5's warning policy; the restore step verifies our archive.
+          digest-mismatch: warn
+          name: debug-runtime
+          path: ${{ runner.temp }}/timo-debug-runtime
+
+      - name: Restore and verify compiled runtime
+        run: |
+          python3 scripts/ci-build-artifact.py restore \
+            --revision "$GITHUB_SHA" \
+            --archive "$RUNNER_TEMP/timo-debug-runtime/timo-debug-runtime.tar.gz"
+
+      - name: Discover and partition all native tests
+        run: |
+          set -euo pipefail
+          swift test list --skip-build > "$RUNNER_TEMP/timo-native-tests.txt"
+          python3 scripts/native-test-shards.py plan \
+            --inventory "$RUNNER_TEMP/timo-native-tests.txt" \
+            --suite required \
+            --index "$NATIVE_SHARD" --count 4 \
+            --manifest "$RUNNER_TEMP/timo-native-shard.json" \
+            --filter-output "$RUNNER_TEMP/timo-native-shard.filter"
+
+      - name: Native regression tests
+        timeout-minutes: 24
+        env:
+          TIMO_NATIVE_FIXTURE_PRIMARY_TIMEOUT: '1200'
+          # Capture the original process/order, even when no ReportCrash file appears.
+          SWIFT_BACKTRACE: enable=yes,interactive=no,color=no,threads=crashed,registers=none,images=none,limit=48,top=0,sanitize=yes,output-to=stderr,timeout=10s,warnings=suppressed
+        run: |
+          set -euo pipefail
+          python3 scripts/run-native-tests.py --skip-build --jobs 1 \
+            --filter "$(cat "$RUNNER_TEMP/timo-native-shard.filter")" \
+            2>&1 | tee "$RUNNER_TEMP/timo-swift-tests.log"
+
+      - name: Verify every selected native test completed
+        run: |
+          python3 scripts/native-test-shards.py verify \
+            --manifest "$RUNNER_TEMP/timo-native-shard.json" \
+            --log "$RUNNER_TEMP/timo-swift-tests.log"
+
+      - name: Preserve native loop failure evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: native-loop-logs-${{ matrix.shard }}
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/timo-swift-tests.log
+            ${{ runner.temp }}/timo-native-tests.txt
+            ${{ runner.temp }}/timo-native-shard.json
+            ${{ runner.temp }}/timo-native-shard.filter
+            /tmp/timo-resize-*.png
+            /tmp/timo-resize-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  packaging:
+    # Common runtime/fixture checks run once, away from the native test desktops.
+    name: Packaging and integrations
+    needs: [changes, build]
+    if: needs.changes.outputs.app_required == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download compiled runtime
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          # Preserve v5's warning policy; the restore step verifies our archive.
+          digest-mismatch: warn
+          name: debug-runtime
+          path: ${{ runner.temp }}/timo-debug-runtime
+
+      - name: Restore and verify compiled runtime
+        run: |
+          python3 scripts/ci-build-artifact.py restore \
+            --revision "$GITHUB_SHA" \
+            --archive "$RUNNER_TEMP/timo-debug-runtime/timo-debug-runtime.tar.gz"
+
+      # Run the fresh-process loop regression once per runtime, away from the
+      # native desktops. Every fixture still admits its own exact AppKit owner.
+      # The outer bound includes SwiftPM's restored-build planning/startup.
+      # NativeFixtureApplicationLoop keeps its own 12s lifecycle watchdogs.
+      - name: Owned AppKit loop preflight
+        timeout-minutes: 4
+        env:
+          TIMO_APPKIT_LOOP_SMOKE: '1'
+          TIMO_NATIVE_FIXTURE_PRIMARY_TIMEOUT: '90'
+          SWIFT_BACKTRACE: enable=yes,interactive=no,color=no,threads=crashed,registers=none,images=none,limit=48,top=0,sanitize=yes,output-to=stderr,timeout=10s,warnings=suppressed
+        run: |
+          set -euo pipefail
+          python3 scripts/run-native-tests.py --skip-build --jobs 1 --filter '^TimoTests[.]NativeApplicationLoopSmokeTests/testOwnedLoopAdmitsAsyncWorkAndStops$' 2>&1 | tee "$RUNNER_TEMP/timo-appkit-loop-preflight.log"
+          python3 scripts/native-test-shards.py verify \
+            --test TimoTests.NativeApplicationLoopSmokeTests/testOwnedLoopAdmitsAsyncWorkAndStops \
+            --log "$RUNNER_TEMP/timo-appkit-loop-preflight.log"
+
+      - name: Checks
+        run: ./.build/debug/timo selfcheck --pure
+
+      - name: Cold WebKit registry startup
+        run: scripts/check-webkit-startup.sh
+
+      - name: App icon migration and bundled selections
+        run: scripts/check-app-icons.sh
+
+      - name: CLI password import errors
+        run: bash scripts/test-cli-import.sh .build/debug/timo
+
+      - name: Cloud AI transport and privacy checks
+        run: |
+          scripts/check-cloud-ai.sh
+          scripts/check-ai-connections.sh
+          scripts/check-ai-routing.sh
+          scripts/check-chatgpt.sh
+          scripts/check-chatgpt-session.sh
+
+      - name: DMG package
+        run: ./scripts/test-build-dmg.sh
+
+      - name: Updater interruption, rollback, transport and relaunch recovery
+        run: |
+          scripts/test-updater-recovery.sh
+          bash scripts/test-update-launch-ownership.sh
+          python3 scripts/test-updater-transport.py
+          python3 scripts/test-updater-archive.py
+          scripts/test-updater-relaunch.sh
+
+      - name: Update installer rejection and quarantine cleanup
+        run: bash scripts/test-update-installer.sh Timo.app --unsigned
+
+      - name: Preserve AppKit loop evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: appkit-loop-log
+          path: ${{ runner.temp }}/timo-appkit-loop-preflight.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  checks:
+    # Only cheap scopes or verified main native reuse permit intentional skips.
+    if: ${{ always() }}
+    needs: [changes, routing, source, build, native, packaging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every selected check to pass
+        env:
+          ROUTING_RESULT: ${{ needs.routing.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          APP_REQUIRED: ${{ needs.changes.outputs.app_required }}
+          NATIVE_REUSED: ${{ needs.changes.outputs.native_reused }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          SOURCE_RESULT: ${{ needs.source.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
+          PACKAGING_RESULT: ${{ needs.packaging.result }}
+        run: |
+          set -euo pipefail
+          [ "$CHANGES_RESULT" = success ] || { echo '::error::Change detection failed.'; exit 1; }
+          [ "$ROUTING_RESULT" = success ] || { echo '::error::Website or routing fixtures failed.'; exit 1; }
+          case "$APP_REQUIRED" in
+            true) expected=success ;;
+            false) expected=skipped ;;
+            *) echo '::error::Missing or invalid change scope.'; exit 1 ;;
+          esac
+          case "$NATIVE_REUSED" in
+            false) native_expected="$expected" ;;
+            true)
+              if [ "$EVENT_NAME" != push ] || [ "$EVENT_REF" != refs/heads/main ] || [ "$APP_REQUIRED" != true ]; then
+                echo '::error::Native reuse is only valid for app checks on main pushes.'
+                exit 1
+              fi
+              native_expected=skipped
+              ;;
+            *) echo '::error::Missing or invalid native reuse decision.'; exit 1 ;;
+          esac
+          [ "$NATIVE_RESULT" = "$native_expected" ] || { echo '::error::Native validation did not match the verified plan.'; exit 1; }
+          for result in "$SOURCE_RESULT" "$BUILD_RESULT" "$PACKAGING_RESULT"; do
+            if [ "$result" != "$expected" ]; then
+              echo "::error::A selected check did not succeed or an app job skipped unexpectedly (result=$result, expected=$expected)."
+              exit 1
+            fi
+          done
+
+  prune-caches:
+    # Keep deletion credentials away from the build and from pull request runs.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.app_required == 'true'
+    needs: [changes, checks]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the two newest Swift debug caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh cache list --ref refs/heads/main --key swift-debug- \
+            --limit 10000 --sort created_at --order desc --json id \
+            --jq '.[2:] | .[].id' > "$RUNNER_TEMP/stale-cache-ids"
+          while IFS= read -r cache_id; do
+            gh cache delete "$cache_id"
+          done < "$RUNNER_TEMP/stale-cache-ids"

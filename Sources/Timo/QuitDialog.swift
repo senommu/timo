@@ -1,0 +1,326 @@
+import SwiftUI
+
+/// Arc's "Quit Arc?": a card over the window with the app's icon, the question, and three
+/// answers — Quit (⏎), Cancel (⎋), and Quit without being asked again. It replaces the
+/// hold-⌘Q toast, which asked for a gesture nobody could see and quit on a clock nobody
+/// could trust; a question with a default button is answered by the same ⌘Q-then-⏎ people
+/// already do, and cannot be missed.
+///
+/// The dark glass card sits *in* the window that asked, on a scrim that dims and blurs the
+/// page, so the question reads as part of the window rather than a
+/// second one floating over it. No sheet: a sheet hangs off a title bar and Timo's windows
+/// have none to hang it from. When open windows are minimized and there is no key window,
+/// a plain borderless panel stands in.
+///
+/// ponytail: `runModal(for:)` on the host window, so the answer comes back as a value and
+/// `applicationShouldTerminate` stays a straight line. The scrim swallows every click and
+/// key that is not one of the three answers.
+@MainActor enum QuitDialog {
+    enum Answer { case quit, quitForever, cancel }
+
+    /// Whether the question is on screen right now. `applicationShouldTerminate` asks this
+    /// before anything else, because every other way out of it ends in a terminate — see
+    /// `QuitAsk.refuses`.
+    private(set) static var isUp = false
+
+    /// Menus can release key status just before ⌘Q is dispatched. Keep the question
+    /// over their owning user window rather than falling back to an unblurred panel.
+    static func presentationHost(preferred: NSWindow?, main: NSWindow?, ordered: [NSWindow]) -> NSWindow? {
+        func eligible(_ candidate: NSWindow?) -> NSWindow? {
+            guard var candidate else { return nil }
+            while let parent = candidate.parent ?? candidate.sheetParent { candidate = parent }
+            guard candidate.isVisible, !candidate.isMiniaturized,
+                  !candidate.isExcludedFromWindowsMenu, !(candidate is NSPanel),
+                  candidate.contentView != nil else { return nil }
+            return candidate
+        }
+        return eligible(preferred) ?? eligible(main) ?? ordered.lazy.compactMap(eligible).first
+    }
+
+    static func ask(over host: NSWindow?) -> Answer {
+        isUp = true
+        Feel02PressMonitor.quitDialogDidOpen()
+        defer { isUp = false }
+        let host = presentationHost(preferred: host, main: NSApp.mainWindow, ordered: NSApp.orderedWindows)
+        if let host, let content = host.contentView { return ask(in: host, content: content) }
+        var answer = Answer.cancel
+        let panel = Panel(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+        panel.title = "Quit Timo?"            // what VoiceOver says when the card takes key
+        panel.answer = { answer = $0; NSApp.stopModal() }
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isReleasedWhenClosed = false
+        // Weak: the card lives inside the panel, so a strong capture here would be a cycle
+        // (panel → hosting view → card → closure → panel) and every Cancel would strand a
+        // window for the life of the process.
+        panel.contentView = NSHostingView(rootView: Card { [weak panel] in panel?.answer?($0) })
+        panel.setContentSize(panel.contentView!.fittingSize)
+        // Centred over the window that asked, or the screen when all windows are minimized.
+        let anchor = host?.frame ?? NSScreen.main?.visibleFrame ?? .zero
+        panel.setFrameOrigin(NSPoint(x: anchor.midX - panel.frame.width / 2,
+                                     y: anchor.midY - panel.frame.height / 2))
+        NSApp.activate()
+        panel.makeKeyAndOrderFront(nil)
+        animateEntrance(of: panel.contentView!, card: panel.contentView!)
+        NSApp.runModal(for: panel)
+        panel.orderOut(nil)
+        panel.answer = nil
+        return answer
+    }
+
+    private static func ask(in host: NSWindow, content: NSView) -> Answer {
+        var answer = Answer.cancel
+        // On the view *around* the content view, not inside it. The content view is a
+        // SwiftUI hosting view, and SwiftUI keeps its own drawing above any AppKit subview
+        // added to it, so a scrim parented there sits behind the page it is meant to cover
+        // and nothing of the question is ever seen. The traffic-light overlay hangs off an
+        // AppKit superview for the same reason; see `TimoWindow.dressTrafficLights`.
+        let over = content.superview ?? content
+        let scrim = Scrim(frame: over.bounds, showing: blurred(over))
+        scrim.answer = { answer = $0; NSApp.stopModal() }
+        // Weak for the same reason as the panel's: scrim → hosting view → card → closure.
+        let card = NSHostingView(rootView: Card { [weak scrim] in scrim?.answer?($0) })
+        card.translatesAutoresizingMaskIntoConstraints = false
+        scrim.addSubview(card)
+        NSLayoutConstraint.activate([card.centerXAnchor.constraint(equalTo: scrim.centerXAnchor),
+                                     card.centerYAnchor.constraint(equalTo: scrim.centerYAnchor)])
+        let was = host.firstResponder
+        over.addSubview(scrim, positioned: .above, relativeTo: nil)
+        NSApp.activate()
+        host.makeKeyAndOrderFront(nil)
+        host.makeFirstResponder(scrim)
+        animateEntrance(of: scrim, card: card)
+        NSApp.runModal(for: host)
+        scrim.removeFromSuperview()
+        scrim.answer = nil
+        host.makeFirstResponder(was)
+        return answer
+    }
+
+    /// Fade the captured blur and card together, with a small, centred settle for the card.
+    /// Explicit layer animations keep running inside AppKit's modal loop and leave the
+    /// model at its final values, so an immediate answer never waits for an animation.
+    private static func animateEntrance(of overlay: NSView, card: NSView) {
+        overlay.wantsLayer = true
+        card.wantsLayer = true
+        overlay.layoutSubtreeIfNeeded()
+        guard let overlayLayer = overlay.layer, let cardLayer = card.layer else { return }
+        let reduced = Motion.reduced
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0
+        fade.toValue = 1
+        fade.duration = reduced ? 0.12 : 0.22
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        fade.pinToDisplayRate(of: overlay.window?.screen)
+        overlayLayer.add(fade, forKey: "quitEntranceFade")
+        guard !reduced else { return }
+
+        // AppKit chooses its backing layers' anchors. Translate the scale to the card's
+        // centre without changing the geometry AppKit owns (or its button hit targets).
+        let scale: CGFloat = 0.96
+        var start = CATransform3DMakeScale(scale, scale, 1)
+        start.m41 = cardLayer.bounds.width * (0.5 - cardLayer.anchorPoint.x) * (1 - scale)
+        start.m42 = cardLayer.bounds.height * (0.5 - cardLayer.anchorPoint.y) * (1 - scale)
+        let settle = CABasicAnimation(keyPath: "transform")
+        settle.fromValue = NSValue(caTransform3D: start)
+        settle.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        settle.duration = 0.22
+        settle.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        settle.pinToDisplayRate(of: card.window?.screen)
+        cardLayer.add(settle, forKey: "quitEntranceScale")
+    }
+
+    /// A picture of the window, blurred and dimmed, taken the moment the question is asked.
+    ///
+    /// This used to be a `CIGaussianBlur` in the layer's `backgroundFilters`, which dimmed
+    /// the page but never blurred it: a background filter samples the layers this process
+    /// composites, and a page is drawn by WebKit's own, out of process. A bitmap of the
+    /// content view does include the page, so the blur is of a still rather than of a live
+    /// layer — which is all a modal needs, since nothing under it can move.
+    ///
+    /// Taken once, at `Look.quitBlurScale` smaller than the window, because the blur hides
+    /// everything that shrinking loses. `Look.quitBlur` is the radius, in points, which a
+    /// material would not let us choose. Nothing to photograph (an off-screen window, a
+    /// window the backing store cannot give up) leaves it dimmed but sharp, as it was.
+    private static func blurred(_ content: NSView) -> CGImage? {
+        guard content.bounds.width > 0, content.bounds.height > 0,
+              let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+        else { return nil }
+        content.cacheDisplay(in: content.bounds, to: rep)
+        guard let shot = rep.cgImage else { return nil }
+        // One unit of the shrunken picture is `Look.quitBlurScale` points of the window,
+        // whatever the screen's backing scale, so the radius below stays in points.
+        let shrink = content.bounds.width / CGFloat(shot.width) / Look.quitBlurScale
+        let small = CIImage(cgImage: shot).transformed(by: .init(scaleX: shrink, y: shrink))
+        // Clamped first, or the blur drags transparency in from past the edges and the
+        // scrim fades out at its border; cropped after, because a clamped image is endless.
+        let blur = small.clampedToExtent()
+            .applyingGaussianBlur(sigma: Look.quitBlur / Look.quitBlurScale)
+            .cropped(to: small.extent)
+        // The dim is painted into the picture, which leaves the scrim's own background
+        // colour standing as exactly the old, dim-only scrim for when there is no picture.
+        let dimmed = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: Look.quitScrim))
+            .cropped(to: blur.extent).composited(over: blur)
+        return CIContext.timo.createCGImage(dimmed, from: dimmed.extent)
+    }
+
+    /// The layer over the page: the blurred picture where there is one, and the dim alone
+    /// where there is not.
+    private final class Scrim: NSView {
+        var answer: ((Answer) -> Void)?
+
+        init(frame: NSRect, showing picture: CGImage?) {
+            super.init(frame: frame)
+            autoresizingMask = [.width, .height]
+            wantsLayer = true
+            layer?.backgroundColor = NSColor.black.withAlphaComponent(Look.quitScrim).cgColor
+            layer?.contents = picture           // nil leaves the dim alone, as it was
+            layer?.contentsGravity = .resize
+            setAccessibilityElement(true)
+            setAccessibilityRole(.sheet)
+            setAccessibilityLabel("Quit Timo?")
+        }
+        required init?(coder: NSCoder) { fatalError() }
+
+        override var acceptsFirstResponder: Bool { true }
+        override func mouseDown(with event: NSEvent) {}      // the page under it is not there
+        override func cancelOperation(_ sender: Any?) { answer?(.cancel) }
+        override func keyDown(with event: NSEvent) {
+            switch event.keyCode {
+            case 36, 76: answer?(.quit)          // return, enter
+            case 53: answer?(.cancel)            // escape
+            default: break
+            }
+        }
+    }
+
+    /// Borderless windows refuse key status by default, and a dialog that cannot take ⏎
+    /// and ⎋ is a picture of a dialog. The two keys are answered here as well as by the
+    /// buttons' own shortcuts, so the card can always be left from the keyboard even if
+    /// SwiftUI's key-equivalent routing inside a modal borderless window ever does not fire.
+    private final class Panel: NSWindow {
+        var answer: ((Answer) -> Void)?
+        override var canBecomeKey: Bool { true }
+        override func cancelOperation(_ sender: Any?) { answer?(.cancel) }
+        override func keyDown(with event: NSEvent) {
+            switch event.keyCode {
+            case 36, 76: answer?(.quit)          // return, enter
+            case 53: answer?(.cancel)            // escape
+            default: super.keyDown(with: event)
+            }
+        }
+    }
+
+    private struct Card: View {
+        let answer: (Answer) -> Void
+        @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: Look.inset * 3) {
+                HStack(spacing: Look.inset * 2) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable().frame(width: Look.quitDialogIcon, height: Look.quitDialogIcon)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: Look.inset) {
+                        Text("Quit Timo?")
+                            .font(Look.dialogTitle)
+                            .foregroundStyle(Look.barSelectedText)
+                        Text("This will close all Timo windows.")
+                            .font(Look.text).foregroundStyle(Look.barPlaceholder)
+                    }
+                }
+                HStack(spacing: Look.inset) {
+                    Choice("Cancel", key: "ESC") { answer(.cancel) }
+                        .keyboardShortcut(.cancelAction)
+                    Choice("Quit", key: "⏎", primary: true) { answer(.quit) }
+                        .keyboardShortcut(.defaultAction)
+                }
+                Button("Quit and don’t ask again") { answer(.quitForever) }
+                    .buttonStyle(.plain)
+                    .font(Look.small)
+                    .foregroundStyle(Look.barPlaceholder)
+                    .padding(.vertical, Look.inset / 2)
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(Look.paneMargin)
+            .frame(width: Look.quitDialogWidth)
+            .background {
+                RoundedRectangle(cornerRadius: Look.quitDialogRadius)
+                    .fill(.ultraThinMaterial)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Look.quitDialogRadius)
+                            .fill(Look.quitCardFill.opacity(reduceTransparency ? 1 : 0.82))
+                    }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: Look.quitDialogRadius)
+                    .strokeBorder(LinearGradient(colors: [.white.opacity(0.26), .white.opacity(0.07)],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing),
+                                  lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.5), radius: 24, y: 12)
+            .padding(Look.quitShadowInset)
+            .fixedSize()
+            .environment(\.colorScheme, .dark)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Quit Timo?")
+        }
+    }
+
+    /// A button in the card: its title and, where a key answers it, that key as a small
+    /// badge — the way Arc prints ESC and ⏎ on its own.
+    private struct Choice: View {
+        let title: String
+        var key: String? = nil
+        var primary = false
+        let action: () -> Void
+
+        init(_ title: String, key: String? = nil, primary: Bool = false, action: @escaping () -> Void) {
+            self.title = title; self.key = key; self.primary = primary; self.action = action
+        }
+
+        var body: some View {
+            Button(action: action) {
+                HStack(spacing: Look.inset) {
+                    Text(title).font(Look.text)
+                    if let key {
+                        Text(key).font(Look.shortcut)
+                            .padding(.horizontal, Look.inset / 2).padding(.vertical, 1)
+                            .background(Look.ink(0.12), in: .rect(cornerRadius: Look.cardRadius - 2))
+                            .accessibilityHidden(true)   // the button's own shortcut says it
+                    }
+                }
+                .padding(.horizontal, Look.inset * 2).padding(.vertical, Look.inset)
+                .frame(maxWidth: .infinity, minHeight: Look.rowHeight)
+                .contentShape(.rect)
+            }
+            .buttonStyle(ChoiceStyle(primary: primary))
+        }
+    }
+
+    private struct ChoiceStyle: ButtonStyle {
+        var primary: Bool
+        @State private var hovering = false
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .foregroundStyle(primary ? Look.quitCardFill : Look.barSelectedText)
+                .background(primary ? Color.white.opacity(configuration.isPressed ? 0.72 : 0.92)
+                            : Color.white.opacity(configuration.isPressed ? 0.18 : hovering ? 0.12 : 0.07),
+                            in: .rect(cornerRadius: Look.pillRadius))
+                .hairline(radius: Look.pillRadius, .white.opacity(primary ? 0.2 : 0.1))
+                .onHover { hovering = $0 }
+                .animation(reduceMotion ? nil : Look.quick, value: hovering)
+        }
+    }
+}
+
+extension CIContext {
+    /// Shared by the captures taken on the main thread as a window question opens. A fresh
+    /// context sets up its GPU pipeline each time: 15–60 ms before the first frame of the
+    /// dialog, against effectively nothing for a reused one. Core Image contexts are
+    /// thread-safe and meant to be kept.
+    nonisolated(unsafe) static let timo = CIContext()
+}
