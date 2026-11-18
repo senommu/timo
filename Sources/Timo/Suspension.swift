@@ -1,0 +1,1008 @@
+import AppKit
+import WebKit
+
+/// Shared snapshot writer. Foundation stages an atomic write beside the destination,
+/// so a failed write cannot truncate the last completed snapshot.
+enum SnapshotPersistence {
+    @discardableResult
+    static func write(_ data: Data, to url: URL,
+                      onFailure: (Error) -> Void = { _ in },
+                      writer: (Data, URL, Data.WritingOptions) throws -> Void = {
+                          try $0.write(to: $1, options: $2)
+                      }) -> Bool {
+        do { try writer(data, url, .atomic); return true }
+        catch {
+            NSLog("Timo: could not save %@: %@", url.lastPathComponent, error.localizedDescription)
+            onFailure(error)
+            return false
+        }
+    }
+
+    static func check() -> [(String, Bool)] {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("timo-snapshot-\(UUID())")
+        do { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true) }
+        catch { return [("snapshot fixture directory is available", false)] }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("session.json")
+        let first = Data("previous complete session".utf8), next = Data("new complete session".utf8)
+        var out = [("a snapshot reaches disk", write(first, to: file))]
+        let failed = write(next, to: file, writer: { _, _, options in
+            guard options.contains(.atomic) else { throw CocoaError(.fileWriteUnknown) }
+            throw CocoaError(.fileWriteOutOfSpace)
+        })
+        out.append(("a failed snapshot is reported and preserves the completed file",
+                    !failed && (try? Data(contentsOf: file)) == first))
+        out.append(("a later successful snapshot replaces the completed file",
+                    write(next, to: file) && (try? Data(contentsOf: file)) == next))
+        let missing = root.appendingPathComponent("missing/session.json")
+        out.append(("a real filesystem error reports failure", !write(next, to: missing)))
+        return out
+    }
+}
+
+/// Everything a tab needs to be drawn in the strip and later brought back exactly where it
+/// was, without a WKWebView being alive in the meantime.
+///
+/// `state` is `WKWebView.interactionState`, which is an opaque archivable value (a `Data`
+/// in practice, ~500–800 bytes) holding the whole session: the back/forward list, which
+/// item is current, and its scroll offset. Assigning it to a fresh WKWebView restores all
+/// of that, synchronously as far as `url` and `canGoBack` are concerned. It is the only
+/// public API that captures a page without keeping its process.
+struct Parked: Equatable, Sendable {
+    var title: String
+    var state: Data?
+    /// The page this state actually came from, when it is filed under a key that is not it.
+    /// A favourite or a pinned row is written into the Space's list — and into the grid's —
+    /// by its *home*, so that is the key the rebuild looks it up by; a row that has wandered
+    /// off its home is not on that page any more, and this is where it says so.
+    ///
+    /// nil means "the key is the page", which is every Today tab, every row that never
+    /// wandered, and every row written down before this field existed.
+    var page: URL?
+    var needsRecovery: Bool
+
+    init(title: String = "", state: Data? = nil, page: URL? = nil, needsRecovery: Bool = false) {
+        self.title = title
+        self.state = state
+        self.page = page
+        self.needsRecovery = needsRecovery
+    }
+
+    /// Opaque WebKit history and form state belong to the original profile.
+    var withoutInteractionState: Parked {
+        var copy = self
+        copy.state = nil
+        return copy
+    }
+
+    /// The same state, filed under a key that is not the page it came from. See
+    /// `TabStore.saveCurrentSpace`, the one caller.
+    func on(_ page: URL) -> Parked { Parked(title: title, state: state, page: page, needsRecovery: needsRecovery) }
+}
+
+extension Prefs {
+    /// On by default. Thirty idle tabs are thirty WebContent processes and ~2 GB; every
+    /// other browser made this call years ago.
+    static var suspendTabs: Bool {
+        get { UserDefaults.timo.object(forKey: "suspendTabs") as? Bool ?? true }
+        set { UserDefaults.timo.set(newValue, forKey: "suspendTabs") }
+    }
+
+    /// How long a background tab has to sit untouched before it is torn down. 30 minutes:
+    /// long enough that tab-flipping never trips it, short enough that a tab left open
+    /// over lunch is gone. Zero or negative in defaults means "use the default".
+    static var suspendAfter: TimeInterval {
+        get {
+            let v = UserDefaults.timo.double(forKey: "suspendAfter")
+            return v > 0 ? v : 30 * 60
+        }
+        set { UserDefaults.timo.set(newValue, forKey: "suspendAfter") }
+    }
+}
+
+/// Tab suspension: the policy, the timer and the memory-pressure source. The mechanism —
+/// actually dropping and rebuilding the WKWebView — lives on `Tab` in Engine.swift, because
+/// that is where the observers and delegates it has to re-wire are.
+///
+/// ponytail: one 60-second Timer over every tab in every window, no per-tab timers, no
+/// scheduling. Thirty tabs is thirty struct comparisons a minute.
+@MainActor enum Suspension {
+
+    /// Everything the decision depends on, gathered in one place so the decision itself is
+    /// a pure function that `check()` can drive without a browser in the room.
+    struct Facts {
+        /// The active tab of *any* window — a background window's selected tab is on screen
+        /// too, and tearing it down would be visible the moment that window is raised.
+        var active = false
+        /// A favourite or a pinned tab: it stays in the sidebar, so the user expects it to
+        /// be instant when they click it.
+        var pinned = false
+        /// In a Space the window is keeping alive behind the one it is showing — so it has
+        /// no row in the sidebar at all. See `Stash`.
+        var stashed = false
+        /// A private tab's data store is `.nonPersistent()` and a fresh one is made per web
+        /// view, so a suspended private tab would come back logged out of everything.
+        var isPrivate = false
+        /// Playing here, or detached into a picture-in-picture window. The second case is
+        /// checked separately rather than trusted to requestMediaPlaybackState: the video
+        /// is rendering in a window of its own, and a background tab whose video you are
+        /// actively watching is the worst possible thing to tear down.
+        var playing = false
+        var loading = false
+        /// Typed-in, unsubmitted form input. Suspending on top of it throws work away.
+        var hasInput = false
+        var suspended = false
+        /// A tab with nothing loaded has nothing to reclaim.
+        var loaded = true
+        var idle: TimeInterval = 0
+    }
+
+    /// The whole decision table. Ordered so the cheap, certain "never" cases come first.
+    ///
+    /// Pinned tabs are excluded, as asked. I half disagree — pins are exactly the heavy
+    /// long-lived apps (mail, chat, calendar) that cost the most to keep resident — but
+    /// they are also the ones a user expects to be instant, and a pin that reloads on every
+    /// click reads as a bug. ponytail: if this ever needs to change it is one more Prefs
+    /// flag and one line here, not a redesign.
+    ///
+    /// That exemption is about the row in the sidebar, so it only covers a pin on the strip
+    /// in front of the user. A pin in a Space the window is keeping alive has no row to
+    /// click and is exactly what a switch used to release, so it goes idle and comes back
+    /// under pressure like any Today tab.
+    static func shouldSuspend(_ f: Facts, after limit: TimeInterval) -> Bool {
+        if f.suspended || !f.loaded { return false }
+        if f.active || f.isPrivate { return false }
+        if f.pinned && !f.stashed { return false }
+        if f.playing || f.loading || f.hasInput { return false }
+        return f.idle >= limit
+    }
+
+    /// Least-recently-active first. Ties broken on id so the order is total and the check
+    /// can assert it.
+    static func lru(_ tabs: [(id: UUID, lastActive: Date)]) -> [UUID] {
+        tabs.sorted {
+            $0.lastActive == $1.lastActive ? $0.id.uuidString < $1.id.uuidString
+                                           : $0.lastActive < $1.lastActive
+        }.map(\.id)
+    }
+
+    /// Who gets suspended under memory pressure, given an LRU-ordered (oldest first) list of
+    /// tabs that are otherwise eligible. Critical takes everything; warning takes the older
+    /// half, so a warning that arrives while the user is working does not blow the whole
+    /// window away.
+    static func victims<T>(_ lruOldestFirst: [T], critical: Bool) -> [T] {
+        if critical { return lruOldestFirst }
+        return Array(lruOldestFirst.prefix(max(1, lruOldestFirst.count / 2)))
+    }
+
+    // MARK: Running
+
+    /// Coarse on purpose: the interval is a floor on how late a suspension can be, and
+    /// nobody can tell 30 minutes from 31.
+    static let sweepInterval: TimeInterval = 60
+
+    private static var timer: Timer?
+    private static var pressure: DispatchSourceMemoryPressure?
+    static var isRunning: Bool { timer != nil }
+
+    /// Match the lifetime of the live tab stores, including floating and parked stores.
+    /// The app may stay open after its last window closes; it needs no sweep then.
+    static func updateLifecycle() {
+        if TabStore.all.isEmpty {
+            timer?.invalidate()
+            timer = nil
+            pressure?.cancel()
+            pressure = nil
+            SidebarWarmOwnerBudget.setUnderPressure(false)
+        } else { begin() }
+    }
+
+    /// Idempotent; restarted when another store opens.
+    static func begin() {
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: sweepInterval, repeats: true) { _ in
+            // One timer for both sweeps. Auto-archive's shortest interval is twelve hours,
+            // so a minute of slop on it is beneath noticing, and a second Timer to say the
+            // same thing is a second Timer.
+            MainActor.assumeIsolated { BatterySaver.shared.refresh(); sweep(); Archive.sweep() }
+        }
+        timer?.tolerance = 10
+        let src = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: .main)
+        // The source is read back off the stored property rather than captured, so nothing
+        // non-Sendable crosses into the handler.
+        src.setEventHandler {
+            MainActor.assumeIsolated {
+                let event = pressure?.data ?? []
+                let normal = event.contains(.normal) && !event.contains(.warning) && !event.contains(.critical)
+                SidebarWarmOwnerBudget.setUnderPressure(!normal)
+                if !normal { relieve(critical: event.contains(.critical)) }
+            }
+        }
+        src.resume()
+        pressure = src
+    }
+
+    /// Ownership facts for one synchronous sweep. Shared pages are deduplicated by object,
+    /// since a restored row can reuse an id without owning the old row's document.
+    @MainActor struct Membership {
+        private(set) var tabs: [Tab] = []
+        private var members = Set<ObjectIdentifier>()
+        private var active = Set<ObjectIdentifier>()
+        private var visible = Set<ObjectIdentifier>()
+        private var stashed = Set<ObjectIdentifier>()
+
+        init<S: Sequence>(stores: S) where S.Element == TabStore {
+            for store in stores {
+                // Split lookup includes folder protection; resolve it once per window.
+                let split = store.activeSplit
+                for tab in store.tabs {
+                    let identity = ObjectIdentifier(tab)
+                    if members.insert(identity).inserted { tabs.append(tab) }
+                    visible.insert(identity)
+                    if store.current == tab.id || split?.contains(tab.id) == true {
+                        active.insert(identity)
+                    }
+                }
+                for stash in store.stashes.values {
+                    for tab in stash.tabs {
+                        let identity = ObjectIdentifier(tab)
+                        if members.insert(identity).inserted { tabs.append(tab) }
+                        stashed.insert(identity)
+                    }
+                }
+            }
+        }
+
+        func contains(_ tab: Tab) -> Bool { members.contains(ObjectIdentifier(tab)) }
+        func isActive(_ tab: Tab) -> Bool { active.contains(ObjectIdentifier(tab)) }
+        func isStashed(_ tab: Tab) -> Bool {
+            let identity = ObjectIdentifier(tab)
+            // A shared pin with a row in any window keeps its pinned exemption.
+            return stashed.contains(identity) && !visible.contains(identity)
+        }
+    }
+
+    /// Include the Spaces held behind the visible strip, without materializing each
+    /// store's concatenated `everyTab` collection first.
+    static var allTabs: [Tab] {
+        var seen = Set<ObjectIdentifier>(), result: [Tab] = []
+        for store in TabStore.all {
+            for tab in store.tabs where seen.insert(ObjectIdentifier(tab)).inserted { result.append(tab) }
+            for stash in store.stashes.values {
+                for tab in stash.tabs where seen.insert(ObjectIdentifier(tab)).inserted { result.append(tab) }
+            }
+        }
+        return result
+    }
+
+    /// The cheap facts: everything that can be read without talking to the web content
+    /// process. `playing` and `hasInput` are filled in later, only for tabs that got this
+    /// far, because both cost a round trip into WebKit.
+    private static func facts(_ tab: Tab, now: Date, active: Bool, stashed: Bool) -> Facts {
+        Facts(active: active, pinned: tab.stays, stashed: stashed,
+              isPrivate: tab.isPrivate, playing: tab.inMeetCall, loading: tab.loading, suspended: tab.suspended,
+              loaded: tab.existingWeb?.url != nil, idle: now.timeIntervalSince(tab.lastActive))
+    }
+
+    /// Asynchronous probes must use current ownership rather than the sweep snapshot.
+    /// Search only for this object, combining membership, selection and stash checks in
+    /// one traversal instead of rebuilding the whole session's tab array for each probe.
+    private static func currentFacts(_ tab: Tab, now: Date) -> Facts? {
+        var visible = false, active = false, stashed = false
+        for store in TabStore.all {
+            if store.tabs.contains(where: { $0 === tab }) {
+                visible = true
+                if store.current == tab.id || store.activeSplit?.contains(tab.id) == true { active = true }
+            }
+            if !stashed {
+                stashed = store.stashes.values.contains { $0.tabs.contains { $0 === tab } }
+            }
+        }
+        guard visible || stashed else { return nil }
+        return facts(tab, now: now, active: active, stashed: stashed && !visible)
+    }
+
+    private final class PlaybackProbe {
+        var continuation: CheckedContinuation<Bool, Never>?
+        var timeout: Task<Void, Never>?
+        func finish(_ protected: Bool) {
+            guard let continuation else { return }
+            self.continuation = nil
+            timeout?.cancel(); timeout = nil
+            continuation.resume(returning: protected)
+        }
+    }
+
+    /// Failure to hear from the media process is uncertain too. Bound the wait so a
+    /// stalled request cannot retain the tab's in-flight slot forever.
+    private static func protectedPlayback(in web: WKWebView) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let probe = PlaybackProbe()
+            probe.continuation = continuation
+            probe.timeout = Task { @MainActor in
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                probe.finish(true)
+            }
+            web.requestMediaPlaybackState { probe.finish($0 == .playing) }
+        }
+    }
+
+    private static var checking = Set<ObjectIdentifier>()
+
+    /// Both pressure and the timer use the same protection checks. The draft probe is
+    /// injectable so lifecycle races can be exercised without blocking a content process.
+    static func suspendIfEligible(_ tab: Tab, underPressure: Bool,
+                                  draftCheck: @MainActor (Tab) async -> Bool = { await $0.hasUnsubmittedInput() }) async {
+        await suspendIfEligible(tab, underPressure: underPressure, initial: nil, draftCheck: draftCheck)
+    }
+
+    private static func suspendIfEligible(_ tab: Tab, underPressure: Bool, initial: Facts?,
+                                         draftCheck: @MainActor (Tab) async -> Bool = { await $0.hasUnsubmittedInput() }) async {
+        let limit = underPressure ? 0 : BatterySaver.idleLimit(normal: Prefs.suspendAfter,
+                                                             saving: BatterySaver.shared.isActive)
+        let identity = ObjectIdentifier(tab)
+        guard !checking.contains(identity), Prefs.suspendTabs,
+              let initial = initial ?? currentFacts(tab, now: .now), shouldSuspend(initial, after: limit),
+              let web = tab.existingWeb else { return }
+        checking.insert(identity)
+        defer { checking.remove(identity) }
+        let pageURL = web.url
+        let document = tab.readingDocumentGeneration
+        let lastActive = tab.lastActive
+        let owner = tab.presentationOwner
+        let playing: Bool
+        if tab.pictureInPicture { playing = true }
+        else { playing = await protectedPlayback(in: web) && !TabAudio.isMuted(tab) }
+        let hasInput = await draftCheck(tab)
+        guard tab.existingWeb === web, web.url == pageURL,
+              tab.readingDocumentGeneration == document, tab.lastActive == lastActive,
+              tab.presentationOwner == owner, var fresh = currentFacts(tab, now: .now) else { return }
+        fresh.playing = playing || tab.pictureInPicture || tab.inMeetCall
+            || (MediaState.shared.isPlaying(tab) && !TabAudio.isMuted(tab))
+        fresh.hasInput = hasInput
+        let currentLimit = underPressure ? 0 : BatterySaver.idleLimit(normal: Prefs.suspendAfter,
+                                                                    saving: BatterySaver.shared.isActive)
+        if Prefs.suspendTabs, shouldSuspend(fresh, after: currentLimit) { tab.suspend() }
+    }
+
+    static func sweep(now: Date = .now) {
+        guard Prefs.suspendTabs else { return }
+        let limit = BatterySaver.idleLimit(normal: Prefs.suspendAfter, saving: BatterySaver.shared.isActive)
+        let membership = Membership(stores: TabStore.all)
+        for tab in membership.tabs {
+            let initial = facts(tab, now: now, active: membership.isActive(tab), stashed: membership.isStashed(tab))
+            guard shouldSuspend(initial, after: limit) else { continue }
+            Task { @MainActor [weak tab] in
+                if let tab { await suspendIfEligible(tab, underPressure: false, initial: initial) }
+            }
+        }
+    }
+
+    /// Pressure changes the idle threshold, never the media or draft protections.
+    static func relieve(critical: Bool) {
+        SidebarWarmOwnerBudget.purge()
+        guard Prefs.suspendTabs else { return }
+        let now = Date.now
+        let membership = Membership(stores: TabStore.all)
+        let eligible = membership.tabs.compactMap { tab -> (tab: Tab, facts: Facts)? in
+            let initial = facts(tab, now: now, active: membership.isActive(tab), stashed: membership.isStashed(tab))
+            return shouldSuspend(initial, after: 0) ? (tab, initial) : nil
+        }
+        let ordered = lru(eligible.map { (id: $0.tab.id, lastActive: $0.tab.lastActive) })
+        let doomed = Set(victims(ordered, critical: critical))
+        for (tab, initial) in eligible where doomed.contains(tab.id) {
+            Task { @MainActor [weak tab] in
+                if let tab { await suspendIfEligible(tab, underPressure: true, initial: initial) }
+            }
+        }
+    }
+
+    // MARK: Per-space tab state
+
+    /// Space switching parks tabs rather than reloading them, and a `Space` has nowhere to
+    /// put an interactionState — it is a Codable struct owned by Profiles.swift, and
+    /// changing its shape would rewrite everyone's spaces.json.
+    ///
+    /// ponytail: a sidecar file per profile, keyed space id → url → base64 state. It is
+    /// pure cache: delete it and spaces still switch, just without the scroll position.
+    /// Ceiling: nothing prunes it, so a space that has had a thousand urls in it keeps a
+    /// thousand rows (~600 bytes each).
+    @MainActor enum SpaceState {
+        fileprivate struct Row: Codable, Equatable, Sendable {
+            var t: String?
+            var s: String?
+            /// The page the state came from, written only for a row filed under a key that
+            /// is not it — see `Parked.page`. Optional, so a sidecar written before it
+            /// existed decodes exactly as it always did. One-way, the way the session
+            /// file's versions are: an older build ignores `u` and parks such a row at its
+            /// home while the state it assigns wakes on the wander.
+            var u: String?
+            var needsRecovery: Bool?
+        }
+
+        nonisolated static func url(for profileID: UUID, in dir: URL) -> URL {
+            dir.appendingPathComponent("spacestate\(ProfileManager.suffix(profileID)).json")
+        }
+
+        fileprivate typealias Table = [String: [String: Row]]
+        struct StagedSave: Sendable {
+            fileprivate let file: URL
+            fileprivate let spaces: Set<UUID>
+            fileprivate let beforeTable: Table
+            fileprivate let afterTable: Table
+            fileprivate let beforePrimary: Data?
+            fileprivate let wasDirty: Bool
+            fileprivate let beforeGenerations: RecoverySnapshots.Generations
+            fileprivate let afterGenerations: RecoverySnapshots.Generations
+            fileprivate let previousRowVersions: [UUID: UInt64]
+            fileprivate let rowVersions: [UUID: UInt64]
+            fileprivate let previousCacheVersions: [UUID: UInt64]
+            fileprivate let cacheVersions: [UUID: UInt64]
+            fileprivate var ownership: SessionPersistence.Ownership?
+        }
+
+        /// Worker state is confined to the shared persistence lane; UI cache contains
+        /// immutable parked values and never waits behind an autosave that is writing.
+        private final class Worker: @unchecked Sendable {
+            var tables: [URL: Table] = [:]
+            var primary: [URL: Data] = [:]
+            var dirty = Set<URL>()
+            var rowVersions: [URL: [String: UInt64]] = [:]
+            var nextVersion: UInt64 = 0
+
+            func read(_ file: URL) -> Table {
+                if let table = tables[file] { return table }
+                var result: Table = [:]
+                for candidate in [file, file.appendingPathExtension("previous")] {
+                    guard let data = try? Data(contentsOf: candidate),
+                          var decoded = try? JSONDecoder().decode(Table.self, from: data) else { continue }
+                    if candidate != file {
+                        decoded = decoded.mapValues { $0.mapValues { row in
+                            var copy = row; copy.needsRecovery = true; return copy
+                        } }
+                    } else { primary[file] = data }
+                    result = decoded; break
+                }
+                tables[file] = result
+                return result
+            }
+
+            /// Durable compatibility callers permit external replacement between calls.
+            /// Normal prepared UI reads never enter this synchronous boundary.
+            func refreshIfChanged(_ file: URL) {
+                let current = try? Data(contentsOf: file)
+                guard current != primary[file] else { return }
+                tables.removeValue(forKey: file); primary.removeValue(forKey: file); dirty.remove(file)
+                rowVersions.removeValue(forKey: file)
+                _ = read(file)
+            }
+
+            func update(_ rows: [String: Row]?, space: UUID, file: URL) -> Bool {
+                update([space: rows], file: file)
+            }
+            func update(_ changes: [UUID: [String: Row]?], file: URL) -> Bool {
+                var table = read(file)
+                var changed = false
+                for (space, rows) in changes {
+                    nextVersion &+= 1
+                    rowVersions[file, default: [:]][space.uuidString] = nextVersion
+                    if table[space.uuidString] != rows { changed = true }
+                    if let rows { table[space.uuidString] = rows }
+                    else { table.removeValue(forKey: space.uuidString) }
+                }
+                tables[file] = table
+                guard changed || dirty.contains(file) else { return true }
+                dirty.insert(file)
+                let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+                guard let data = try? encoder.encode(table) else { return false }
+                let trusted = primary[file]
+                let ok = RecoverySnapshots.write(data, to: file) { candidate in
+                    candidate == data || candidate == trusted || readable(candidate)
+                }
+                if ok { primary[file] = data; dirty.remove(file) }
+                return ok
+            }
+        }
+        private nonisolated static let worker = Worker()
+        private static var cache: [URL: [String: [String: Parked]]] = [:]
+        private static var loaded = Set<URL>()
+        private static var retired = Set<URL>()
+        private static var legacyFiles = Set<URL>()
+        private static var cacheVersions: [URL: [String: UInt64]] = [:]
+        private static var nextCacheVersion: UInt64 = 0
+        private static func advanceCache(_ file: URL, space: UUID) -> UInt64 {
+            nextCacheVersion &+= 1
+            cacheVersions[file, default: [:]][space.uuidString] = nextCacheVersion
+            return nextCacheVersion
+        }
+
+        private nonisolated static func parked(_ table: Table) -> [String: [String: Parked]] {
+            table.mapValues { rows in rows.mapValues {
+                Parked(title: $0.t ?? "", state: $0.s.flatMap { Data(base64Encoded: $0) },
+                       page: $0.u.flatMap(URL.init(string:)), needsRecovery: $0.needsRecovery == true)
+            } }
+        }
+        private nonisolated static func rows(_ parked: [String: Parked]) -> [String: Row] {
+            parked.mapValues {
+                Row(t: $0.title, s: $0.state?.base64EncodedString(), u: $0.page?.absoluteString,
+                    needsRecovery: $0.needsRecovery ? true : nil)
+            }
+        }
+        private nonisolated static func readable(_ data: Data) -> Bool {
+            (try? JSONDecoder().decode(Table.self, from: data)) != nil
+        }
+
+        /// Await before restoration. Large first-generation decoding and state decoding
+        /// happen on the worker; later Space switches only read the in-memory values.
+        static func prepare(profiles: [UUID], in dir: URL) async {
+            for profile in profiles {
+                let file = url(for: profile, in: dir)
+                guard !loaded.contains(file), !retired.contains(file) else { continue }
+                let loaded = await SessionPersistence.shared.perform { parked(worker.read(file)) }
+                guard !retired.contains(file) else { continue }
+                cache[file] = loaded.merging(cache[file] ?? [:], uniquingKeysWith: { _, newer in newer })
+                self.loaded.insert(file)
+            }
+        }
+
+        static func invalidateCache() async {
+            await SessionPersistence.shared.perform {
+                worker.tables.removeAll(); worker.primary.removeAll(); worker.dirty.removeAll(); worker.rowVersions.removeAll()
+            }
+            cache.removeAll(); loaded.removeAll(); cacheVersions.removeAll()
+        }
+
+        /// A freshly generated profile ID has no sidecar or recovery generations.
+        /// Establish its empty UI cache before any window is constructed, without
+        /// joining the disk lane behind another profile's in-flight write.
+        static func registerNewProfile(profileID: UUID, in dir: URL) {
+            let file = url(for: profileID, in: dir)
+            guard !retired.contains(file) else { return }
+            cache[file] = [:]
+            loaded.insert(file)
+        }
+
+        /// Profile deletion closes UI admission before awaiting the ordered barrier.
+        /// Every session-generation producer uses the same retired destination keys.
+        static func retire(profileID: UUID, in dir: URL) async {
+            let file = url(for: profileID, in: dir)
+            retired.insert(file)
+            cache.removeValue(forKey: file); loaded.remove(file)
+            await SessionPersistence.shared.retire(files: [file,
+                ProfileManager.sessionURL(for: profileID, in: dir),
+                ProfileManager.spacesURL(for: profileID, in: dir)])
+            await SessionPersistence.shared.perform {
+                worker.tables.removeValue(forKey: file)
+                worker.primary.removeValue(forKey: file)
+                worker.dirty.remove(file); worker.rowVersions.removeValue(forKey: file)
+            }
+        }
+
+        static func load(space: UUID, profileID: UUID, in dir: URL) -> [String: Parked] {
+            let file = url(for: profileID, in: dir)
+            guard !retired.contains(file) else { return [:] }
+            if legacyFiles.contains(file) {
+                cache[file] = SessionPersistence.shared.sync {
+                    worker.refreshIfChanged(file)
+                    return parked(worker.read(file))
+                }
+                loaded.insert(file)
+            } else if !loaded.contains(file) {
+                // Compatibility for isolated checks and newly introduced profiles.
+                let disk = SessionPersistence.shared.sync { parked(worker.read(file)) }
+                cache[file] = disk.merging(cache[file] ?? [:], uniquingKeysWith: { _, newer in newer })
+                loaded.insert(file)
+            }
+            return cache[file]?[space.uuidString] ?? [:]
+        }
+
+        /// Accepted into the ordered queue; flushPersistence reports durable completion.
+        @discardableResult
+        static func enqueueSave(_ parked: [String: Parked], space: UUID,
+                                profileID: UUID, in dir: URL) -> Bool {
+            let file = url(for: profileID, in: dir)
+            guard !retired.contains(file) else { return false }
+            _ = advanceCache(file, space: space)
+            cache[file, default: [:]][space.uuidString] = parked
+            return SessionPersistence.shared.enqueue(file: file) {
+                worker.update(rows(parked), space: space, file: file)
+            }
+        }
+
+        @discardableResult
+        static func saveAsync(_ parked: [String: Parked], space: UUID,
+                              profileID: UUID, in dir: URL) async -> Bool {
+            guard enqueueSave(parked, space: space, profileID: profileID, in: dir) else { return false }
+            return await SessionPersistence.shared.flush()
+        }
+
+        @discardableResult
+        static func removeAsync(space: UUID, profileID: UUID, in dir: URL) async -> Bool {
+            let file = url(for: profileID, in: dir)
+            guard !retired.contains(file) else { return false }
+            _ = advanceCache(file, space: space)
+            cache[file]?.removeValue(forKey: space.uuidString)
+            SessionPersistence.shared.enqueue(file: file) { worker.update(nil, space: space, file: file) }
+            return await SessionPersistence.shared.flush()
+        }
+
+        /// Stage one Space and retain a receipt for conditional failure repair. File
+        /// generations and decoded state are captured together on the persistence lane.
+        static func stageSave(_ parked: [String: Parked], space: UUID,
+                              profileID: UUID, in dir: URL) async -> (succeeded: Bool, change: StagedSave?) {
+            await stageSave([space: parked], profileID: profileID, in: dir)
+        }
+        static func stageSave(_ changes: [UUID: [String: Parked]],
+                              profileID: UUID, in dir: URL) async -> (succeeded: Bool, change: StagedSave?) {
+            let file = url(for: profileID, in: dir)
+            guard !retired.contains(file) else { return (false, nil) }
+            let cacheBefore = cache[file] ?? [:]
+            var previousCacheVersions: [UUID: UInt64] = [:], cacheVersions: [UUID: UInt64] = [:]
+            for (space, parked) in changes {
+                previousCacheVersions[space] = self.cacheVersions[file]?[space.uuidString] ?? 0
+                cacheVersions[space] = advanceCache(file, space: space)
+                cache[file, default: [:]][space.uuidString] = parked
+            }
+            let priorCacheVersions = previousCacheVersions, stagedCacheVersions = cacheVersions
+            let result = await SessionPersistence.shared.mutate(file: file, ownsResult: { $0.1 != nil }) {
+                () -> (Bool, StagedSave?) in
+                let beforeTable = worker.read(file)
+                let beforePrimary = worker.primary[file], wasDirty = worker.dirty.contains(file)
+                let beforeVersions = Dictionary(uniqueKeysWithValues: changes.keys.map {
+                    ($0, worker.rowVersions[file]?[$0.uuidString] ?? 0)
+                })
+                guard let before = try? RecoverySnapshots.Generations.capture(file) else { return (false, nil) }
+                let converted: [UUID: [String: Row]?] = changes.mapValues { rows($0) }
+                let succeeded = worker.update(converted, file: file)
+                guard let after = try? RecoverySnapshots.Generations.capture(file) else { return (false, nil) }
+                let versions = Dictionary(uniqueKeysWithValues: changes.keys.map {
+                    ($0, worker.rowVersions[file]?[$0.uuidString] ?? 0)
+                })
+                let change = StagedSave(file: file, spaces: Set(changes.keys), beforeTable: beforeTable,
+                    afterTable: worker.read(file), beforePrimary: beforePrimary, wasDirty: wasDirty,
+                    beforeGenerations: before, afterGenerations: after,
+                    previousRowVersions: beforeVersions, rowVersions: versions,
+                    previousCacheVersions: priorCacheVersions, cacheVersions: stagedCacheVersions)
+                return (succeeded, change)
+            }
+            if result?.value.1 == nil {
+                for space in changes.keys where self.cacheVersions[file]?[space.uuidString] == cacheVersions[space] {
+                    cache[file, default: [:]][space.uuidString] = cacheBefore[space.uuidString]
+                    self.cacheVersions[file, default: [:]][space.uuidString] = previousCacheVersions[space]
+                }
+            }
+            var staged = result?.value ?? (false, nil)
+            staged.1?.ownership = result?.ownership
+            return staged
+        }
+
+        /// Repair only rows still owned by this staging receipt. A complete unchanged
+        /// batch restores exact generation bytes; partial repairs preserve newer rows.
+        static func repair(_ change: StagedSave) async -> Bool {
+            guard !retired.contains(change.file), let ownership = change.ownership else { return true }
+            let empty: (succeeded: Bool, restored: Set<UUID>) = (true, [])
+            let result = await SessionPersistence.shared.repair(ownership) { (ownsFile: Bool) -> ((succeeded: Bool, restored: Set<UUID>), SessionPersistence.RepairDisposition) in
+                let owned = change.spaces.filter {
+                    worker.rowVersions[change.file]?[$0.uuidString] == change.rowVersions[$0]
+                }
+                guard !owned.isEmpty else { return ((true, []), .unchanged) }
+                guard let current = try? RecoverySnapshots.Generations.capture(change.file) else { return ((false, []), .failed) }
+                let table = worker.read(change.file)
+                let succeeded: Bool
+                let disposition: SessionPersistence.RepairDisposition
+                if ownsFile, owned == change.spaces, current == change.afterGenerations && table == change.afterTable {
+                    succeeded = change.beforeGenerations.restore(change.file)
+                    if succeeded {
+                        worker.tables[change.file] = change.beforeTable
+                        worker.primary[change.file] = change.beforePrimary
+                        if change.wasDirty { worker.dirty.insert(change.file) } else { worker.dirty.remove(change.file) }
+                    }
+                    disposition = succeeded ? .rolledBack : .failed
+                } else {
+                    guard current.current == worker.primary[change.file] else { return ((true, []), .unchanged) }
+                    let previous = Dictionary(uniqueKeysWithValues: owned.map { ($0, change.beforeTable[$0.uuidString]) })
+                    succeeded = worker.update(previous, file: change.file)
+                    disposition = succeeded ? .published : .failed
+                }
+                if succeeded {
+                    for space in owned {
+                        worker.rowVersions[change.file, default: [:]][space.uuidString] = change.previousRowVersions[space]
+                    }
+                }
+                return ((succeeded, succeeded ? owned : []), disposition)
+            } ?? empty
+            for space in result.restored where cacheVersions[change.file]?[space.uuidString] == change.cacheVersions[space] {
+                if let previous = change.beforeTable[space.uuidString] {
+                    cache[change.file, default: [:]][space.uuidString] = self.parked([space.uuidString: previous])[space.uuidString]
+                } else { cache[change.file]?.removeValue(forKey: space.uuidString) }
+                cacheVersions[change.file, default: [:]][space.uuidString] = change.previousCacheVersions[space]
+            }
+            return result.succeeded
+        }
+
+        /// Durable compatibility boundary for move/delete transactions. Normal UI
+        /// autosaves use enqueueSave, and backups/quit await the shared lane's flush.
+        @discardableResult
+        static func save(_ parked: [String: Parked], space: UUID,
+                         profileID: UUID, in dir: URL) -> Bool {
+            let file = url(for: profileID, in: dir)
+            guard !retired.contains(file) else { return false }
+            legacyFiles.insert(file)
+            let ok = SessionPersistence.shared.sync(file: file) {
+                worker.refreshIfChanged(file)
+                return worker.update(rows(parked), space: space, file: file)
+            }
+            if ok {
+                _ = advanceCache(file, space: space)
+                cache[file] = SessionPersistence.shared.sync { self.parked(worker.read(file)) }
+                loaded.insert(file)
+            }
+            return ok
+        }
+
+        @discardableResult
+        static func remove(space: UUID, profileID: UUID, in dir: URL) -> Bool {
+            let file = url(for: profileID, in: dir)
+            guard !retired.contains(file) else { return false }
+            legacyFiles.insert(file)
+            let ok = SessionPersistence.shared.sync(file: file) {
+                worker.refreshIfChanged(file)
+                return worker.update(nil, space: space, file: file)
+            }
+            if ok {
+                _ = advanceCache(file, space: space)
+                cache[file] = SessionPersistence.shared.sync { self.parked(worker.read(file)) }
+                loaded.insert(file)
+            }
+            return ok
+        }
+
+    }
+
+    // MARK: Offline check
+
+    /// Pure: a decision table, a sort, JSON round-trips in memory, and UserDefaults keys
+    /// that are put back exactly as they were found. No window server, no network, no
+    /// WKWebView.
+    static func check() -> [(String, Bool)] {
+        var out = SnapshotPersistence.check()
+        func assert(_ name: String, _ ok: Bool) { out.append((name, ok)) }
+
+        // MARK: the decision table
+        let hour: TimeInterval = 3600
+        let idle = Facts(idle: hour)
+        assert("an idle background tab suspends", shouldSuspend(idle, after: 30 * 60))
+        assert("a tab idle for less than the interval does not",
+               !shouldSuspend(Facts(idle: 60), after: 30 * 60))
+        assert("a tab idle for exactly the interval does",
+               shouldSuspend(Facts(idle: 30 * 60), after: 30 * 60))
+        var active = idle; active.active = true
+        assert("the active tab of a window never suspends", !shouldSuspend(active, after: 0))
+        var pinned = idle; pinned.pinned = true
+        assert("a pinned tab never suspends", !shouldSuspend(pinned, after: 0))
+        // The pin exemption is about the row you can click, and a Space kept alive behind the
+        // one on screen has no rows. Before Spaces stayed loaded a switch released these; now
+        // the sweep is the only thing that does.
+        var stashedPin = pinned; stashedPin.stashed = true
+        assert("a pinned tab in a Space kept alive is due once it has been idle long enough",
+               shouldSuspend(stashedPin, after: 30 * 60))
+        assert("…while the pinned row on the strip still is not",
+               !shouldSuspend(pinned, after: 30 * 60))
+        assert("critical pressure reclaims a kept-alive Space's pinned tabs",
+               shouldSuspend(stashedPin, after: 0))
+        var stashedIdle = Facts(idle: 60); stashedIdle.stashed = true
+        assert("a stashed tab is no more suspendable before the interval than any other",
+               !shouldSuspend(stashedIdle, after: 30 * 60))
+        var stashedPlaying = stashedPin; stashedPlaying.playing = true
+        assert("a kept-alive Space still playing a video is left alone",
+               !shouldSuspend(stashedPlaying, after: 0))
+        var priv = idle; priv.isPrivate = true
+        assert("a private tab never suspends", !shouldSuspend(priv, after: 0))
+        var playing = idle; playing.playing = true
+        assert("a tab playing media never suspends", !shouldSuspend(playing, after: 0))
+        var typing = idle; typing.hasInput = true
+        assert("a tab with unsubmitted form input never suspends", !shouldSuspend(typing, after: 0))
+        var loading = idle; loading.loading = true
+        assert("a loading tab is left alone", !shouldSuspend(loading, after: 0))
+        var already = idle; already.suspended = true
+        assert("an already suspended tab is not suspended twice", !shouldSuspend(already, after: 0))
+        var blank = idle; blank.loaded = false
+        assert("a tab with nothing loaded has nothing to reclaim", !shouldSuspend(blank, after: 0))
+        assert("a zero interval suspends every eligible tab immediately",
+               shouldSuspend(Facts(idle: 0), after: 0))
+        // A page another page opened is not asked about anywhere in this table, and that is
+        // the point: every `target="_blank"` and every `window.open` comes through WebKit's
+        // popup path, so the commonest link on the web would otherwise make a tab that could
+        // never be reclaimed. A `_blank` tab is the first row, and a popup floating as a
+        // Little Timo is the "active tab of a window" row — the one page of a Little Timo is
+        // always that window's current tab. `Tab.suspend` asks nothing extra either.
+        // Every "never" reason beats the timer, even at an hour idle.
+        assert("no single exclusion is overridden by a long idle time",
+               [active, pinned, priv, playing, typing, loading, already, blank]
+                   .allSatisfy { !shouldSuspend($0, after: 0) })
+
+        // MARK: LRU under memory pressure
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let a = UUID(uuidString: "00000000-0000-0000-0000-0000000000AA")!
+        let b = UUID(uuidString: "00000000-0000-0000-0000-0000000000BB")!
+        let c = UUID(uuidString: "00000000-0000-0000-0000-0000000000CC")!
+        let d = UUID(uuidString: "00000000-0000-0000-0000-0000000000DD")!
+        let order = lru([(id: b, lastActive: t0 + 300), (id: a, lastActive: t0),
+                         (id: d, lastActive: t0 + 900), (id: c, lastActive: t0 + 600)])
+        assert("lru puts the least recently used first", order == [a, b, c, d])
+        assert("equal timestamps still give a stable total order",
+               lru([(id: c, lastActive: t0), (id: a, lastActive: t0), (id: b, lastActive: t0)]) == [a, b, c])
+        assert("a warning takes the older half, oldest first",
+               victims(order, critical: false) == [a, b])
+        assert("a warning with one candidate still takes it",
+               victims([a], critical: false) == [a])
+        assert("a warning with nothing eligible takes nothing",
+               victims([UUID](), critical: false).isEmpty)
+        assert("critical takes everything eligible", victims(order, critical: true) == [a, b, c, d])
+
+        // MARK: session format round-trip
+        let state = Data("interaction-state-bytes".utf8)
+        let entries = [[Session.Entry(url: "https://a.example/", title: "Alpha",
+                                      state: state.base64EncodedString()),
+                        Session.Entry(url: "https://b.example/", title: "Beta", state: nil)],
+                       [Session.Entry(url: "https://c.example/", title: "Gamma", state: nil)]]
+        let encoded = Session.encode(entries) ?? Data()
+        let decoded = Session.decode(encoded)
+        assert("a session round-trips through the new format", decoded == entries)
+        assert("the interaction state survives the round-trip",
+               decoded.first?.first?.state.flatMap { Data(base64Encoded: $0) } == state)
+        assert("window grouping survives the round-trip",
+               decoded.count == 2 && decoded[0].count == 2 && decoded[1].count == 1)
+
+        let firstID = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+        let secondID = UUID(uuidString: "00000000-0000-0000-0000-0000000000A2")!
+        let identityEntries = [[
+            Session.Entry(id: firstID.uuidString, url: "https://same.example/",
+                          title: "first", state: Data("first".utf8).base64EncodedString(),
+                          kind: .today),
+            Session.Entry(id: secondID.uuidString, url: "https://same.example/",
+                          title: "second", state: Data("second".utf8).base64EncodedString(),
+                          kind: .pinned, home: "https://pin.example/")
+        ]]
+        let identityData = Session.encode(identityEntries, selected: [secondID.uuidString]) ?? Data()
+        let identityBack = Session.decode(identityData)
+        assert("v4 keeps duplicate-url tabs as distinct identified entries",
+               identityBack == identityEntries && identityBack[0][0].state != identityBack[0][1].state)
+        assert("v4 remembers the selected tab by identity",
+               Session.decodeSelected(identityData) == [secondID])
+        assert("v4 remembers a wandered pin's section and home separately from its page",
+               identityBack[0][1].kind == .pinned
+               && identityBack[0][1].home == "https://pin.example/"
+               && identityBack[0][1].url == "https://same.example/")
+
+        let damaged = Session.normalizedEntries([
+            identityEntries[0][0],
+            Session.Entry(id: firstID.uuidString, url: "https://same.example/", state: "second"),
+            Session.Entry(id: "broken", url: "https://other.example/", title: "Keep me")
+        ])
+        assert("damaged session IDs recover without collapsing duplicate tabs",
+               Set(damaged.compactMap(\.id)).count == 3 && damaged[0] == identityEntries[0][0]
+               && damaged[1].state == "second" && damaged[2].title == "Keep me")
+        let damagedKind = Data("{\"version\":4,\"windows\":[[{\"url\":\"https://keep.example/\",\"title\":\"Keep\",\"kind\":\"broken\"},{\"url\":\"https://also.example/\",\"kind\":\(TabKind.pinned.rawValue)}]]}".utf8)
+        let recovered = Session.decode(damagedKind)
+        assert("an unknown tab kind does not discard the rest of a session",
+               recovered.first?.count == 2 && recovered.first?.last?.kind == .pinned)
+
+        // The bytes the original URL-only format wrote.
+        let legacy = Data(#"[["https://a.example/","https://b.example/"],["https://c.example/"]]"#.utf8)
+        let old = Session.decode(legacy)
+        assert("an old url-only session file still reads",
+               old.map { $0.map(\.url) } == [["https://a.example/", "https://b.example/"],
+                                             ["https://c.example/"]])
+        assert("an old session file simply has no extra fidelity",
+               old.allSatisfy { $0.allSatisfy { $0.title == nil && $0.state == nil } })
+        assert("an old session file parks nothing, so those tabs load as they always did",
+               Session.parked(old[0]).isEmpty)
+        assert("a new session file parks what it knows",
+               Session.parked(entries[0]).count == 2
+               && Session.parked(entries[0])["https://a.example/"]?.title == "Alpha"
+               && Session.parked(entries[0])["https://a.example/"]?.state == state)
+        assert("garbage in the session file decodes to nothing, not a crash",
+               Session.decode(Data("not json at all".utf8)).isEmpty)
+        assert("an empty session file decodes to nothing", Session.decode(Data()).isEmpty)
+
+        // MARK: the per-space sidecar
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("timo-suspend-\(UUID().uuidString)")
+        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        let profile = ProfileManager.defaultID
+        let spaceA = UUID(), spaceB = UUID()
+        assert("a space with no sidecar loads empty",
+               SpaceState.load(space: spaceA, profileID: profile, in: root).isEmpty)
+        SpaceState.save(["https://a.example/": Parked(title: "Alpha", state: state)],
+                        space: spaceA, profileID: profile, in: root)
+        SpaceState.save(["https://z.example/": Parked(title: "Zulu", state: nil)],
+                        space: spaceB, profileID: profile, in: root)
+        let backA = SpaceState.load(space: spaceA, profileID: profile, in: root)
+        assert("a space's tab state round-trips",
+               backA["https://a.example/"]?.state == state && backA["https://a.example/"]?.title == "Alpha")
+        assert("writing one space leaves the other alone",
+               SpaceState.load(space: spaceB, profileID: profile, in: root)["https://z.example/"]?.title == "Zulu")
+        assert("the sidecar is per profile",
+               SpaceState.load(space: spaceA, profileID: UUID(), in: root).isEmpty)
+        assert("the sidecar file lands under the profile's own name",
+               SpaceState.url(for: profile, in: root).lastPathComponent == "spacestate.json")
+        assert("a row that never left home says nothing about where it is",
+               backA["https://a.example/"]?.page == nil)
+
+        // A pinned row browsed away from the page it was pinned at. The Space's list names it
+        // by its home, so that is the key it has to be findable under — this is the round
+        // trip a Space rebuilt from disk makes, and the one that used to come up empty and
+        // leave the row named after its host. See `TabStore.saveCurrentSpace`.
+        let home = "https://github.example/timo", pin = URL(string: home)!
+        let wander = URL(string: "https://github.example/timo/pull/1")!
+        let spaceC = UUID()
+        SpaceState.save([home: Parked(title: "Pinned titles", state: state).on(wander)],
+                        space: spaceC, profileID: profile, in: root)
+        let backC = SpaceState.load(space: spaceC, profileID: profile, in: root)
+        assert("a wandered pinned row is filed under the home its Space names it by",
+               backC[home]?.title == "Pinned titles" && backC[home]?.state == state)
+        assert("…and says which page that state came from, so the switch back is not a × home",
+               backC[home]?.page == wander)
+
+        // The rule that fills the file, driven with no tab in the room. See
+        // `TabStore.sidecarEntry`, the one writer, and `TabStore.restore` at the other end.
+        let row = Parked(title: "Pinned titles", state: state)
+        let atHome = TabStore.sidecarEntry(page: pin, home: pin, snapshot: row)
+        assert("a row on the page it was pinned at is filed under it, saying nothing about where it is",
+               atHome?.key == home && atHome?.parked.state == state && atHome?.parked.page == nil)
+        let wandered = TabStore.sidecarEntry(page: wander, home: pin, snapshot: row)
+        assert("a wandered row is filed under its home alone, carrying the page it was on",
+               wandered?.key == home && wandered?.parked.page == wander
+                   && wandered?.parked.state == state)
+        let today = TabStore.sidecarEntry(page: wander, home: nil, snapshot: Parked(title: "Pull 1"))
+        assert("a Today tab has no home, so it is filed under the page it is on",
+               today?.key == wander.absoluteString && today?.parked.page == nil)
+        let pdf = URL(string: "file:///Users/someone/paper.pdf")!
+        assert("a page that is not web stays out of a file every reader hands http urls to",
+               TabStore.sidecarEntry(page: pdf, home: nil, snapshot: Parked(title: "paper.pdf")) == nil)
+        assert("…and so does a row that has wandered onto one",
+               TabStore.sidecarEntry(page: pdf, home: pin, snapshot: row) == nil)
+        assert("a row whose whereabouts are unknown is not filed at all",
+               TabStore.sidecarEntry(page: nil, home: pin, snapshot: row) == nil)
+
+        // The bytes a sidecar written before the page field holds: `t` and nothing else.
+        let oldRoot = fm.temporaryDirectory.appendingPathComponent("timo-spacestate-\(UUID().uuidString)")
+        try? fm.createDirectory(at: oldRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: oldRoot) }
+        let spaceD = UUID()
+        try? Data(#"{"\#(spaceD.uuidString)":{"https://a.example/":{"t":"Alpha"}}}"#.utf8)
+            .write(to: SpaceState.url(for: profile, in: oldRoot))
+        let oldBack = SpaceState.load(space: spaceD, profileID: profile, in: oldRoot)
+        assert("a sidecar written before the page field still reads, and parks at its key",
+               oldBack["https://a.example/"]?.title == "Alpha"
+                   && oldBack["https://a.example/"]?.page == nil)
+
+        // MARK: defaults
+        let defaults = UserDefaults.timo
+        let hadToggle = defaults.object(forKey: "suspendTabs")
+        let hadInterval = defaults.object(forKey: "suspendAfter")
+        defer {
+            defaults.set(hadToggle, forKey: "suspendTabs")
+            defaults.set(hadInterval, forKey: "suspendAfter")
+        }
+        defaults.removeObject(forKey: "suspendTabs")
+        defaults.removeObject(forKey: "suspendAfter")
+        assert("suspension is on out of the box", Prefs.suspendTabs)
+        assert("the default interval is 30 minutes", Prefs.suspendAfter == 30 * 60)
+        Prefs.suspendTabs = false
+        assert("the toggle round-trips off", Prefs.suspendTabs == false)
+        Prefs.suspendTabs = true
+        assert("the toggle round-trips on", Prefs.suspendTabs == true)
+        Prefs.suspendAfter = 90
+        assert("the interval round-trips", Prefs.suspendAfter == 90)
+        defaults.set(0, forKey: "suspendAfter")
+        assert("a zero interval in defaults falls back to the default, not to instant",
+               Prefs.suspendAfter == 30 * 60)
+        defaults.set(-5, forKey: "suspendAfter")
+        assert("a negative interval in defaults falls back too", Prefs.suspendAfter == 30 * 60)
+
+        return out
+    }
+}

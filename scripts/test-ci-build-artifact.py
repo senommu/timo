@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Exercise runtime-only archive transfer and provenance failures."""
+import importlib.util
+import json
+from pathlib import Path
+import tarfile
+import tempfile
+import unittest
+
+SCRIPT = Path(__file__).with_name("ci-build-artifact.py")
+
+
+class BuildArtifactTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        spec = importlib.util.spec_from_file_location("artifact", SCRIPT)
+        self.artifact = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.artifact)
+        self.binary = self.root / ".build/arm64-apple-macosx/debug"
+        self.binary.mkdir(parents=True)
+        (self.root / ".build/debug").symlink_to("arm64-apple-macosx/debug")
+        for relative in ("timo", "NativeLeaseHolder", "TimoPackageTests.xctest/Contents/MacOS/TimoPackageTests",
+                         "Timo_timo.bundle/resource.txt", "timo.build/large.o"):
+            p = self.binary / relative
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("fixture")
+            p.chmod(0o755)
+        (self.binary / "description.json").write_text(json.dumps({"builtTestProducts": [{
+            "binaryPath": str(self.binary / "TimoPackageTests.xctest/Contents/MacOS/TimoPackageTests")}]}))
+        app = self.root / "Timo.app/Contents/MacOS/Timo"
+        app.parent.mkdir(parents=True)
+        app.write_text("fixture")
+        app.chmod(0o755)
+        self.archive = self.root / "runtime.tar.gz"
+
+    def pack(self):
+        self.artifact.pack(self.root, self.binary, self.archive, "revision", "toolchain")
+
+    def use_swiftbuild_products(self):
+        destination = self.root / ".build/out/Products/Debug"
+        destination.parent.mkdir(parents=True)
+        self.binary.rename(destination)
+        self.binary = destination
+        (self.binary / "description.json").unlink()
+        (self.root / ".build/debug").unlink()
+        (self.root / ".build/debug").symlink_to("out/Products/Debug")
+
+    def test_roundtrip_keeps_only_runtime_resources_modes_and_symlinks(self):
+        self.pack()
+        with tarfile.open(self.archive) as archive:
+            names = archive.getnames()
+        self.assertFalse(any("large.o" in name for name in names))
+        self.assertIn(".build/arm64-apple-macosx/debug/description.json", names)
+        self.assertIn("Timo.app/Contents/MacOS/Timo", names)
+        # A consumer has the same checkout path on a different runner.
+        (self.root / ".build").rename(self.root / "original-build")
+        (self.root / "Timo.app").rename(self.root / "original-app")
+        self.artifact.restore(self.root, self.archive, "revision", "toolchain")
+        self.assertEqual((self.binary / "Timo_timo.bundle/resource.txt").read_text(), "fixture")
+        self.assertTrue((self.root / ".build/debug").is_symlink())
+        self.assertTrue((self.binary / "timo").stat().st_mode & 0o111)
+        self.assertTrue((self.root / "Timo.app/Contents/MacOS/Timo").stat().st_mode & 0o111)
+
+    def test_roundtrip_preserves_native_lease_holder_and_executable_mode(self):
+        self.pack()
+        (self.root / ".build").rename(self.root / "original-build")
+        (self.root / "Timo.app").rename(self.root / "original-app")
+        self.artifact.restore(self.root, self.archive, "revision", "toolchain")
+        helper = self.binary / "NativeLeaseHolder"
+        self.assertTrue(helper.is_file(), "restored test runtime must include the independent lease holder")
+        self.assertEqual(helper.read_text(), "fixture")
+        self.assertEqual(helper.stat().st_mode & 0o777, 0o755)
+
+    def test_swiftbuild_roundtrip_without_native_build_description(self):
+        # Swift Build uses the public --show-bin-path result and does not write
+        # the legacy native engine's description.json file.
+        self.use_swiftbuild_products()
+        self.pack()
+        (self.root / ".build").rename(self.root / "original-build")
+        (self.root / "Timo.app").rename(self.root / "original-app")
+        self.artifact.restore(self.root, self.archive, "revision", "toolchain")
+        self.assertEqual((self.root / ".build/debug").resolve(), self.binary)
+        self.assertTrue((self.binary / "TimoPackageTests.xctest/Contents/MacOS/TimoPackageTests").is_file())
+        self.assertFalse((self.binary / "description.json").exists())
+
+    def test_swiftbuild_includes_each_test_bundle_and_rejects_invalid_bundles(self):
+        self.use_swiftbuild_products()
+        extra = self.binary / "ExtraTests.xctest/Contents/MacOS/ExtraTests"
+        extra.parent.mkdir(parents=True)
+        extra.write_text("fixture")
+        extra.chmod(0o755)
+        self.pack()
+        with tarfile.open(self.archive) as archive:
+            self.assertIn(str(extra.relative_to(self.root)), archive.getnames())
+        extra.unlink()
+        with self.assertRaises(ValueError):
+            self.pack()
+
+    def test_swiftbuild_missing_tests_or_release_products_cannot_be_published(self):
+        self.use_swiftbuild_products()
+        with self.assertRaises(ValueError):
+            self.artifact.pack(self.root, self.binary.with_name("Release"), self.archive, "revision", "toolchain")
+        bundle = self.binary / "TimoPackageTests.xctest"
+        bundle.rename(self.binary / "removed-tests")
+        with self.assertRaises(ValueError):
+            self.pack()
+
+    def test_native_description_remains_authoritative(self):
+        extra = self.binary / "IgnoredTests.xctest"
+        extra.mkdir()
+        self.pack()
+        with tarfile.open(self.archive) as archive:
+            self.assertNotIn(str(extra.relative_to(self.root)), archive.getnames())
+        (self.binary / "description.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.pack()
+
+    def test_missing_native_lease_holder_cannot_be_published(self):
+        (self.binary / "NativeLeaseHolder").unlink()
+        with self.assertRaises(ValueError):
+            self.pack()
+
+    def test_nonexecutable_native_lease_holder_cannot_be_published(self):
+        (self.binary / "NativeLeaseHolder").chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.pack()
+
+    def test_restore_rejects_missing_or_nonexecutable_native_lease_holder(self):
+        self.pack()
+        helper = str((self.binary / "NativeLeaseHolder").relative_to(self.root))
+        for defect in ("missing", "nonexecutable"):
+            with self.subTest(defect=defect):
+                bad = self.root / (defect + ".tar")
+                with tarfile.open(self.archive) as original, tarfile.open(bad, "w") as archive:
+                    for member in original:
+                        if member.name == helper:
+                            if defect == "missing":
+                                continue
+                            member.mode = 0o644
+                        archive.addfile(member, original.extractfile(member) if member.isfile() else None)
+                # Even a preexisting helper cannot conceal an incomplete archive.
+                with self.assertRaises(ValueError):
+                    self.artifact.restore(self.root, bad, "revision", "toolchain")
+
+    def test_mismatched_revision_toolchain_or_checkout_rejects_before_extracting(self):
+        self.pack()
+        for root, revision, toolchain in ((self.root, "stale", "toolchain"),
+                                           (self.root, "revision", "other-sdk"),
+                                           (self.root / "other", "revision", "toolchain")):
+            with self.subTest(root=root, revision=revision, toolchain=toolchain):
+                with self.assertRaises(ValueError):
+                    self.artifact.restore(root, self.archive, revision, toolchain)
+
+    def test_missing_tests_or_release_products_cannot_be_published(self):
+        with self.assertRaises(ValueError):
+            self.artifact.pack(self.root, self.binary.with_name("release"), self.archive, "revision", "toolchain")
+        (self.binary / "TimoPackageTests.xctest/Contents/MacOS/TimoPackageTests").unlink()
+        with self.assertRaises(ValueError):
+            self.pack()
+
+    def test_unexpected_archive_paths_are_rejected(self):
+        self.pack()
+        bad = self.root / "unsafe.tar"
+        with tarfile.open(self.archive) as original, tarfile.open(bad, "w") as archive:
+            for member in original:
+                archive.addfile(member, original.extractfile(member) if member.isfile() else None)
+            member = tarfile.TarInfo("../escape")
+            archive.addfile(member)
+        with self.assertRaises((ValueError, tarfile.FilterError)):
+            self.artifact.restore(self.root, bad, "revision", "toolchain")
+        self.assertFalse((self.root.parent / "escape").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

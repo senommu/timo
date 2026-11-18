@@ -1,0 +1,856 @@
+import Foundation
+
+/// Concise names for favorite and pinned tabs, regardless of the original title's length.
+/// The deterministic cleaner supplies an immediate label and a fallback if the selected
+/// AI provider is unavailable or its answer fails validation. Generated names stay grounded
+/// in the original title; ordinary Today tabs keep the page's own title.
+@MainActor enum TidyTitles {
+
+    /// Off means the raw `Tab.title` everywhere. Manual renames still apply — those are the
+    /// user's own words, not ours, and a feature switch has no business deleting them.
+    static var enabled: Bool {
+        get { UserDefaults.timo.object(forKey: "tidyTitles") as? Bool ?? true }
+        set { UserDefaults.timo.set(newValue, forKey: "tidyTitles") }
+    }
+
+    /// What fits a pinned chip before it starts eating the strip.
+    static let pinnedLimit = 24
+
+    /// The model is told "at most four words"; anything past this is it ignoring us.
+    static let modelLimit = 32
+
+    // MARK: - The deterministic cleaner
+    //
+    // Pure. Everything below this line up to `tidy` is a function of its arguments, which is
+    // why `check()` can hammer it with real titles and no window server, no profile on disk
+    // and no Apple Intelligence.
+
+    /// Separators sites put between the page and their own name. Every one is *space
+    /// delimited*, which is what keeps "Hyper-threading - Wikipedia" from losing its hyphen:
+    /// the hyphen inside a word has no spaces around it, so it is not a separator here.
+    static let separators = [" :: ", " — ", " – ", " - ", " | ", " · ", " • ", " » ", " › "]
+
+    /// Segments that carry no information at all, whatever site they came from.
+    static let boilerplate: Set<String> = [
+        "home", "homepage", "home page", "start", "start page", "index", "welcome",
+        "official site", "official website", "untitled", "untitled document",
+    ]
+
+    /// Words that start a tagline rather than a title. "The system for product development".
+    private static let articles: Set<String> = ["the", "a", "an", "your", "our", "my"]
+
+    static func squash(_ s: String) -> String {
+        String(s.lowercased().filter { $0.isLetter || $0.isNumber })
+    }
+
+    static func words(_ s: String) -> Int {
+        s.split(whereSeparator: \.isWhitespace).count
+    }
+
+    private static func collapse(_ s: String) -> String {
+        s.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    /// Trimmed off both ends after every cut. `?` and `!` are deliberately absent — they are
+    /// part of "How do I sort a dictionary by value?", not decoration.
+    private static let junk = CharacterSet(charactersIn: " \t\"'“”‘’.,:;·•|–—-–")
+
+    private static func trimmed(_ s: String) -> String {
+        var t = s.trimmingCharacters(in: junk)
+        // A site that already truncated its own title leaves the ellipsis behind.
+        while t.hasSuffix("…") || t.hasSuffix("...") {
+            t = String(t.dropLast(t.hasSuffix("…") ? 1 : 3)).trimmingCharacters(in: junk)
+        }
+        return t
+    }
+
+    /// "(3) Facebook", "Inbox (12) - ada@example.com - Gmail". One to three digits only, so
+    /// the year in "Star Wars (1977) - IMDb" is not mistaken for an unread badge.
+    ///
+    /// ponytail: anywhere in the string, not just the front, because Gmail puts its badge in
+    /// the middle and Gmail is on everybody's pinned strip. The cost is that a genuine
+    /// "(12)" in a title disappears; that has not turned up in any real title I looked at.
+    static func stripCounts(_ s: String) -> String {
+        var out = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            if s[i] == "(", let close = s[i...].firstIndex(of: ")") {
+                let inner = s[s.index(after: i)..<close]
+                if (1...4).contains(inner.count), inner.contains(where: \.isNumber),
+                   inner.allSatisfy({ $0.isNumber || $0 == "+" }), inner.filter(\.isNumber).count <= 3 {
+                    i = s.index(after: close)
+                    continue
+                }
+            }
+            out.append(s[i])
+            i = s.index(after: i)
+        }
+        return out
+    }
+
+    /// The site's own name, as it might appear written out in the title. `en.wikipedia.org`
+    /// gives "wikipedia"; `f-droid.org` gives both "fdroid" and "droid" so the segment
+    /// "F-Droid" matches however the site chose to punctuate it.
+    static func hostTokens(_ host: String?) -> Set<String> {
+        guard var h = host?.lowercased(), !h.isEmpty else { return [] }
+        for p in ["www.", "m.", "mobile."] where h.hasPrefix(p) { h.removeFirst(p.count) }
+        var labels = h.split(separator: ".").map(String.init)
+        if labels.count >= 2 { labels.removeLast() }                    // the TLD
+        // co.uk, com.au, ac.jp — the second-level bit is not a name either.
+        if labels.count >= 2, ["co", "com", "org", "net", "gov", "ac", "edu"].contains(labels.last!) {
+            labels.removeLast()
+        }
+        var out = Set<String>()
+        for l in labels {
+            out.insert(l.replacingOccurrences(of: "-", with: ""))
+            for piece in l.split(separator: "-") where piece.count >= 3 { out.insert(String(piece)) }
+        }
+        return out.filter { $0.count >= 2 }
+    }
+
+    /// Is this segment the site announcing itself? Exact wins outright. A loose substring
+    /// match ("Apple Developer Documentation" against `developer.apple.com`) needs a token of
+    /// four characters or more, because a three-letter token like `bbc` matches half the web.
+    private static func isSite(_ segment: String, _ tokens: Set<String>) -> Bool {
+        let s = squash(segment)
+        guard !s.isEmpty else { return false }
+        if tokens.contains(s) { return true }
+        return tokens.contains { $0.count >= 4 && s.contains($0) }
+    }
+
+    /// A strapline, not a title: "A fast all-in-one JavaScript runtime". Long, or wordy, or
+    /// opening with an article — real page titles almost never open with "The system for".
+    private static func isTagline(_ s: String) -> Bool {
+        let w = words(s)
+        if w >= 6 || s.count >= 40 { return true }
+        let first = s.split(whereSeparator: \.isWhitespace).first.map { squash(String($0)) } ?? ""
+        return articles.contains(first) && w >= 4
+    }
+
+    /// Split on the separators, remembering which one followed each segment so the survivors
+    /// can be put back together with the punctuation the site actually used.
+    static func segments(_ s: String) -> [(text: String, after: String)] {
+        var parts: [(text: String, after: String)] = []
+        var rest = Substring(s)
+        while true {
+            var hit: (Range<Substring.Index>, String)?
+            for sep in separators {
+                if let r = rest.range(of: sep), hit == nil || r.lowerBound < hit!.0.lowerBound {
+                    hit = (r, sep)
+                }
+            }
+            guard let (r, sep) = hit else {
+                parts.append((trimmed(String(rest)), ""))
+                break
+            }
+            parts.append((trimmed(String(rest[rest.startIndex..<r.lowerBound])), sep))
+            rest = rest[r.upperBound...]
+        }
+        return parts.filter { !$0.text.isEmpty }
+    }
+
+    private static func joined(_ parts: [(text: String, after: String)]) -> String {
+        guard !parts.isEmpty else { return "" }
+        var s = parts[0].text
+        for i in 1..<parts.count { s += parts[i - 1].after + parts[i].text }
+        return s
+    }
+
+    /// The whole cheap path. nil only when there is nothing left worth showing.
+    ///
+    /// Only ever *removes*, which is what makes "never longer than the original" a property
+    /// of the code rather than a check bolted on afterwards.
+    static func clean(_ title: String, host: String?) -> String? {
+        let normalized = trimmed(collapse(stripCounts(title)))
+        guard !normalized.isEmpty else { return nil }
+        var parts = segments(normalized)
+        guard parts.count > 1 else { return normalized }
+        let tokens = hostTokens(host)
+
+        // 1. Taglines, from the tail. Before the host pass, and that ordering is load
+        //    bearing: "Ars Technica - Serving the Technologist since 1998. …" matches the
+        //    host at the *front*, so a host pass first would keep the strapline and throw
+        //    away the name. The guard is that the head still looks like a label.
+        while parts.count > 1, parts[0].text.count <= 30, isTagline(parts[parts.count - 1].text) {
+            parts.removeLast()
+        }
+
+        // 2. Segments that say nothing: "Home - BBC News".
+        while parts.count > 1, boilerplate.contains(parts[0].text.lowercased()) { parts.removeFirst() }
+        while parts.count > 1, boilerplate.contains(parts[parts.count - 1].text.lowercased()) { parts.removeLast() }
+
+        // 3. The site's name, and everything after it — once the site has introduced itself
+        //    the rest is its strapline. "… | F-Droid - Free and Open Source Android App
+        //    Repository" loses both halves in one cut. A leading one goes too, but only on an
+        //    exact match, or "BBC Sport - …" would lose the "BBC Sport".
+        if let last = parts.indices.last(where: { isSite(parts[$0].text, tokens) }), last > 0 {
+            parts.removeSubrange(last...)
+        }
+        if parts.count > 1, tokens.contains(squash(parts[0].text)) { parts.removeFirst() }
+
+        // 4. Last resort: a short trailing qualifier. Runs once unconditionally, because
+        //    "中國 - 维基百科，自由的百科全书" is already inside the width budget and still
+        //    mostly boilerplate, then keeps going only while the chip would overflow.
+        //
+        // ponytail: this is the one rule that can lose real information — "Bug 12345 - crash
+        // on launch" becomes "Bug 12345". Accepted, because a 40pt chip cannot show the tail
+        // either, and a user who disagrees double-clicks and renames it.
+        var forced = true
+        while parts.count > 1, forced || joined(parts).count > pinnedLimit {
+            let tail = parts[parts.count - 1].text
+            guard words(tail) <= 4, tail.count <= pinnedLimit else { break }
+            parts.removeLast()
+            forced = false
+        }
+
+        let out = trimmed(joined(parts))
+        // Belt and braces: a cleaner that grew the title is a bug, and the raw title is
+        // always a safe answer.
+        guard !out.isEmpty, out.count <= title.count else { return normalized.isEmpty ? nil : normalized }
+        return out
+    }
+
+    // MARK: - The model, and the net under it
+
+    /// The model has a token budget, so it stops mid-phrase: measured, "Installing Tailwind
+    /// CSS with Vite - Tailwind CSS" came back as "Installing Tailwind CSS with". A trailing
+    /// preposition is always the cut showing, never the title.
+    private static let dangling: Set<String> = [
+        "with", "and", "or", "the", "a", "an", "of", "for", "to", "in", "on", "by", "from", "at", "as",
+    ]
+
+    /// Whatever the model said, treated as text a hostile page influenced — see the long
+    /// note in AppleAI about why. A shortened title is a *selection* from the original, so
+    /// every real word in the answer has to be a word of the original.
+    ///
+    /// Whole words, not substrings, and that is measured too: with substring matching the
+    /// model turned "Ars Technica - Serving the Technologist since 1998…" into "Tech News",
+    /// which passed because "tech" hides inside "Technica" and "Technologist". It is a new
+    /// name for the site, not a shortening of the title, and a shortener that renames things
+    /// is the one failure mode worth being strict about. The cost of being strict is a
+    /// rejected inflection ("Programs" for "program"), and a rejection just falls back to
+    /// the deterministic answer.
+    static func validate(_ answer: String, original: String) -> String? {
+        var a = trimmed(collapse(answer))
+        while let last = a.split(whereSeparator: \.isWhitespace).last,
+              a.split(whereSeparator: \.isWhitespace).count > 1,
+              dangling.contains(squash(String(last))) {
+            a = trimmed(String(a.dropLast(last.count)))
+        }
+        guard !a.isEmpty, a.count <= original.count, a.count <= modelLimit else { return nil }
+        let vocabulary = Set(original.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
+        let all = a.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        // Short words carry no evidence, so they are dropped — unless that leaves nothing,
+        // which is what happens on CJK where a whole title is two characters.
+        var terms = all.filter { $0.count >= 3 }
+        if terms.isEmpty { terms = all }
+        guard !terms.isEmpty, terms.allSatisfy(vocabulary.contains) else { return nil }
+        return a
+    }
+
+    /// What `tidy` came back with, and which half of it answered. `fromModel` is the whole
+    /// reason the pair exists: the row shimmers for a name the model wrote and for nothing
+    /// else, and "the model was asked" is not the same question as "the model answered" —
+    /// an unavailable, refused or timed-out ask falls back to the cheap name, which arrives
+    /// silently the way every other title does.
+    struct Tidied: Equatable, Sendable {
+        var text: String
+        var fromModel: Bool
+    }
+
+    /// Ask for a concise name even when the page title or deterministic label is short.
+    static func tidy(title: String, url: URL,
+                     generate: (String, URL) async -> String? = { await BrowserAI.shortTitle(for: $0, url: $1) }) async -> Tidied? {
+        let host = url.host()
+        let cleaned = clean(title, host: host)
+        // AppleAI returns nil for every kind of "no answer" — unavailable, off, refused,
+        // timed out — and every one of them means the same thing here: keep the cheap one.
+        guard let raw = await generate(title, url),
+              let checked = validate(raw, original: title) else {
+            return cleaned.map { Tidied(text: $0, fromModel: false) }
+        }
+        return Tidied(text: checked, fromModel: true)
+    }
+
+    // MARK: - Storage
+    //
+    // Three dictionaries per profile, all url → string, and they are separate because their
+    // lifetimes are: the cache is disposable, the rename is the user's own data, and the
+    // pin-time name lives exactly as long as the pin.
+    //
+    // Which of the two names a pinned row, plainly: pinning a row runs `refresh`, and the
+    // tidied name it writes into the cache — keyed by the pinned page, so a row that wanders
+    // keeps it — is what the chip normally reads. `pinnedNames` is the fallback underneath,
+    // for the four cases the cache has nothing to say about: a pin made with the tidier
+    // switched off, a cache entry thrown away by the blow-away in `refresh`, a row `refresh`
+    // stands aside for (a page that is not http), and a pin an importer brought in from
+    // another browser, whose page nothing of ours has ever loaded.
+
+    // Earlier caches include short titles that never reached the model. Start fresh so
+    // those entries cannot suppress naming under the new policy.
+    private static let cacheKey = "tidyTitleCacheV2"
+    private static let overrideKey = "tidyTitleOverrides"
+    private static let pinnedKey = "pinnedNames"
+
+    /// A provider change discards generated names, preserving manual and pin-time names.
+    static func invalidateGeneratedNames() {
+        for key in UserDefaults.timo.dictionaryRepresentation().keys where key.hasPrefix(cacheKey) {
+            UserDefaults.timo.removeObject(forKey: key)
+        }
+        decoded = decoded.filter { !$0.key.hasPrefix(cacheKey) }
+    }
+
+    /// `UserDefaults.dictionary(forKey:)` decodes the stored plist and hands back a fresh
+    /// dictionary every time it is asked, and `title(for:)` asks up to three times — per
+    /// row, per SwiftUI `body`. A loading row redraws on every progress tick, so a strip of
+    /// twenty pinned tabs was decoding sixty plists a frame while the page was loading.
+    ///
+    /// Held until something writes. Everything that writes one of these three keys goes
+    /// through `put` or `drop`, which is what makes that true.
+    private static var decoded: [String: [String: String]] = [:]
+
+    private static func dict(_ base: String, _ profileID: UUID) -> [String: String] {
+        let key = ProfileManager.defaultsKey(base, profileID)
+        if profileID == Profile.incognito.id { return decoded[key] ?? [:] }
+        if let hit = decoded[key] { return hit }
+        let d = UserDefaults.timo.dictionary(forKey: key) as? [String: String] ?? [:]
+        decoded[key] = d
+        return d
+    }
+
+    private static func put(_ base: String, _ profileID: UUID, _ url: String, _ value: String?) {
+        var d = dict(base, profileID)
+        d[url] = value
+        let key = ProfileManager.defaultsKey(base, profileID)
+        if profileID != Profile.incognito.id {
+            if d.isEmpty { UserDefaults.timo.removeObject(forKey: key) }
+            else { UserDefaults.timo.set(d, forKey: key) }
+        }
+        decoded[key] = d
+    }
+
+    /// Throw one of the three keys away, cache and all. The only other way they are written.
+    private static func drop(_ base: String, _ profileID: UUID) {
+        let key = ProfileManager.defaultsKey(base, profileID)
+        UserDefaults.timo.removeObject(forKey: key)
+        decoded[key] = [:]
+    }
+
+    /// The user's own name for this tab, from a double-click on the chip.
+    static func override(for url: URL, in profileID: UUID) -> String? {
+        let name = dict(overrideKey, profileID)[url.absoluteString]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (name?.isEmpty ?? true) ? nil : name
+    }
+
+    /// nil clears it and hands the tab back to the tidier.
+    static func rename(_ url: URL, in profileID: UUID, to name: String?) {
+        let trimmedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        put(overrideKey, profileID, url.absoluteString,
+            (trimmedName?.isEmpty ?? true) ? nil : trimmedName)
+    }
+
+    static func rename(_ tab: Tab, to name: String?) {
+        if tab.workspaceName != nil {
+            tab.workspaceName = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            TabStore.savePins(owning: tab)
+            return
+        }
+        if let session = tab.easelSession, let name {
+            session.edit { $0.title = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200)) }
+            return
+        }
+        // `key(for:)`, not `currentURL`: a rename typed on a wandered pinned row has to be
+        // written under the url the chip reads it back from, or it lands on the page the row
+        // went to and the row goes on wearing its old name.
+        guard let url = key(for: tab) else { return }
+        rename(url, in: tab.profileID, to: name)
+        tab.objectWillChange.send()      // the chip re-reads `title(for:)`
+    }
+
+    /// What the page was called at the moment its row was pinned. Not a rename and not the
+    /// cache: it is the raw title, written down once so a row that has since wandered still
+    /// has something honest to be called when nothing else is remembered about its home.
+    static func pinnedName(for url: URL, in profileID: UUID) -> String? {
+        let name = dict(pinnedKey, profileID)[url.absoluteString]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (name?.isEmpty ?? true) ? nil : name
+    }
+
+    /// Freeze a name against the page a row stands for. `Tab.kind`'s didSet is the caller
+    /// that matters — it is the one place a row's home is decided, so it is also the one
+    /// place a row's name is frozen and dropped — and a nil name clears it, which is what an
+    /// unpin is. An importer bringing pinned tabs in from another browser calls this with
+    /// the name that browser had for the row.
+    static func recordPinnedName(_ title: String?, for url: URL, in profileID: UUID) {
+        let name = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ponytail: the tidy cache's blow-away, same one line and same number. An unpin
+        // clears its own name, so what piles up here is the pins that went while nobody was
+        // watching — a Space deleted from the Library, a profile merged in — and a live row
+        // freezes its name again from its next title (`note`) or its next launch
+        // (`Tab.restore`). Ceiling: a user who really does keep 200 pins loses the frozen
+        // names every time they pin the next one.
+        if dict(pinnedKey, profileID).count > 200 { drop(pinnedKey, profileID) }
+        put(pinnedKey, profileID, url.absoluteString, (name?.isEmpty ?? true) ? nil : name)
+    }
+
+    /// Whether a title is the page's own or a stand-in for one that has not arrived. A row
+    /// pinned while it was still loading is wearing "New Tab"; a parked one is wearing the
+    /// host label `TabStore.homeTitle` puts on a page this profile has never been to. Freeze
+    /// either and the row wears it forever — `refresh` skips those titles too, so nothing
+    /// would ever come along and better it.
+    ///
+    /// Pure, so `selfcheck --pure` can drive it: it is the rule both the pin (`Tab.kind`'s
+    /// didSet) and the backfill (`note`) are gated on, and they are the write and the repair
+    /// of the same field.
+    nonisolated static func realTitle(_ title: String, at url: URL?) -> Bool {
+        guard !title.isEmpty, title != "New Tab" else { return false }
+        guard let url else { return true }
+        return title != TabStore.homeTitle(known: nil, url: url)
+    }
+
+    /// A title has arrived for a tab. The one thing this is for: a row pinned before its page
+    /// had a title of its own — pinned mid-load, or pinned while parked — recorded nothing,
+    /// and this is where it finally gets a name. First real title wins, so a row that has
+    /// since wandered is never renamed after the page it went to; only a row still at home,
+    /// with nothing recorded, records anything here.
+    ///
+    /// Every eligible home title also refreshes the generated name when its cache is empty,
+    /// including saved rows whose original pinned name has already been recorded.
+    static func note(_ tab: Tab) {
+        guard tab.stays, !tab.isPrivate, tab.atHome, let home = tab.homeURL,
+              realTitle(tab.title, at: home) else { return }
+        if pinnedName(for: home, in: tab.profileID) == nil {
+            recordPinnedName(tab.title, for: home, in: tab.profileID)
+        }
+        // Existing pins need a chance to refill an invalidated generated-name cache too.
+        refresh(tab)
+    }
+
+    // MARK: - What the UI shows
+
+    /// The url a row is *named* by. Arc's rule, and the whole of the frozen name: a row that
+    /// stays is a place — the page it was pinned at — so browsing it somewhere else changes
+    /// the page under it and not the name on it. A Today tab is named by where it is, as
+    /// every tab always was, and a row pinned while it was still blank has no home to be
+    /// named by and falls back to the page it is on.
+    ///
+    /// Pure, so `selfcheck --pure` can drive it with no tab in the room: it is the one place
+    /// this key is decided, and a chrome that read it one way while the store wrote it
+    /// another is a pinned row named after whatever link it last followed.
+    nonisolated static func named(stays: Bool, home: URL?, at: URL?) -> URL? {
+        stays ? (home ?? at) : at
+    }
+
+    /// `named` with a tab's three fields in it. Every caller that reads a name and every
+    /// caller that writes one goes through this and nothing else — `title(for:)`,
+    /// `rename(_ tab:to:)` and `TabActions.rename` — because a chrome that showed the name
+    /// under one url while a rename wrote it under another is a rename that does nothing.
+    static func key(for tab: Tab) -> URL? {
+        named(stays: tab.stays, home: tab.homeURL, at: tab.currentURL)
+    }
+
+    /// The order the names are tried in, as one expression so `check()` can prove it: what
+    /// the user typed, then what the tidier made of the pinned page, then the title that
+    /// page had at the moment it was pinned. The recorded title stands in for the live one
+    /// and goes through the same cleaner, so a row whose name was frozen before the tidier
+    /// ever ran still reads as a chip rather than as a paragraph.
+    static func pick(override: String?, tidied: String?, recorded: String?,
+                     raw: String, host: String?) -> String {
+        if let override { return override }
+        if let tidied { return tidied }
+        let text = recorded ?? raw
+        // The deterministic answer is available *now*, so show it rather than flashing the
+        // long title while `refresh` decides whether to ask the model.
+        return clean(text, host: host) ?? text
+    }
+
+    /// What a Space's ghost calls a row it has no `Tab` for — the sidebar sliding under a
+    /// swipe is built from `spaces.json`, and for the width of that swipe it used to call
+    /// every row by its host. Same ladder as `title(for:)`, with the sidecar's saved title
+    /// standing in for the live one, and the host only when nothing has ever named the row.
+    static func previewName(for url: URL, in profileID: UUID, saved: String?, stays: Bool = true) -> String {
+        rowName(for: url, in: profileID, raw: previewRaw(saved: saved, url: url), stays: stays)
+    }
+
+    /// The bottom rung: the saved title when it is a real one, else the host without its
+    /// `www.` — the same label the address pill would show.
+    nonisolated static func previewRaw(saved: String?, url: URL) -> String {
+        if let saved, realTitle(saved, at: url) { return saved }
+        return Files.pillLabel(url) ?? url.absoluteString
+    }
+
+    /// The one thing the chrome should call. Sync, because SwiftUI's `body` is.
+    ///
+    /// ponytail: the rename wins even for an unpinned tab. "Never retitle an unpinned tab"
+    /// is a rule about *us* inventing a name behind the user's back; a name the user typed
+    /// is not us, and Arc keeps it across an unpin too.
+    static func title(for tab: Tab) -> String {
+        if let name = tab.workspaceName { return name.isEmpty ? tab.title : name }
+        if tab.easelID != nil { return tab.title }
+        guard let url = key(for: tab) else { return tab.title }
+        return rowName(for: url, in: tab.profileID, raw: tab.title, stays: tab.stays)
+    }
+
+    /// The real row and its swipe preview must agree about which titles can be tidied.
+    private static func rowName(for url: URL, in profileID: UUID, raw: String, stays: Bool) -> String {
+        let typed = override(for: url, in: profileID)
+        // The name a row was pinned under is not an AI feature — it is a page title, written
+        // down — so the toggle does not withhold it. What the toggle withholds is the tidier:
+        // the cached name, and the cleaner `pick` runs over whatever it ends up showing.
+        let recorded = stays ? pinnedName(for: url, in: profileID) : nil
+        guard enabled, stays else { return typed ?? recorded ?? raw }
+        return pick(override: typed,
+                    tidied: dict(cacheKey, profileID)[url.absoluteString],
+                    recorded: recorded,
+                    raw: raw, host: url.host())
+    }
+
+    /// The menu and the request share this gate. A wandered row needs its home's saved
+    /// title; the current page's title must never become the pinned row's name.
+    static func canRegenerate(_ tab: Tab) -> Bool {
+        guard BrowserAI.enabled, enabled, tab.kind == .pinned, !tab.isPrivate,
+              tab.workspaceName == nil, tab.easelID == nil,
+              let url = key(for: tab), ["http", "https"].contains(url.scheme ?? "") else { return false }
+        return pinnedName(for: url, in: tab.profileID) != nil
+            || (tab.atHome && realTitle(tab.title, at: url))
+    }
+
+    private struct RegenerationKey: Hashable {
+        let profileID: UUID
+        let url: URL
+    }
+    private static var regenerations: [RegenerationKey: UUID] = [:]
+
+    /// An explicit request bypasses the cache. Keep the old name until a valid model
+    /// answer arrives, then replace any manual name and use the normal AI title reveal.
+    static func regenerate(_ tab: Tab,
+                           generate: (String, URL) async -> String? = { await BrowserAI.shortTitle(for: $0, url: $1) }) async {
+        guard canRegenerate(tab), let url = key(for: tab) else { return }
+        let profileID = tab.profileID
+        let raw = pinnedName(for: url, in: profileID) ?? tab.title
+        let typed = override(for: url, in: profileID)
+        let revision = UserDefaults.timo.integer(forKey: "aiSettingsRevision")
+        let requestKey = RegenerationKey(profileID: profileID, url: url)
+        let request = UUID()
+        regenerations[requestKey] = request
+        defer {
+            if regenerations[requestKey] == request { regenerations[requestKey] = nil }
+        }
+        guard let out = await tidy(title: raw, url: url, generate: generate), out.fromModel,
+              !Task.isCancelled, regenerations[requestKey] == request,
+              revision == UserDefaults.timo.integer(forKey: "aiSettingsRevision"),
+              canRegenerate(tab), key(for: tab) == url,
+              override(for: url, in: profileID) == typed else { return }
+        let was = title(for: tab)
+        rename(url, in: profileID, to: nil)
+        put(cacheKey, profileID, url.absoluteString, out.text)
+        tab.noteAITitle(replacing: was)
+    }
+
+    /// Fill the cache for a favorite or pinned tab. Fire and forget:
+    /// call it when a tab is pinned and when a pinned tab finishes retitling.
+    ///
+    /// The cache is what keeps a pinned tab from re-running a multi-second inference on every
+    /// reload, and it is persisted per profile so a relaunch does not pay for it again.
+    ///
+    /// ponytail: keyed by url, so a single-page app that swaps its title without navigating
+    /// keeps the first name it was tidied under. Ceiling: refreshing it would need a
+    /// title-versus-cache comparison on every KVO tick, which is a lot of machinery to fix
+    /// the label on a chip.
+    ///
+    /// A row that has wandered off its home is not tidied at all: the title in front of us
+    /// belongs to the page it went to, and the name on the row belongs to the page it was
+    /// pinned at (`named`), so tidying here would spend an inference on a name nothing will
+    /// ever show. At home the two urls are the same one, which is every call that matters —
+    /// a tab is refreshed as it is pinned.
+    private static func isLocked(_ tab: Tab) -> Bool {
+        TabStore.all.contains { $0.profileID == tab.profileID && $0.isTabLocked(tab.id) }
+    }
+
+    @discardableResult
+    static func refresh(_ tab: Tab,
+                        generate: (@MainActor (String, URL) async -> String?)? = nil) -> Task<Void, Never>? {
+        guard enabled, tab.stays, !tab.isPrivate, tab.atHome,
+              !isLocked(tab),
+              let url = tab.currentURL, url.scheme?.hasPrefix("http") == true else { return nil }
+        let key = url.absoluteString
+        guard dict(cacheKey, tab.profileID)[key] == nil else { return nil }
+        let raw = tab.title
+        guard !raw.isEmpty, raw != "New Tab" else { return nil }
+        let profileID = tab.profileID
+        let aiRevision = UserDefaults.timo.integer(forKey: "aiSettingsRevision")
+        return Task { @MainActor [weak tab] in
+            guard let tab, !isLocked(tab) else { return }
+            let generation = generate ?? { [weak tab] title, url in
+                await BrowserAI.shortTitle(for: title, url: url, isCurrent: {
+                    guard let tab else { return false }
+                    return !isLocked(tab)
+                })
+            }
+            guard let out = await tidy(title: raw, url: url, generate: generation),
+                  !isLocked(tab),
+                  aiRevision == UserDefaults.timo.integer(forKey: "aiSettingsRevision"),
+                  dict(cacheKey, profileID)[key] == nil else { return }
+            // Read *before* the cache is written, because `title(for:)` reads the cache: this
+            // is the name the row is showing at this instant, and it is what the shimmer
+            // fades out from under the new one.
+            let was = title(for: tab)
+            var cache = dict(cacheKey, profileID)
+            // ponytail: no LRU. A pinned strip is a handful of urls; if it ever gets absurd,
+            // throwing the whole cache away costs one re-run per pin and zero code.
+            if cache.count > 200 {
+                drop(cacheKey, profileID)
+                cache = [:]
+            }
+            put(cacheKey, profileID, key, out.text)
+            // A name the model wrote is an event about the row and is announced as one; the
+            // cheap answer is just a title and arrives the way titles always have.
+            if out.fromModel { tab.noteAITitle(replacing: was) }
+            else { tab.objectWillChange.send() }
+        }
+    }
+
+    /// Drop everything remembered for a profile. For profile deletion and for a settings
+    /// toggle that should not leave stale names behind.
+    static func forget(_ profileID: UUID) {
+        regenerations = regenerations.filter { $0.key.profileID != profileID }
+        for base in [cacheKey, overrideKey, pinnedKey] { drop(base, profileID) }
+    }
+
+    // MARK: - check
+
+    /// Offline only. Nothing here reaches Apple Intelligence, a window server, a profile on
+    /// disk or the network — the model half is exercised by pinning a tab.
+    ///
+    /// Every title below was fetched from the live site with curl before it was written down,
+    /// not remembered. That matters: a cleaner tuned against invented titles is tuned against
+    /// nothing. The one exception is the Gmail row, whose format is real but whose address is
+    /// anonymised, and it is labelled as such.
+    static func check() -> [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        func assert(_ name: String, _ ok: Bool) { out.append((name, ok)) }
+
+        // host, real title, what a pinned chip should say
+        let real: [(String, String, String)] = [
+            // The canonical case, and the one that names the feature.
+            ("en.wikipedia.org", "Apollo program - Wikipedia", "Apollo program"),
+            // A hyphen inside the *title*. It has no spaces round it, so it is not a separator.
+            ("en.wikipedia.org", "Hyper-threading - Wikipedia", "Hyper-threading"),
+            // Separator twice, and the site names itself at both ends.
+            ("github.com", "GitHub - swiftlang/swift: The Swift Programming Language · GitHub",
+             "swiftlang/swift: The Swift Programming Language"),
+            // A site name that legitimately contains a hyphen, plus a strapline behind it.
+            ("f-droid.org", "404 Page Not Found | F-Droid - Free and Open Source Android App Repository",
+             "404 Page Not Found"),
+            // Every segment is the site. Must not come back empty.
+            ("f-droid.org", "F-Droid | F-Droid - Free and Open Source Android App Repository", "F-Droid"),
+            // The other hyphenated site name, lowercase this time.
+            ("www.e-flux.com", "Journal - e-flux", "Journal"),
+            // Site first, strapline second — dropping the site here would be exactly wrong.
+            ("arstechnica.com",
+             "Ars Technica - Serving the Technologist since 1998. News, reviews, and analysis.",
+             "Ars Technica"),
+            ("www.nytimes.com",
+             "The New York Times - Breaking News, US News, World News and Videos",
+             "The New York Times"),
+            ("linear.app", "Linear – The system for product development", "Linear"),   // en dash
+            ("bun.sh", "Bun — A fast all-in-one JavaScript runtime", "Bun"),           // em dash
+            ("svelte.dev", "Svelte • Web development for the rest of us", "Svelte"),   // bullet
+            // CJK: no spaces, so word counts are useless and only the separator helps.
+            ("zh.wikipedia.org", "中國 - 维基百科，自由的百科全书", "中國"),
+            ("ko.wikipedia.org", "서울특별시 - 위키백과, 우리 모두의 백과사전", "서울특별시"),
+            // Emoji prefix survives — at chip width a leading glyph is the most legible part.
+            ("emojipedia.org", "🚀 Rocket Emoji | Meaning, Copy And Paste", "🚀 Rocket Emoji"),
+            // Boilerplate head, and a three-letter host token that must not match loosely.
+            ("www.bbc.co.uk", "Home - BBC News", "BBC News"),
+            ("www.bbc.co.uk", "BBC Sport - Scores, Fixtures, News - Live Sport", "BBC Sport"),
+            // The immediate deterministic labels; AI can still refine them.
+            ("news.ycombinator.com", "Hacker News", "Hacker News"),
+            ("mail.proton.me", "Proton Mail", "Proton Mail"),
+            ("developer.apple.com", "View | Apple Developer Documentation", "View"),
+            ("www.youtube.com", "Me at the zoo - YouTube", "Me at the zoo"),
+            ("vercel.com", "Agentic Infrastructure - Vercel", "Agentic Infrastructure"),
+            // Gmail's real title format; the address is anonymised. Unread badge in the middle.
+            ("mail.google.com", "Inbox (12) - ada@example.com - Gmail", "Inbox"),
+        ]
+
+        for (host, title, want) in real {
+            assert("\"\(title)\" → \"\(want)\"", clean(title, host: host) == want)
+        }
+
+        // The invariant, over every real title above: removal only, never growth.
+        assert("no real title is ever made longer",
+               real.allSatisfy { (clean($0.1, host: $0.0)?.count ?? 0) <= $0.1.count })
+        assert("no real title is ever cleaned to nothing",
+               real.allSatisfy { clean($0.1, host: $0.0)?.isEmpty == false })
+
+        // Long titles still receive a useful deterministic fallback before AI answers.
+        let so = "python - How do I sort a dictionary by value? - Stack Overflow"
+        let pr = "GenericSpecializer: support specializing typed throws by eeckstein "
+            + "· Pull Request #70000 · swiftlang/swift · GitHub"
+        assert("stack overflow loses its site name",
+               clean(so, host: "stackoverflow.com") == "python - How do I sort a dictionary by value?")
+        assert("a github pull request is trimmed twice",
+               clean(pr, host: "github.com")
+                   == "GenericSpecializer: support specializing typed throws by eeckstein")
+
+        // --- Pieces, so a failure above points somewhere ---
+        assert("an unread badge is stripped wherever the site put it",
+               stripCounts("(3) Facebook") == " Facebook" && stripCounts("Inbox (12) - x") == "Inbox  - x")
+        assert("a year in parentheses is not an unread badge",
+               stripCounts("Star Wars (1977) - IMDb") == "Star Wars (1977) - IMDb")
+        assert("a site's own ellipsis is dropped",
+               clean("The long headline that got cut… - The Site", host: "thesite.com")
+                   == "The long headline that got cut")
+        assert("a hyphenated host yields both spellings of its name",
+               hostTokens("f-droid.org").contains("fdroid") && hostTokens("f-droid.org").contains("droid"))
+        assert("a country second-level domain is not mistaken for the site name",
+               hostTokens("www.bbc.co.uk") == ["bbc"])
+        assert("whitespace and non-breaking spaces collapse",
+               clean("  Spaced\u{00A0}\u{00A0}out   title  ", host: nil) == "Spaced out title")
+
+        // --- Model answers: the net ---
+        let apollo = "Apollo program - Wikipedia, the free encyclopedia"
+        assert("a shortened title made of the original's words is kept",
+               validate("Apollo Program", original: apollo) == "Apollo Program")
+        assert("an answer a page dictated is thrown away",
+               validate("PWNED", original: apollo) == nil)
+        assert("an answer longer than the title it shortens is thrown away",
+               validate(apollo + " and then some", original: apollo) == nil)
+        assert("an answer the model padded past four words is thrown away",
+               validate("Apollo program Wikipedia the free encyclopedia and more besides",
+                        original: apollo) == nil)
+        assert("an empty or punctuation-only answer is thrown away",
+               validate("  ", original: apollo) == nil && validate("\"\".", original: apollo) == nil)
+        assert("the model's quotes and trailing stop come off",
+               validate("  \"Apollo program.\"  ", original: apollo) == "Apollo program")
+        assert("a CJK answer is not rejected for having no long words",
+               validate("中國", original: "中國 - 维基百科，自由的百科全书") == "中國")
+        // Both of these came out of the on-device model on real titles, not out of my head.
+        assert("an answer that renames the site is thrown away, even from its own letters",
+               validate("Tech News",
+                        original: "Ars Technica - Serving the Technologist since 1998. "
+                            + "News, reviews, and analysis.") == nil)
+        assert("an answer the model cut off mid-phrase loses the dangling word",
+               validate("Installing Tailwind CSS with",
+                        original: "Installing Tailwind CSS with Vite - Tailwind CSS")
+                   == "Installing Tailwind CSS")
+        assert("a one-word answer is not trimmed away by the dangling-word rule",
+               validate("Programming", original: "The Swift Programming Language") == "Programming")
+
+        // --- Storage. Two profiles, restored afterwards so check() leaves no footprint. ---
+        let alpha = UUID(uuidString: "00000000-0000-0000-0000-0000000A1FA0")!
+        let beta = UUID(uuidString: "00000000-0000-0000-0000-0000000BE7A0")!
+        let keys = [alpha, beta].flatMap {
+            [ProfileManager.defaultsKey(cacheKey, $0), ProfileManager.defaultsKey(overrideKey, $0),
+             ProfileManager.defaultsKey(pinnedKey, $0)]
+        } + ["tidyTitles"]
+        let saved = keys.map { ($0, UserDefaults.timo.object(forKey: $0)) }
+        // These go straight to UserDefaults, behind `dict`'s back, so the memo has to go too
+        // — on the way in and on the way out.
+        defer {
+            for (k, v) in saved { UserDefaults.timo.set(v, forKey: k) }
+            decoded.removeAll()
+        }
+        for k in keys { UserDefaults.timo.removeObject(forKey: k) }
+        decoded.removeAll()
+
+        let docs = URL(string: "https://docs.example.com/guide")!
+        let other = URL(string: "https://other.example.com/")!
+
+        assert("nothing renamed reads back as nil", override(for: docs, in: alpha) == nil)
+        rename(docs, in: alpha, to: "Guide")
+        assert("a rename round-trips", override(for: docs, in: alpha) == "Guide")
+        assert("a rename is keyed by url, not by profile alone", override(for: other, in: alpha) == nil)
+        assert("a rename in one profile is invisible in another", override(for: docs, in: beta) == nil)
+        rename(docs, in: beta, to: "Handbook")
+        assert("the two profiles hold different names",
+               override(for: docs, in: alpha) == "Guide" && override(for: docs, in: beta) == "Handbook")
+        rename(docs, in: alpha, to: nil)
+        assert("nil clears the rename", override(for: docs, in: alpha) == nil)
+        assert("clearing one profile leaves the other alone", override(for: docs, in: beta) == "Handbook")
+        rename(docs, in: beta, to: "   ")
+        assert("an all-whitespace rename clears rather than blanking the tab",
+               override(for: docs, in: beta) == nil)
+
+        // --- The frozen name: what a row that stays is called, and the page it is called by ---
+        assert("nothing pinned reads back as nil", pinnedName(for: docs, in: alpha) == nil)
+        recordPinnedName("Guide - Docs", for: docs, in: alpha)
+        assert("a pinned name round-trips", pinnedName(for: docs, in: alpha) == "Guide - Docs")
+        assert("a pinned name is keyed by url", pinnedName(for: other, in: alpha) == nil)
+        assert("a pinned name in one profile is invisible in another",
+               pinnedName(for: docs, in: beta) == nil)
+        recordPinnedName(nil, for: docs, in: alpha)
+        assert("unpinning clears the name the row was frozen under",
+               pinnedName(for: docs, in: alpha) == nil)
+        recordPinnedName("  ", for: docs, in: alpha)
+        assert("a page with nothing but spaces for a title records no name",
+               pinnedName(for: docs, in: alpha) == nil)
+        // What may be frozen at all. A row pinned before its page had a title of its own
+        // must record nothing, or the placeholder is the name forever: `refresh` skips those
+        // titles too, so nothing would ever come along and better it.
+        assert("a row pinned mid-load freezes nothing", !realTitle("New Tab", at: docs))
+        assert("nor does a parked row wearing its host",
+               !realTitle("docs.example.com", at: docs))
+        assert("nor one with no title at all", !realTitle("", at: docs))
+        assert("the page's own title is what gets frozen", realTitle("Guide - Docs", at: docs))
+        assert("a Space's ghost calls a row by the title the sidecar saved for it",
+               previewRaw(saved: "Guide - Docs", url: docs) == "Guide - Docs")
+        assert("…and by its host only when nothing real was saved",
+               previewRaw(saved: "docs.example.com", url: docs) == "docs.example.com"
+                   && previewRaw(saved: nil, url: URL(string: "https://www.google.com/search?q=x")!)
+                       == "google.com")
+
+        // The key, from both sides. The rename and the chip are one expression — `key(for:)`,
+        // which is `named` with a tab's fields in it — and this is that expression driven
+        // with a wandered pinned row's three values, the case where the two used to differ.
+        let wandered = named(stays: true, home: docs, at: other)!
+        rename(wandered, in: alpha, to: "Mine")
+        assert("a rename on a wandered pinned row is written under its home",
+               override(for: named(stays: true, home: docs, at: other)!, in: alpha) == "Mine")
+        assert("and not under the page it wandered to", override(for: other, in: alpha) == nil)
+        rename(wandered, in: alpha, to: nil)
+
+        recordPinnedName("Guide", for: docs, in: beta)
+        forget(beta)
+        assert("a forgotten profile takes its pinned names with it",
+               pinnedName(for: docs, in: beta) == nil)
+
+        // The precedence, in the order the row reads it.
+        assert("a name the user typed beats everything",
+               pick(override: "Mine", tidied: "Tidied", recorded: "Recorded",
+                    raw: "Raw - Site", host: "example.com") == "Mine")
+        assert("the tidied name of the pinned page beats the name it was pinned under",
+               pick(override: nil, tidied: "Tidied", recorded: "Recorded",
+                    raw: "Raw - Site", host: "example.com") == "Tidied")
+        assert("the name the page had when it was pinned beats the page it wandered to",
+               pick(override: nil, tidied: nil, recorded: "Apollo program - Wikipedia",
+                    raw: "Google", host: "en.wikipedia.org") == "Apollo program")
+        assert("with nothing recorded the row is the cleaned-up page it is on",
+               pick(override: nil, tidied: nil, recorded: nil,
+                    raw: "Apollo program - Wikipedia", host: "en.wikipedia.org")
+                   == "Apollo program")
+
+        // The key. A row that stays is named by its home wherever it has been; a Today tab
+        // is named by the page it is on, exactly as every tab always was.
+        assert("a wandered pinned row is still named by the page it was pinned at",
+               named(stays: true, home: docs, at: other) == docs)
+        assert("a Today tab is named by the page it is on",
+               named(stays: false, home: docs, at: other) == other)
+        assert("a row pinned while it was still blank is named by where it went",
+               named(stays: true, home: nil, at: other) == other)
+        assert("a row with no page at all has no name to look up",
+               named(stays: true, home: nil, at: nil) == nil)
+
+        UserDefaults.timo.removeObject(forKey: "tidyTitles")
+        let byDefault = enabled
+        enabled = false
+        let offRoundTrip = enabled
+        enabled = true
+        assert("tidying is on unless it was turned off", byDefault == true)
+        assert("the switch round-trips through UserDefaults", offRoundTrip == false && enabled == true)
+
+        return out
+    }
+}

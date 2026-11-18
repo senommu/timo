@@ -1,0 +1,1379 @@
+import AppKit
+import WebKit
+
+/// Intentional link previews: one ephemeral renderer, one bounded memory cache,
+/// and cancellation when the source pointer or document leaves. The hover script
+/// filters discovery links before native work begins. Metadata and optional AI
+/// summaries arrive independently; the card receives one settled page image.
+@MainActor final class Previews: ObservableObject {
+    static let shared = Previews()
+
+    /// Everything a preview card can draw. Published as one value so a view redraws once
+    /// per change instead of once per field.
+    ///
+    /// `image` is the live mini render — the whole point. `imageURL` is `og:image`, for a
+    /// card that would rather show the page's own hero art than a shrunken screenshot;
+    /// nothing here fetches it, that is the drawing code's call.
+    struct Preview {
+        var url: URL
+        var title = ""
+        /// `og:description` where the page has one. Present within milliseconds of the DOM.
+        var description = ""
+        /// The mini render. Nil until the destination has painted something.
+        var image: NSImage?
+        var favicon: NSImage?
+        /// The model's text so far. Cumulative — never append to this, assign it.
+        var summary = ""
+        /// True while the model is generating, so a card can say "summarising…" honestly
+        /// rather than sitting there looking hung. False also covers "never asked".
+        var summarizing = false
+        /// Still loading: the image may still improve. Lets a card show a subtle progress
+        /// hint without owning any of the loading state itself.
+        var loading = true
+        /// `og:image`, resolved against the destination.
+        var imageURL: URL?
+    }
+
+    @Published private(set) var current: Preview?
+    /// Native points within the source WebView, not window or screen coordinates.
+    @Published private(set) var linkRect = CGRect.zero
+
+    func preview(for tab: Tab) -> Preview? { source === tab ? current : nil }
+
+    static func rect(from body: [String: Any], pageZoom: CGFloat) -> CGRect? {
+        let values = ["x", "y", "w", "h"].compactMap { body[$0] as? Double }
+        guard values.count == 4, values.allSatisfy({ $0.isFinite && abs($0) <= 1_000_000 }),
+              values[2] >= 0, values[3] >= 0, pageZoom.isFinite, pageZoom > 0, pageZoom <= 10 else { return nil }
+        return CGRect(x: values[0] * pageZoom, y: values[1] * pageZoom,
+                      width: values[2] * pageZoom, height: values[3] * pageZoom)
+    }
+
+    /// Off is a real preference; on is the default because a preview is the feature.
+    static var enabled: Bool {
+        get { UserDefaults.timo.object(forKey: "linkPreviews") as? Bool ?? true }
+        set { UserDefaults.timo.set(newValue, forKey: "linkPreviews") }
+    }
+
+    // MARK: - Dials
+    //
+    // Every number here was either measured or is a deliberate ceiling.
+
+    /// A real desktop viewport. Smaller and the destination lays itself out as a phone,
+    /// which is not what the user is about to click on.
+    static let viewport = NSSize(width: 1000, height: 700)
+    /// Point width of the snapshot handed to the UI. 360pt at 2x is ~1.1MB of bitmap; the
+    /// cache cap below is chosen against that number.
+    static let snapshotWidth = 360.0
+    /// ponytail: 12 × ~1.1MB ≈ 13MB of images held live. Cheap for what it buys — a
+    /// re-hover is instant — and bounded. Ceiling: no disk tier, so the cache dies with the
+    /// process, which is correct for something this speculative.
+    static let cacheCap = 12
+    /// Five minutes. Long enough that going back and forth across a page of links never
+    /// re-loads anything; short enough that a preview never shows a headline that has since
+    /// changed.
+    static let cacheTTL: TimeInterval = 300
+    /// Long enough that a pointer sweeping across links does not start a full background
+    /// page load and model request for each one; short enough to still feel like a hover.
+    /// 220ms is roughly one deliberate pause.
+    static let summaryDebounce = Duration.milliseconds(220)
+    /// The page script already required 550ms of intent. Prepare the image before the
+    /// model's longer gate, while direct/native callers still get a cancellable pause.
+    static let loadDebounce = Duration.milliseconds(140)
+    /// Stop asking for snapshots after this. A page that has painted nothing by now is
+    /// broken, blocked, or a login wall, and none of those improve with more polling.
+    static let paintDeadline = Duration.seconds(4)
+    static let paintInterval = Duration.milliseconds(150)
+    /// The model gets the top of the article, not all of it.
+    ///
+    /// This is the one lever on the wait that is actually ours: the wait is mostly prefill —
+    /// the model reading — and prefill scales with the input. Measured end to end through
+    /// this class, handing `summarizeStream` a full 8000-character page (AppleAI's own input
+    /// budget) put the first streamed element **22.6s** away; the same pages cut to 1200
+    /// characters measured 6–15s. A two-sentence hover card wants the lede regardless, so
+    /// the cut costs nothing anyone can see.
+    /// ponytail: a character count, not a section detector. Ceiling: a page that buries its
+    /// point below a 1200-character preamble gets summarised on the preamble.
+    static let summaryBudget = 1_200
+    /// documentEnd, then one retry at didFinish. A framework-rendered page has an empty
+    /// body at documentEnd and everything by didFinish; anything still empty after two
+    /// looks has no article in it and never will.
+    static let summaryTryLimit = 2
+
+    // MARK: - Eligibility
+
+    /// Resolve speculative loads using the source profile's transport policy.
+    static func requestURL(_ url: URL, profileID: UUID) -> URL {
+        HTTPSOnly.enabled ? (HTTPSOnly.upgrade(url, profileID: profileID) ?? url) : url
+    }
+
+    static func httpsPolicy(_ url: URL, profileID: UUID) -> WKWebpagePreferences.UpgradeToHTTPSPolicy {
+        guard HTTPSOnly.enabled, let host = url.host,
+              !HTTPSOnly.isLocal(host), !HTTPSOnly.isExcepted(host: host, profileID: profileID)
+        else { return .keepAsRequested }
+        return .errorOnFailure
+    }
+
+    /// The preview delegate's whole navigation decision, including the transport policy
+    /// it hands WebKit, so the applied preferences are testable without a private bridge.
+    static func navigationPolicy(_ url: URL?, profileID: UUID?,
+                                 preferences: WKWebpagePreferences) -> WKNavigationActionPolicy {
+        // Internal cancellation unloads the document while keeping the reusable view.
+        if url?.absoluteString == "about:blank" { return .allow }
+        guard let url, let profileID else { return .cancel }
+        // WebKit also enforces upgrades through server redirects, without silently
+        // retrying plaintext if TLS fails. No preview can grant an HTTP exception.
+        preferences.preferredHTTPSNavigationPolicy = httpsPolicy(url, profileID: profileID)
+        return allowsNavigation(url, profileID: profileID) ? .allow : .cancel
+    }
+
+    /// Redirects cannot ask for permission to fall back to plaintext.
+    static func allowsNavigation(_ url: URL, profileID: UUID) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        return (scheme == "http" || scheme == "https") && requestURL(url, profileID: profileID) == url
+    }
+
+    /// The cache key, and the identity a preview is compared by: the url without its
+    /// fragment. Two links into the same document differ only in where they scroll to, and
+    /// previewing that twice would be two loads of one page.
+    static func key(for url: URL) -> String {
+        var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        parts?.fragment = nil
+        return (parts?.url ?? url).absoluteString
+    }
+
+    /// What may be previewed at all. Deliberately unconditional — the Shift variant in the
+    /// script below widens which *links* get reported, never these rules.
+    ///
+    /// `onPage` is the tab's current url: previewing the page you are already looking at is
+    /// a whole page load to show the user a picture of what is behind the popover.
+    ///
+    /// `shift` is false for an automatic (dwell) preview, which is limited to the discovery
+    /// surfaces the script's `automatic` filter names. Re-checked here so the native side
+    /// never relies on page script for that limit.
+    static func eligible(_ url: URL, onPage: URL?, shift: Bool) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased(), !host.isEmpty,
+              key(for: url) != onPage.map(key(for:)) else { return false }
+        if shift { return true }
+        guard let page = onPage?.host?.lowercased(), page != host else { return false }
+        let search = onPage?.path == "/search"
+        func social(_ h: String) -> Bool { h.wholeMatch(of: #/(www\.)?(x|twitter)\.com/#) != nil }
+        if page.wholeMatch(of: #/(www\.)?google\.(com|[a-z]{2}|com\.[a-z]{2}|co\.[a-z]{2})/#) != nil
+            || page == "www.bing.com" || page == "bing.com" { return search }
+        if social(page) { return !social(host) }
+        return ["duckduckgo.com", "html.duckduckgo.com", "news.ycombinator.com"].contains(page)
+            || page.wholeMatch(of: #/(www\.)?threads\.(net|com)/#) != nil
+    }
+
+    // MARK: - Requesting
+
+    private var cache = Cache()
+    private var aiSettingsRevision = UserDefaults.timo.integer(forKey: "aiSettingsRevision")
+    private var cacheScope: (profile: UUID, privateTab: UUID?)?
+    private var sessionObserver: Feel04PreviewSessionObserver?
+    private struct SessionCookie: Hashable {
+        let domain, path, name, value: String
+        let expires: Date?
+        let secure, httpOnly, sessionOnly: Bool
+        let sameSite: String?
+        let version: Int
+        let ports: [Int]?
+        init(_ cookie: HTTPCookie) {
+            domain = cookie.domain; path = cookie.path; name = cookie.name; value = cookie.value
+            expires = cookie.expiresDate; secure = cookie.isSecure
+            httpOnly = cookie.isHTTPOnly; sessionOnly = cookie.isSessionOnly
+            sameSite = cookie.sameSitePolicy?.rawValue
+            version = cookie.version
+            ports = cookie.portList?.map(\.intValue)
+        }
+    }
+    private var sessionCookies: Set<SessionCookie>?
+    private var sessionTask: Task<Void, Never>?
+    private var metadataTask: Task<Void, Never>?
+    private var metadataDocument: WKNavigation?
+    private let sessionObserverFactory: (UUID, @escaping @MainActor () -> Void) -> Feel04PreviewSessionObserver?
+    /// Monotonic. Every publish carries the id of the request that produced it, so a reply
+    /// arriving after the pointer moved is dropped rather than flashed on screen.
+    private var latest = 0
+    /// What `current` is about, so re-entering the same link mid-load is a no-op instead of
+    /// a restart.
+    private var showing: String?
+    private weak var source: Tab?
+
+    private let snapshotCapture: @MainActor (WKWebView) async -> NSImage?
+    private let debounceSleep: @MainActor (Duration) async throws -> Void
+
+    init(sessionObserverFactory: @escaping (UUID, @escaping @MainActor () -> Void) -> Feel04PreviewSessionObserver? = {
+        Feel04PreviewSessionObserver(profileID: $0, changed: $1)
+    }, debounceSleep: @escaping @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+       snapshotCapture: @escaping @MainActor (WKWebView) async -> NSImage? = { web in
+           let configuration = WKSnapshotConfiguration()
+           configuration.snapshotWidth = NSNumber(value: Previews.snapshotWidth)
+           return try? await web.takeSnapshot(configuration: configuration)
+       }) {
+        self.sessionObserverFactory = sessionObserverFactory
+        self.debounceSleep = debounceSleep
+        self.snapshotCapture = snapshotCapture
+    }
+
+    isolated deinit { sessionTask?.cancel(); metadataTask?.cancel() }
+
+    private func retireSession() {
+        cache = Cache(); sessionCookies = nil
+        cancel()
+        web?.removeFromSuperview(); host?.contentView = nil
+        web = nil; builtFor = nil; bridge = nil
+    }
+
+    /// Cookie-store notifications can omit page-originated deletions on WebKit 26.
+    /// Check only while one ordinary preview is active; no page polling, speculative
+    /// loads, private-session reads or work after pointer exit is introduced.
+    private func monitorSession(_ id: Int) {
+        sessionTask?.cancel()
+        sessionTask = Task(priority: .background) { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                guard let self, !Task.isCancelled, self.latest == id else { return }
+                guard self.showing != nil, self.source != nil, self.current != nil,
+                      Previews.enabled, !BatterySaver.shared.isActive else { self.cancel(); return }
+                guard let unchanged = await self.sessionUnchanged(id) else { return }
+                if !unchanged { self.retireSession(); return }
+            }
+        }
+    }
+
+    /// Nil means this read was superseded; its completion must not affect a successor.
+    private func sessionUnchanged(_ id: Int) async -> Bool? {
+        guard latest == id, Previews.enabled, !BatterySaver.shared.isActive,
+              let scope = cacheScope, scope.privateTab == nil else { return nil }
+        let expected = sessionCookies
+        let cookies = await ProfileManager.dataStore(for: scope.profile).httpCookieStore.allCookies()
+        guard !Task.isCancelled, latest == id, Previews.enabled, !BatterySaver.shared.isActive,
+              cacheScope?.profile == scope.profile,
+              cacheScope?.privateTab == nil else { return nil }
+        return expected == Set(cookies.map(SessionCookie.init))
+    }
+
+    private var debounceTask: Task<Void, Never>?
+    private var paintTask: Task<Void, Never>?
+    private var summaryTask: Task<Void, Never>?
+    /// Both have to be true before the model is worth starting: the pointer has settled,
+    /// and there is a parsed DOM to take text out of.
+    private var settled = false
+    private var domReady = false
+    private var summaryTries = 0
+    /// The request whose page has actually committed. Until then the web view is still
+    /// showing the *last* preview, and snapshotting it would put the previous link's
+    /// screenshot under this link's title — measured, and exactly what happened before this
+    /// existed: every preview after the first "painted" in 160ms because it was a picture of
+    /// the one before it.
+    private var committed = 0
+    private var navigation: WKNavigation?
+    // Remember unload identities without keeping retired navigations/pages alive.
+    private let unloads = NSHashTable<WKNavigation>.weakObjects()
+
+    /// Start (or instantly re-show) a preview of `url`. Safe to call on every hover event —
+    /// the same link twice in a row costs nothing.
+    func request(_ url: URL, from tab: Tab, rect: CGRect = .zero, shift: Bool = true) {
+        guard Previews.enabled, !BatterySaver.shared.isActive else { cancel(); return }
+        guard Previews.eligible(url, onPage: tab.currentURL, shift: shift) else { cancel(); return }
+        let revision = UserDefaults.timo.integer(forKey: "aiSettingsRevision")
+        if revision != aiSettingsRevision {
+            aiSettingsRevision = revision
+            cache = Cache()
+            stop()
+        }
+        let scope = (profile: tab.profileID, privateTab: tab.isPrivate ? tab.id : nil)
+        if let previous = cacheScope, previous != scope {
+            cache = Cache(); sessionCookies = nil
+            stop()
+            sessionObserver?.detach(); sessionObserver = nil
+        }
+        cacheScope = scope
+        if !tab.isPrivate, sessionObserver == nil {
+            sessionObserver = sessionObserverFactory(tab.profileID) { [weak self] in self?.retireSession() }
+        }
+        let key = Previews.key(for: url)
+        if showing == key, source === tab { linkRect = rect; return }
+
+        stop()
+        source = tab
+        linkRect = rect
+        let id = begin()
+        showing = key
+
+        // Re-hover: everything, image included, straight back out of memory in this turn of
+        // the run loop. This is the whole reason the cache exists.
+        if let hit = cache.lookup(key) {
+            unload()
+            var p = hit
+            p.summarizing = false; p.loading = false
+            if tab.isPrivate { publish(p, for: id); return }
+            // Validate the source session before promoting stored pixels, including
+            // changes missed while no preview was active. Reuse the existing renderer.
+            current = nil
+            debounceTask = Task(priority: .background) { [weak self, weak tab] in
+                guard let self, let tab, let unchanged = await self.sessionUnchanged(id) else { return }
+                if !unchanged {
+                    let rect = self.linkRect
+                    self.retireSession()
+                    self.request(url, from: tab, rect: rect)
+                    return
+                }
+                self.publish(p, for: id)
+                self.monitorSession(id)
+            }
+            return
+        }
+
+        var p = Preview(url: url)
+        p.title = url.host ?? url.absoluteString      // something to draw before the DOM lands
+        // A private window never writes a favicon to disk — an icon in the cache directory
+        // is a record that the host was visited. `Favicons.icon(for:)` has no read-only
+        // door, so private previews simply go without one.
+        p.favicon = tab.isPrivate ? nil : tab.favicons.icon(for: url)
+        publish(p, for: id)
+
+        let sleep = debounceSleep
+        debounceTask = Task(priority: .background) { [weak self, weak tab] in
+            try? await sleep(Previews.loadDebounce)
+            guard !Task.isCancelled, let self, let tab, self.latest == id,
+                  Previews.enabled, !BatterySaver.shared.isActive else { return }
+            // Give the page being browsed priority over this optional destination.
+            guard tab.existingWeb?.isLoading != true else {
+                self.unload()
+                self.edit(id) { $0.loading = false }; return
+            }
+            let web = self.webView(for: tab)
+            if !tab.isPrivate {
+                // Speculative responses must not mutate the profile session or trigger
+                // our source-session observer. Refresh this ephemeral cookie snapshot
+                // before each destination; real profile changes still cancel the request.
+                let cookies = await ProfileManager.dataStore(for: tab.profileID).httpCookieStore.allCookies()
+                guard !Task.isCancelled, self.latest == id else { return }
+                let state = Set(cookies.map(SessionCookie.init))
+                if let previous = self.sessionCookies, previous != state { self.cache = Cache() }
+                self.sessionCookies = state
+                let destination = web.configuration.websiteDataStore.httpCookieStore
+                for cookie in await destination.allCookies() {
+                    guard !Task.isCancelled, self.latest == id else { return }
+                    await destination.deleteCookie(cookie)
+                }
+                for cookie in cookies {
+                    guard !Task.isCancelled, self.latest == id else { return }
+                    await destination.setCookie(cookie)
+                }
+            }
+            guard !Task.isCancelled, self.latest == id, Previews.enabled,
+                  !BatterySaver.shared.isActive else { return }
+            self.navigation = web.load(URLRequest(url: Previews.requestURL(url, profileID: tab.profileID)))
+            if !tab.isPrivate { self.monitorSession(id) }
+            self.paintTask = Task(priority: .background) { [weak self] in await self?.paint(id: id, web: web) }
+            // Preparing pixels never speculatively starts inference. Keep its original
+            // intent budget, independently of when the page begins painting.
+            try? await Task.sleep(for: Previews.summaryDebounce - Previews.loadDebounce)
+            guard !Task.isCancelled, self.latest == id, Previews.enabled,
+                  !BatterySaver.shared.isActive else { return }
+            self.settled = true
+            self.startSummary(id: id)
+        }
+    }
+
+    /// The pointer left. Everything stops: the load, the snapshots, the inference.
+    func cancel() {
+        stop()
+        current = nil
+        unload()
+    }
+
+    /// A page release must not dismiss a preview requested by another tab.
+    func cancel(from tab: Tab) {
+        guard source === tab else { return }
+        cancel()
+    }
+
+    func cancel(from tabID: Tab.ID) {
+        guard source?.id == tabID else { return }
+        cancel()
+    }
+
+    private func unload() {
+        // about:blank rather than tearing the view down — a fresh WKWebView costs a
+        // WebContent process launch, and this is a thing the user does dozens of times a
+        // minute. Blanking is what actually stops a video, an animation and a timer.
+        if let web, web.url != nil,
+           let navigation = web.load(URLRequest(url: URL(string: "about:blank")!)) {
+            unloads.add(navigation)
+        }
+    }
+
+    /// Everything cancel() does except clearing the screen, so `request` can reuse it.
+    private func stop() {
+        latest += 1
+        showing = nil
+        source = nil
+        settled = false
+        domReady = false
+        summaryTries = 0
+        navigation = nil
+        metadataTask?.cancel(); metadataTask = nil
+        metadataDocument = nil
+        debounceTask?.cancel(); debounceTask = nil
+        sessionTask?.cancel(); sessionTask = nil
+        paintTask?.cancel(); paintTask = nil
+        // Cancelling the consumer is what cancels the inference: AppleAI's stream cancels
+        // its work and retires its session from `onTermination`.
+        summaryTask?.cancel(); summaryTask = nil
+        web?.stopLoading()
+    }
+
+    // internal, not private: `check()` drives the publish gate directly.
+    func begin() -> Int { latest += 1; return latest }
+
+    /// True when this reply belongs to a request that has since been superseded or cancelled.
+    static func stale(request: Int, latest: Int) -> Bool { request != latest }
+
+    func publish(_ p: Preview, for id: Int) {
+        guard !Previews.stale(request: id, latest: latest) else { return }
+        current = p
+        // Only a preview with a picture is worth remembering; caching the empty shell would
+        // make the *next* hover instantly show nothing.
+        if p.image != nil { cache.store(p, key: Previews.key(for: p.url)) }
+    }
+
+    private func edit(_ id: Int, _ change: (inout Preview) -> Void) {
+        guard !Previews.stale(request: id, latest: latest), var p = current else { return }
+        change(&p)
+        publish(p, for: id)
+    }
+
+    // MARK: - The mini render
+
+    private var web: WKWebView?
+    private var host: PreviewHostWindow?
+    private var bridge: Bridge?
+    /// The web view is built against one profile's data store; a hover from another window
+    /// rebuilds it. Reused otherwise, which is what keeps the warm numbers warm.
+    private var builtFor: (profile: UUID, isPrivate: Bool, privateTab: UUID?)?
+
+    private func webView(for tab: Tab) -> WKWebView {
+        if let web, builtFor?.profile == tab.profileID, builtFor?.isPrivate == tab.isPrivate,
+           builtFor?.privateTab == (tab.isPrivate ? tab.id : nil) {
+            return web
+        }
+        web?.removeFromSuperview()
+
+        // Keep profile blocker/settings configuration, but isolate speculative writes.
+        // Regular previews receive a cookie snapshot just before loading; private
+        // previews stay empty and never read the user's persistent session.
+        let cfg = Tab.configuration(isPrivate: tab.isPrivate, profileID: tab.profileID)
+        cfg.websiteDataStore = .nonPersistent()
+        // A preview is not a tab. Extensions must not see it, script into it, or count it.
+        cfg.webExtensionController = nil
+        // Tab.configuration allows autoplay, which is right for a tab and wrong for a
+        // picture of one.
+        cfg.mediaTypesRequiringUserActionForPlayback = .all
+
+        let b = Bridge(self)
+        bridge = b
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: Previews.metaScript, injectionTime: .atDocumentEnd,
+                         forMainFrameOnly: true, in: Previews.metadataWorld))
+        cfg.userContentController.add(b, contentWorld: Previews.metadataWorld, name: Previews.metaMessageName)
+
+        let w = WKWebView(frame: NSRect(origin: .zero, size: Previews.viewport), configuration: cfg)
+        w.customUserAgent = Settings.userAgent
+        w.navigationDelegate = b
+        w.uiDelegate = b
+
+        if let host { host.contentView = w }
+        else { host = PreviewHostWindow(content: w) }
+
+        web = w
+        builtFor = (tab.profileID, tab.isPrivate, tab.isPrivate ? tab.id : nil)
+        return w
+    }
+
+    /// Publish one settled frame, retrying only blank/failed captures within the
+    /// paint budget. Document identity must survive every await: a client redirect
+    /// can replace the document without changing the hovered request's identity.
+    private func paint(id: Int, web: WKWebView) async {
+        let deadline = ContinuousClock.now + Previews.paintDeadline
+        while !Task.isCancelled, latest == id {
+            if committed == id, !web.isLoading || ContinuousClock.now >= deadline,
+               let document = navigation, let url = web.url {
+                do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+                guard !Task.isCancelled, latest == id else { return }
+                if owns(web, navigation: document), committed == id, web.url == url {
+                    let image = await snapshotCapture(web)
+                    guard !Task.isCancelled, latest == id else { return }
+                    if owns(web, navigation: document), committed == id, web.url == url,
+                       let image, Previews.meaningful(image) {
+                        if source?.isPrivate != true {
+                            guard let unchanged = await sessionUnchanged(id) else { return }
+                            if !unchanged { retireSession(); return }
+                        }
+                        guard !Task.isCancelled, latest == id else { return }
+                        if owns(web, navigation: document), committed == id, web.url == url {
+                            edit(id) { $0.image = image; $0.loading = false }
+                            return
+                        }
+                    }
+                }
+            }
+            if ContinuousClock.now >= deadline { break }
+            do { try await Task.sleep(for: Previews.paintInterval) } catch { return }
+        }
+        edit(id) { $0.loading = false }
+    }
+
+    /// "Usable" means "not one flat colour". A snapshot taken before the first paint is a
+    /// perfectly uniform white (or black) rectangle, and showing that is worse than showing
+    /// nothing. Samples a coarse grid; three distinct colours means something rendered.
+    /// ponytail: a real page that is genuinely two colours in its first 400 rows is judged
+    /// blank and waits for the next poll. Cheap failure, 150ms.
+    static func meaningful(_ image: NSImage) -> Bool {
+        guard let tiff = image.tiffRepresentation, let bits = NSBitmapImageRep(data: tiff),
+              bits.pixelsWide > 8, bits.pixelsHigh > 8 else { return false }
+        var seen = Set<UInt32>()
+        for x in stride(from: 2, to: bits.pixelsWide, by: max(1, bits.pixelsWide / 20)) {
+            for y in stride(from: 2, to: bits.pixelsHigh, by: max(1, bits.pixelsHigh / 20)) {
+                guard let c = bits.colorAt(x: x, y: y) else { continue }
+                seen.insert(UInt32(c.redComponent * 255) << 16
+                            | UInt32(c.greenComponent * 255) << 8
+                            | UInt32(c.blueComponent * 255))
+                if seen.count >= 3 { return true }
+            }
+        }
+        return false
+    }
+
+    // MARK: - Metadata, straight off the DOM
+
+    private func owns(_ web: WKWebView, navigation: WKNavigation?) -> Bool {
+        web === self.web && navigation != nil && navigation === self.navigation
+    }
+
+    fileprivate func started(_ web: WKWebView, navigation: WKNavigation?) {
+        // Client-side redirects create a new navigation, unlike HTTP redirects.
+        // Adopt those while rejecting queued starts from internal unloads.
+        guard web === self.web, showing != nil, let navigation,
+              !unloads.contains(navigation) else { return }
+        self.navigation = navigation
+        committed = 0
+        domReady = false
+    }
+
+    fileprivate func committed(_ web: WKWebView, navigation: WKNavigation?) {
+        guard owns(web, navigation: navigation), showing != nil else { return }
+        committed = latest
+    }
+
+    /// Deliberately keyed on "is there a live request", not on the url matching the one that
+    /// was asked for: github.com/apple/swift is a 301 to github.com/swiftlang/swift, and
+    /// comparing urls threw away the metadata of every redirecting link — measured, the card
+    /// kept the bare hostname as its title.
+    fileprivate func received(meta html: String, from web: WKWebView, documentURL: URL?) {
+        let id = latest
+        guard web === self.web, committed == id, let url = web.url,
+              let documentURL, documentURL.absoluteString != "about:blank",
+              documentURL == url, showing != nil else { return }
+        guard Self.acceptsMetadata(html), let navigation,
+              metadataDocument !== navigation else { return }
+        metadataTask?.cancel()
+        metadataDocument = navigation
+        let work = Task.detached(priority: .userInitiated) { Previews.meta(from: html) }
+        metadataTask = Task { @MainActor [weak self, weak web] in
+            let m = await withTaskCancellationHandler {
+                await work.value
+            } onCancel: { work.cancel() }
+            guard !Task.isCancelled, let self, let web,
+                  self.latest == id, self.web === web, self.navigation === navigation,
+                  self.committed == id, web.url == url, self.showing != nil else { return }
+            self.metadataTask = nil
+            self.edit(id) {
+                if !m.title.isEmpty { $0.title = m.title }
+                if !m.description.isEmpty { $0.description = m.description }
+                if !m.image.isEmpty { $0.imageURL = URL(string: m.image, relativeTo: url)?.absoluteURL }
+            }
+            // documentEnd: the DOM is parsed, even if styles and images are still arriving.
+            self.domReady = true
+            self.startSummary(id: id)
+        }
+    }
+
+    fileprivate func finished(_ web: WKWebView, navigation: WKNavigation?) {
+        guard owns(web, navigation: navigation) else { return }
+        domReady = true
+        startSummary(id: latest)
+    }
+
+    fileprivate func failed(_ web: WKWebView, navigation: WKNavigation?) {
+        guard owns(web, navigation: navigation) else { return }
+        edit(latest) { $0.loading = false }
+    }
+
+    // MARK: - The model
+
+    /// Runs once both gates are open: the pointer settled, and the DOM parsed. Whichever
+    /// arrives second starts it.
+    private func startSummary(id: Int) {
+        guard settled, domReady, summaryTask == nil, BrowserAI.ready(for: .summaries),
+              summaryTries < Previews.summaryTryLimit,
+              !Previews.stale(request: id, latest: latest), let web else { return }
+        summaryTries += 1
+        edit(id) { $0.summarizing = true }
+        summaryTask = Task { [weak self] in await self?.summarize(id: id, web: web) }
+    }
+
+    private func summarize(id: Int, web: WKWebView) async {
+        // Reader's extraction, not innerText: it is the one piece of code in this app that
+        // already knows how to find the article and leave the navigation behind, and a
+        // summary of a nav bar is worse than no summary.
+        guard let e = await Reader.extract(from: web), latest == id else {
+            edit(id) { $0.summarizing = false }
+            if latest == id { summaryTask = nil }      // let didFinish have the retry
+            return
+        }
+        let whole = (e.title + "\n\n" + Reader.plainText(e.nodes))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // AppleAI.truncate cuts at a sentence end where it can, so the model is never handed
+        // half a clause. See `summaryBudget` for why this is cut at all.
+        let text = AppleAI.truncate(whole, limit: Previews.summaryBudget)
+
+        // Two sentences, not three: this is a hover card, and two is ~30% less generation.
+        var fold = Fold()
+        for await element in BrowserAI.summarizeStream(text, sentences: 2, isPrivate: builtFor?.isPrivate ?? true) {
+            guard latest == id else { return }        // pointer left; publish nothing more
+            let carryOn = fold.take(element)
+            edit(id) { $0.summary = fold.text }
+            if !carryOn { break }                     // the empty final element: retracted
+        }
+        guard latest == id else { return }
+        // An empty stream means the model was never called — nothing was shown and nothing
+        // needs retracting, so the card just stops saying it is summarising.
+        edit(id) { $0.summarizing = false; $0.summary = fold.text }
+        // Nothing came back, which on a framework-rendered page usually means the body was
+        // still empty at documentEnd. Clear the slot so didFinish gets the one retry
+        // `summaryTryLimit` allows.
+        if !fold.ran { summaryTask = nil }
+    }
+
+    /// The stream contract, as a value, so it can be asserted without a neural engine.
+    ///
+    /// `AppleAI.summarizeStream` yields **cumulative** snapshots: each element is the whole
+    /// answer so far. So `take` assigns and never appends. A **final empty element** is the
+    /// retraction signal — the completed answer failed validation and everything already
+    /// shown must be discarded — so it clears the text and reports "stop". A stream with no
+    /// elements at all means the model was never called, which is a different thing from an
+    /// answer that was withdrawn: `ran` tells them apart.
+    struct Fold {
+        private(set) var text = ""
+        private(set) var ran = false
+        private(set) var discarded = false
+
+        /// Returns false when the stream should not be read any further.
+        @discardableResult
+        mutating func take(_ element: String) -> Bool {
+            ran = true
+            guard !element.isEmpty else { text = ""; discarded = true; return false }
+            text = element
+            return true
+        }
+    }
+
+    static func fold(_ elements: [String]) -> Fold {
+        var f = Fold()
+        for e in elements {
+            if !f.take(e) { break }
+        }
+        return f
+    }
+
+    // MARK: - Cache
+
+    /// url → preview, capped and time-limited. ponytail: a dictionary and a counter. No LRU
+    /// list, no cost accounting — eviction is oldest-inserted-first, which for a hover cache
+    /// is indistinguishable from LRU because nothing is ever re-inserted without being
+    /// re-fetched. Ceiling: a preview you keep re-hovering still ages out at the TTL.
+    /// @MainActor because a type nested in an isolated one does not inherit its isolation,
+    /// and the caps above are main-actor state.
+    @MainActor struct Cache {
+        private struct Entry {
+            var preview: Preview
+            var at: Date
+            var seq: Int
+        }
+        private var entries: [String: Entry] = [:]
+        private var seq = 0
+
+        var count: Int { entries.count }
+
+        mutating func store(_ p: Preview, key: String, now: Date = .now) {
+            seq += 1
+            entries[key] = Entry(preview: p, at: now, seq: seq)
+            while entries.count > Previews.cacheCap {
+                guard let oldest = entries.min(by: { $0.value.seq < $1.value.seq })?.key else { break }
+                entries[oldest] = nil
+            }
+        }
+
+        mutating func lookup(_ key: String, now: Date = .now) -> Preview? {
+            guard let e = entries[key] else { return nil }
+            guard now.timeIntervalSince(e.at) < Previews.cacheTTL else {
+                entries[key] = nil
+                return nil
+            }
+            return e.preview
+        }
+    }
+
+    // MARK: - The hover script
+    //
+    // Injected into every tab; `messageName` is the channel it posts on.
+
+    static let messageName = "timopreview"
+    /// Isolated so the page can neither post on the channel nor see the hover tracker.
+    static let world = WKContentWorld.world(name: "TimoPreviewHover")
+
+    /// Automatic previews are limited to result/content links on Arc Max's supported
+    /// discovery surfaces. Shift explicitly requests other destinations. Filters run
+    /// before the native bridge, so ordinary navigation starts no speculative work.
+    /// One document-level pointer tracker and timer also cover dynamically added links.
+    static let script = """
+    (function () {
+      var DWELL = 550;
+      var timer = null, at = null, hovered = null, announced = false;
+
+      function link(node) {
+        while (node && node.nodeType !== 1) { node = node.parentNode; }
+        return node && node.closest ? node.closest('a[href]') : null;
+      }
+      // `a.href` is resolved and normalised by the DOM, so this is the real destination.
+      function web(a) { return /^https?:/i.test(a.href) && !a.hasAttribute('download'); }
+      function destination(a) {
+        var url = new URL(a.href), host = url.hostname.toLowerCase(), value = null;
+        // Search engines wrap result URLs. Preview the article, not the redirect page.
+        if (/^(www\\.)?google\\.(com|[a-z]{2}|com\\.[a-z]{2}|co\\.[a-z]{2})$/.test(host) && url.pathname === '/url') {
+          value = url.searchParams.get('q') || url.searchParams.get('url');
+        } else if ((host === 'duckduckgo.com' || host === 'html.duckduckgo.com') && url.pathname === '/l/') {
+          value = url.searchParams.get('uddg');
+        } else if (/^(www\\.)?bing\\.com$/.test(host) && url.pathname === '/ck/a') {
+          var encoded = url.searchParams.get('u');
+          if (encoded && encoded.slice(0, 2) === 'a1') {
+            try { value = atob(encoded.slice(2).replace(/-/g, '+').replace(/_/g, '/')); } catch (_) {}
+          }
+        }
+        try { if (value && /^https?:/i.test(value)) { return new URL(value); } } catch (_) {}
+        return url;
+      }
+      function automatic(a) {
+        var host = location.hostname.toLowerCase(), path = location.pathname;
+        var target = destination(a);
+        // Controls and same-site navigation never need a speculative page load.
+        if (a.closest('nav,header,footer,[role=navigation],[role=menu],[role=button]')) { return false; }
+        if (target.hostname === host) { return false; }
+        if (/^(www\\.)?google\\.(com|[a-z]{2}|com\\.[a-z]{2}|co\\.[a-z]{2})$/.test(host)) {
+          return path === '/search' && !!a.querySelector('h3,[role=heading]');
+        }
+        if (host === 'duckduckgo.com' || host === 'html.duckduckgo.com') {
+          return a.matches('[data-testid=result-title-a],.result__a');
+        }
+        if (host === 'www.bing.com' || host === 'bing.com') {
+          return path === '/search' && !!a.closest('.b_algo h2');
+        }
+        if (host === 'news.ycombinator.com') {
+          return a.matches('.titleline > a') && !a.closest('.sitebit');
+        }
+        if (/^(www\\.)?(x\\.com|twitter\\.com)$/.test(host)) {
+          if (/^(www\\.)?(x\\.com|twitter\\.com)$/.test(target.hostname)) { return false; }
+          return a.matches('[data-testid=tweetText] a[role=link][target=_blank], [data-testid="card.wrapper"] a[role=link]');
+        }
+        if (/^(www\\.)?threads\\.(net|com)$/.test(host)) {
+          return a.matches('a[role=link][rel="nofollow noreferrer"][target=_blank]');
+        }
+        return false;
+      }
+      function samePage(a) {
+        if ((a.getAttribute('href') || '').charAt(0) === '#') { return true; }
+        return a.href.split('#')[0] === location.href.split('#')[0];
+      }
+      function send(a) {
+        var r = a.getBoundingClientRect();
+        announced = true;
+        webkit.messageHandlers.\(messageName).postMessage({
+          url: destination(a).href, shift: !!shifted,
+          x: r.left, y: r.top, w: r.width, h: r.height
+        });
+      }
+      function gone() {
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (!at) { return; }
+        at = null;
+        // A canceled dwell never requested native work and has nothing to retract.
+        if (!announced) { return; }
+        announced = false;
+        webkit.messageHandlers.\(messageName).postMessage({ gone: true });
+      }
+      // Only real input drives previews; page script can dispatch synthetic events.
+      function real(e) { return e.isTrusted; }
+      function enter(a) {
+        if (a === at) { return; }
+        gone();
+        at = a;
+        if (shifted) { send(a); return; }
+        timer = setTimeout(function () { timer = null; if (at === a) { send(a); } }, DWELL);
+      }
+
+      var shifted = false, blocked = false;
+
+      document.addEventListener('mouseover', function (e) {
+        if (!real(e)) { return; }
+        shifted = !!e.shiftKey;
+        blocked = !!(e.metaKey || e.altKey || e.ctrlKey);
+        var a = link(e.target);
+        hovered = a;
+        if (blocked) { gone(); return; }
+        if (!a || !web(a) || samePage(a)) { gone(); return; }
+        if (!shifted && !automatic(a)) { gone(); return; }
+        enter(a);
+      }, true);
+
+      document.addEventListener('mouseout', function (e) {
+        var a = link(e.target);
+        if (!a || a !== hovered) { return; }
+        // Moving between two children of the same <a> is not leaving it.
+        var to = link(e.relatedTarget);
+        if (to === hovered) { return; }
+        hovered = null;
+        gone();
+      }, true);
+
+      // Modifiers can arrive before the hover or change with the pointer stationary.
+      // Command/Option belong to opening hints; they must not also raise a preview.
+      function modifiers(e) {
+        if (!real(e)) { return; }
+        var shift = !!e.shiftKey, block = !!(e.metaKey || e.altKey || e.ctrlKey);
+        if (shift === shifted && block === blocked) { return; }
+        shifted = shift; blocked = block;
+        gone();
+        if (blocked) { return; }
+        if (hovered && web(hovered) && !samePage(hovered) && (shifted || automatic(hovered))) { enter(hovered); }
+      }
+      document.addEventListener('keydown', modifiers, true);
+      document.addEventListener('keyup', modifiers, true);
+
+      // Anything that moves the page out from under the popover retracts it.
+      window.addEventListener('scroll', function () { hovered = null; gone(); }, true);
+      window.addEventListener('blur', function () { hovered = null; gone(); });
+      window.addEventListener('pagehide', function () { hovered = null; gone(); });
+      document.addEventListener('mousedown', function () { hovered = null; gone(); }, true);
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { hovered = null; gone(); }
+      }, true);
+    })();
+    """
+
+    /// The preview web view's own channel: the head, filtered down to the tags a card needs,
+    /// posted the moment the DOM is parsed. `outerHTML` rather than the values themselves so
+    /// attribute escaping is WebKit's problem and the Swift parser below has exactly one
+    /// input format — the same one `check()` feeds it.
+    fileprivate static let metaMessageName = "timopreviewmeta"
+
+    private static let metadataWorld = WKContentWorld.world(name: "TimoPreviewMetadata")
+
+    fileprivate static let metaScript = """
+    (function () {
+      var out = [], size = 0, limit = 65536, t = document.querySelector('title');
+      function append(node) {
+        var text = node.outerHTML;
+        if (text.length > limit - size) { return false; }
+        size += text.length; out.push(text); return true;
+      }
+      if (t) { append(t); }
+      var m = document.querySelectorAll('meta[property],meta[name]');
+      for (var i = 0; i < m.length && i < 256; i++) { if (!append(m[i])) { break; } }
+      webkit.messageHandlers.\(metaMessageName).postMessage(out.join(''));
+    })();
+    """
+
+    // MARK: - Metadata parsing
+    //
+    // Plain Swift over a markup fragment, which is what makes it assertable offline against
+    // a real page's real head. The web's og tags are written by hand, by templates, and by
+    // plugins, so the parser assumes nothing: any quoting, any attribute order, any casing.
+
+    struct Meta: Equatable, Sendable {
+        var title = ""
+        var description = ""
+        var image = ""
+    }
+
+    nonisolated static let maxMetadataBytes = 65_536
+
+    nonisolated static func acceptsMetadata(_ html: String) -> Bool {
+        html.utf8.prefix(maxMetadataBytes + 1).count <= maxMetadataBytes
+    }
+
+    nonisolated static func meta(from html: String) -> Meta {
+        guard acceptsMetadata(html), !Task.isCancelled else { return Meta() }
+        let s = Array(html)
+        var docTitle = ""
+        var og = Meta(), twitter = Meta()
+        var nameDescription = ""
+        var i = 0
+        while i < s.count {
+            guard s[i] == "<" else { i += 1; continue }
+            var j = i + 1
+            if j < s.count, s[j] == "/" { j += 1 }
+            var name = ""
+            while j < s.count, s[j].isLetter || s[j].isNumber { name.append(s[j]); j += 1 }
+            let tag = name.lowercased()
+
+            if tag == "script" || tag == "style" {
+                // A page's inline scripts are full of strings that look exactly like meta
+                // tags — GitHub's head ships 5KB of them. Skip the element's contents whole,
+                // and land *past* the closing tag: landing on it would re-enter this branch
+                // and swallow the rest of the head.
+                let (_, end) = attributes(s, from: j)
+                let close = find("</" + tag, in: s, from: end)
+                (_, i) = attributes(s, from: min(close + tag.count + 2, s.count))
+                continue
+            }
+            if tag == "title" {
+                let (_, end) = attributes(s, from: j)
+                var k = end, text = ""
+                while k < s.count, s[k] != "<" { text.append(s[k]); k += 1 }
+                if docTitle.isEmpty { docTitle = clean(text) }
+                i = k
+                continue
+            }
+            if tag == "meta" {
+                let (a, end) = attributes(s, from: j)
+                let key = (a["property"] ?? a["name"] ?? "")
+                    .trimmingCharacters(in: .whitespaces).lowercased()
+                let content = clean(a["content"] ?? "")
+                if !content.isEmpty {
+                    // Exact keys only: `og:image:alt` is a description of the picture, not a
+                    // picture, and matching it by prefix is how a card ends up showing the
+                    // word "Screenshot of the app" where the art should be.
+                    switch key {
+                    case "og:title":            if og.title.isEmpty { og.title = content }
+                    case "og:description":      if og.description.isEmpty { og.description = content }
+                    case "og:image", "og:image:url", "og:image:secure_url":
+                                                if og.image.isEmpty { og.image = content }
+                    case "twitter:title":       if twitter.title.isEmpty { twitter.title = content }
+                    case "twitter:description": if twitter.description.isEmpty { twitter.description = content }
+                    case "twitter:image":       if twitter.image.isEmpty { twitter.image = content }
+                    case "description":         if nameDescription.isEmpty { nameDescription = content }
+                    default: break
+                    }
+                }
+                i = end
+                continue
+            }
+            i = max(j, i + 1)
+        }
+        // og first, always. It is the line the publisher wrote to be quoted elsewhere, which
+        // is exactly what a preview card is; `<title>` is the line they wrote for a tab and
+        // is usually carrying a site name it does not need here.
+        func first(_ options: String...) -> String { options.first { !$0.isEmpty } ?? "" }
+        return Meta(title: first(og.title, twitter.title, docTitle),
+                    description: first(og.description, twitter.description, nameDescription),
+                    image: first(og.image, twitter.image))
+    }
+
+    /// Reads `name=value` pairs from `i` up to the tag's unquoted `>`. Handles double
+    /// quotes, single quotes and no quotes, tolerates a valueless attribute, and stops at
+    /// the end of the input rather than running off it — a truncated head is a normal thing
+    /// to be handed, not an error.
+    ///
+    /// Returns the attributes with lowercased names, and the index just past the `>`.
+    nonisolated static func attributes(_ s: [Character], from i: Int) -> ([String: String], Int) {
+        var attrs: [String: String] = [:]
+        var j = i
+        while j < s.count {
+            while j < s.count, s[j].isWhitespace { j += 1 }
+            guard j < s.count else { break }
+            if s[j] == ">" { j += 1; break }
+            if s[j] == "/" { j += 1; continue }
+
+            var name = ""
+            while j < s.count, !s[j].isWhitespace, s[j] != "=", s[j] != ">" {
+                name.append(s[j]); j += 1
+            }
+            var after = j
+            while after < s.count, s[after].isWhitespace { after += 1 }
+            guard after < s.count, s[after] == "=" else {
+                if !name.isEmpty { attrs[name.lowercased()] = "" }   // a bare attribute
+                continue
+            }
+            j = after + 1
+            while j < s.count, s[j].isWhitespace { j += 1 }
+            var value = ""
+            if j < s.count, s[j] == "\"" || s[j] == "'" {
+                let quote = s[j]
+                j += 1
+                while j < s.count, s[j] != quote { value.append(s[j]); j += 1 }
+                if j < s.count { j += 1 }
+            } else {
+                while j < s.count, !s[j].isWhitespace, s[j] != ">" { value.append(s[j]); j += 1 }
+            }
+            if !name.isEmpty { attrs[name.lowercased()] = value }
+        }
+        return (attrs, j)
+    }
+
+    /// Index of `needle` (case-insensitively) at or after `from`, or the end of the input.
+    private nonisolated static func find(_ needle: String, in s: [Character], from: Int) -> Int {
+        let n = Array(needle.lowercased())
+        guard !n.isEmpty, s.count >= n.count else { return s.count }
+        var i = max(0, from)
+        // Compare as Strings, not Characters: `Character.lowercased()` can return more than
+        // one character (İ), and `Character(_: String)` traps when handed those.
+        let lowered = n.map(String.init)
+        while i + n.count <= s.count {
+            var k = 0
+            while k < n.count, s[i + k].lowercased() == lowered[k] { k += 1 }
+            if k == n.count { return i }
+            i += 1
+        }
+        return s.count
+    }
+
+    /// Attribute values arrive escaped and often wrapped across source lines. A card wants
+    /// one tidy line of prose.
+    nonisolated static func clean(_ s: String) -> String {
+        var out = ""
+        var space = false
+        for ch in unescape(s) {
+            if ch.isWhitespace { space = !out.isEmpty; continue }
+            if space { out.append(" "); space = false }
+            out.append(ch)
+        }
+        return out
+    }
+
+    /// ponytail: the five named entities that actually turn up in an og:description, plus
+    /// numeric references. Not an entity table — `&hellip;` survives as `&hellip;`, which is
+    /// a cosmetic wart on a hover card and not worth 250 lines of HTML5 named references.
+    nonisolated static func unescape(_ s: String) -> String {
+        guard s.contains("&") else { return s }
+        var out = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            // Look at at most ten characters, even when no semicolon exists. Searching
+            // the entire suffix once per ampersand makes malformed input quadratic.
+            let end = s.index(i, offsetBy: 11, limitedBy: s.endIndex) ?? s.endIndex
+            guard s[i] == "&", let semi = s[i..<end].firstIndex(of: ";") else {
+                out.append(s[i]); i = s.index(after: i); continue
+            }
+            let body = String(s[s.index(after: i)..<semi])
+            let replacement: String?
+            switch body.lowercased() {
+            case "amp": replacement = "&"
+            case "lt": replacement = "<"
+            case "gt": replacement = ">"
+            case "quot": replacement = "\""
+            case "apos": replacement = "'"
+            case "nbsp": replacement = " "
+            default:
+                if body.hasPrefix("#") {
+                    let digits = body.dropFirst()
+                    let value = digits.hasPrefix("x") || digits.hasPrefix("X")
+                        ? UInt32(digits.dropFirst(), radix: 16)
+                        : UInt32(digits)
+                    replacement = value.flatMap { Unicode.Scalar($0).map { String(Character($0)) } }
+                } else {
+                    replacement = nil
+                }
+            }
+            guard let replacement else {
+                out.append(s[i]); i = s.index(after: i); continue
+            }
+            out += replacement
+            i = s.index(after: semi)
+        }
+        return out
+    }
+
+    // MARK: - Bridge
+    //
+    // WKUserContentController retains its handlers and WKWebView's delegates are the same
+    // object here, so this holds Previews weakly — the same reason WeakHandler exists.
+
+    @MainActor private final class Bridge: NSObject, WKNavigationDelegate, WKUIDelegate,
+                                           WKScriptMessageHandler {
+        weak var owner: Previews?
+        init(_ owner: Previews) { self.owner = owner }
+
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+            guard m.frameInfo.isMainFrame, let native = m.body as? NSString,
+                  native.length <= Previews.maxMetadataBytes,
+                  let html = m.body as? String, Previews.acceptsMetadata(html),
+                  let web = m.webView else { return }
+            owner?.received(meta: html, from: web, documentURL: m.frameInfo.request.url)
+        }
+
+        func webView(_ w: WKWebView, didStartProvisionalNavigation n: WKNavigation!) { owner?.started(w, navigation: n) }
+        func webView(_ w: WKWebView, didCommit n: WKNavigation!) { owner?.committed(w, navigation: n) }
+        func webView(_ w: WKWebView, didFinish n: WKNavigation!) { owner?.finished(w, navigation: n) }
+        func webView(_ w: WKWebView, didFail n: WKNavigation!, withError e: Error) { owner?.failed(w, navigation: n) }
+        func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!,
+                     withError e: Error) { owner?.failed(w, navigation: n) }
+
+        /// A preview follows redirects and nothing else. No mailto:, no custom scheme
+        /// handing the click to another app, no popup.
+        func webView(_ w: WKWebView, decidePolicyFor action: WKNavigationAction,
+                     preferences: WKWebpagePreferences,
+                     decisionHandler: @escaping @MainActor (WKNavigationActionPolicy, WKWebpagePreferences) -> Void) {
+            let policy = Previews.navigationPolicy(action.request.url, profileID: owner?.source?.profileID,
+                                                   preferences: preferences)
+            decisionHandler(policy, preferences)
+        }
+
+        /// Never turn a preview into a download. Engine.swift routes an attachment to the
+        /// download manager; here it is simply not previewable.
+        func webView(_ w: WKWebView, decidePolicyFor response: WKNavigationResponse)
+            async -> WKNavigationResponsePolicy {
+            let http = response.response as? HTTPURLResponse
+            let disposition = (http?.value(forHTTPHeaderField: "Content-Disposition") ?? "").lowercased()
+            return disposition.hasPrefix("attachment") || !response.canShowMIMEType ? .cancel : .allow
+        }
+
+        /// The one place in Timo that still refuses a popup outright, and deliberately: this
+        /// web view is off-screen and exists to read a page's `<head>`, so there is no window
+        /// for a popup to belong to and nobody clicked anything to ask for one. Engine.swift
+        /// hands back a real one instead — see Popups.swift — because a *tab* has a window.
+        /// A Little Timo and a Peek are ordinary `Tab`s in a floating `TabStore`, so they are
+        /// already on that path and their popups float as Little Timos of their own.
+        func webView(_ w: WKWebView, createWebViewWith cfg: WKWebViewConfiguration,
+                     for action: WKNavigationAction,
+                     windowFeatures: WKWindowFeatures) -> WKWebView? { nil }
+
+        /// A page that opens an alert during a preview would put a modal on screen for
+        /// something the user only pointed at.
+        func webView(_ w: WKWebView, runJavaScriptAlertPanelWithMessage m: String,
+                     initiatedByFrame f: WKFrameInfo) async {}
+        func webView(_ w: WKWebView, runJavaScriptConfirmPanelWithMessage m: String,
+                     initiatedByFrame f: WKFrameInfo) async -> Bool { false }
+    }
+
+    // MARK: - Checks
+
+    /// Offline assertions. No network, no window server, no model — everything here is the
+    /// pure half: the head parser, the eligibility rules, the cache, the stream contract and
+    /// the publish gate.
+    static func check() -> [(String, Bool)] {
+        let u = { (s: String) in URL(string: s)! }
+
+        // A real head. Trimmed from https://github.com/apple/swift, kept exactly as served:
+        // og:image ahead of og:title, the og:image:* siblings that a prefix match would trip
+        // over, an inline <script>, an ampersand entity, and a <title> carrying a site name.
+        let real = """
+        <meta charset="utf-8">
+        <script type="application/json" data-target="react-app.embeddedData">\
+        {"og:description":"POISONED, this is inside a script tag"}</script>
+        <title>GitHub - swiftlang/swift: The Swift Programming Language &amp; more · GitHub</title>
+        <meta name="twitter:image" content="https://opengraph.githubassets.com/a3d0/swiftlang/swift" />
+        <meta name="twitter:site" content="@github" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="GitHub - swiftlang/swift: The Swift Programming Language" />
+        <meta name="twitter:description" content="Contribute to swiftlang/swift development." />
+        <meta property="og:image" content="https://opengraph.githubassets.com/a3d0/swiftlang/swift" />
+        <meta property="og:image:alt" content="The Swift Programming Language. Contribute to swiftlang/swift." />
+        <meta property="og:image:width" content="1200" />
+        <meta property="og:image:height" content="600" />
+        <meta property="og:site_name" content="GitHub" />
+        <meta property="og:type" content="object" />
+        <meta property="og:title" content="GitHub - swiftlang/swift: The Swift Programming Language" />
+        <meta property="og:description" content="The Swift Programming Language &amp; friends.
+              Contribute to swiftlang/swift development by creating an account on GitHub." />
+        """
+        let hit = meta(from: real)
+
+        // The same page with the og block deleted — the common case on a personal site.
+        let bare = """
+        <meta charset="utf-8">
+        <title>  Notes on   suspending tabs \u{2014} timo  </title>
+        <meta name="description" content="A short note about WKWebView memory.">
+        """
+        let plain = meta(from: bare)
+
+        // Nothing at all.
+        let empty = meta(from: "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">")
+
+        // Malformed, all of it seen in the wild: single quotes, content before property,
+        // upper-case attribute names, an unquoted value, a meta with no content at all, and
+        // a tag that is never closed because the response was truncated mid-head.
+        let malformed = """
+        <meta property='og:title' content='Single quoted &#39;title&#39;'>
+        <META CONTENT="Reversed and shouty" PROPERTY="OG:DESCRIPTION">
+        <meta property="og:site_name">
+        <meta property=og:image content=https://e.test/a.png>
+        <meta name="twitter:title" content="should lose to og:title"
+        """
+        let odd = meta(from: malformed)
+
+        // A page whose og:description is declared but empty must fall through, not win.
+        let hollow = meta(from: """
+        <meta property="og:description" content="">
+        <meta name="twitter:description" content="the real one">
+        """)
+
+        // Eligibility.
+        let onPage = u("https://example.com/article")
+
+        // Cache.
+        var cache = Cache()
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        func shot(_ s: String) -> Preview {
+            // A cache entry only ever holds a preview that has an image; NSImage() is enough
+            // to stand in for one here and needs no window server.
+            Preview(url: u(s), title: s, image: NSImage())
+        }
+        cache.store(shot("https://a.test/1"), key: "https://a.test/1", now: t0)
+        let readback = cache.lookup("https://a.test/1", now: t0.addingTimeInterval(1))
+        let live = cache.lookup("https://a.test/1", now: t0.addingTimeInterval(cacheTTL - 1)) != nil
+        let expired = cache.lookup("https://a.test/1", now: t0.addingTimeInterval(cacheTTL + 1)) == nil
+        // The expired lookup dropped it, so re-store before filling up.
+        var full = Cache()
+        for n in 0...cacheCap { full.store(shot("https://a.test/\(n)"), key: "k\(n)", now: t0) }
+        let capped = full.count == cacheCap
+        let evictedOldest = full.lookup("k0", now: t0) == nil
+        let keptNewest = full.lookup("k\(cacheCap)", now: t0) != nil
+        var repeated = Cache()
+        repeated.store(shot("https://a.test/x"), key: "k", now: t0)
+        repeated.store(shot("https://a.test/x"), key: "k", now: t0)
+
+        // The publish gate. A scratch instance, so `shared` is untouched.
+        let cancelled = Previews()
+        let cancelledID = cancelled.begin()
+        cancelled.cancel()
+        cancelled.publish(shot("https://a.test/z"), for: cancelledID)
+
+        let superseded = Previews()
+        let firstID = superseded.begin()
+        let secondID = superseded.begin()
+        superseded.publish(shot("https://a.test/first"), for: firstID)
+        let afterStale = superseded.current
+        superseded.publish(shot("https://a.test/second"), for: secondID)
+
+        let cleared = Previews()
+        let clearedID = cleared.begin()
+        cleared.publish(shot("https://a.test/y"), for: clearedID)
+        let wasShowing = cleared.current != nil
+        cleared.cancel()
+
+        return [
+            // --- metadata, real fixture
+            ("og:title beats the <title> tag",
+             hit.title == "GitHub - swiftlang/swift: The Swift Programming Language"),
+            ("og:description is picked up across a wrapped attribute value",
+             hit.description == "The Swift Programming Language & friends. Contribute to "
+                + "swiftlang/swift development by creating an account on GitHub."),
+            ("og:image is the image, not og:image:alt",
+             hit.image == "https://opengraph.githubassets.com/a3d0/swiftlang/swift"),
+            ("&amp; in an attribute value is decoded",
+             hit.description.contains("Language & friends")),
+            ("a meta tag written inside an inline <script> is not parsed",
+             !hit.description.contains("POISONED")),
+
+            // --- metadata, og absent
+            ("with no og tags the <title> is the title",
+             plain.title == "Notes on suspending tabs \u{2014} timo"),
+            ("whitespace in a title is collapsed and trimmed",
+             !plain.title.contains("  ") && !plain.title.hasPrefix(" ")),
+            ("name=description stands in for og:description",
+             plain.description == "A short note about WKWebView memory."),
+            ("no image is an empty string, not a placeholder", plain.image.isEmpty),
+            ("a head with nothing in it yields empty fields, not junk", empty == Meta()),
+
+            // --- metadata, malformed
+            ("single-quoted attributes parse", odd.title == "Single quoted 'title'"),
+            ("&#39; numeric entities decode", odd.title.contains("'title'")),
+            ("content before property parses, and the key is case-insensitive",
+             odd.description == "Reversed and shouty"),
+            ("an unquoted attribute value parses", odd.image == "https://e.test/a.png"),
+            ("a meta declaring a property with no content at all is skipped, and does not "
+             + "derail the tags after it", odd.image == "https://e.test/a.png"),
+            ("a tag left unterminated by a truncated response does not eat the earlier tags",
+             !odd.title.isEmpty && !odd.description.isEmpty),
+            ("an og tag declared empty loses to the twitter one that has content",
+             hollow.description == "the real one"),
+
+            // --- eligibility
+            ("an https link is previewable", eligible(u("https://b.test/x"), onPage: onPage, shift: true)),
+            ("an http link is previewable", eligible(u("http://b.test/x"), onPage: onPage, shift: true)),
+            ("javascript: is not", eligible(u("javascript:alert(1)"), onPage: onPage, shift: true) == false),
+            ("mailto: is not", eligible(u("mailto:ada@example.com"), onPage: onPage, shift: true) == false),
+            ("file: is not", eligible(u("file:///etc/hosts"), onPage: onPage, shift: true) == false),
+            ("data: is not",
+             eligible(u("data:text/html,<b>x</b>"), onPage: onPage, shift: true) == false),
+            ("a url with no host is not", eligible(u("https:///x"), onPage: onPage, shift: true) == false),
+            ("the page you are already on is not previewable",
+             eligible(onPage, onPage: onPage, shift: true) == false),
+            ("an anchor into the page you are on is not previewable",
+             eligible(u("https://example.com/article#part2"), onPage: onPage, shift: true) == false),
+            ("a different query on the same path is previewable",
+             eligible(u("https://example.com/article?page=2"), onPage: onPage, shift: true)),
+            ("with no current page everything http is previewable",
+             eligible(u("https://b.test/x"), onPage: nil, shift: true)),
+            ("without Shift an ordinary page previews nothing",
+             eligible(u("https://b.test/x"), onPage: onPage, shift: false) == false),
+            ("without Shift a search result on Google previews",
+             eligible(u("https://b.test/x"), onPage: u("https://www.google.com/search?q=a"), shift: false)),
+            ("without Shift Google's own navigation does not",
+             eligible(u("https://b.test/x"), onPage: u("https://www.google.com/maps"), shift: false) == false),
+            ("without Shift a same-site link on a discovery site does not",
+             eligible(u("https://news.ycombinator.com/item?id=1"), onPage: u("https://news.ycombinator.com/"),
+                      shift: false) == false),
+            ("without Shift an external Hacker News story previews",
+             eligible(u("https://b.test/x"), onPage: u("https://news.ycombinator.com/"), shift: false)),
+            ("without Shift an X link to X does not",
+             eligible(u("https://twitter.com/a"), onPage: u("https://x.com/home"), shift: false) == false),
+            ("without Shift and with no current page nothing previews",
+             eligible(u("https://b.test/x"), onPage: nil, shift: false) == false),
+
+            // --- cache
+            ("the cache key drops the fragment",
+             key(for: u("https://a.test/p#one")) == key(for: u("https://a.test/p#two"))),
+            ("the cache key keeps the query",
+             key(for: u("https://a.test/p?a=1")) != key(for: u("https://a.test/p?a=2"))),
+            ("a stored preview reads straight back", readback?.title == "https://a.test/1"),
+            ("an entry just inside the TTL is a hit", live),
+            ("an entry past the TTL is a miss", expired),
+            ("the cache never grows past its cap", capped),
+            ("eviction drops the oldest entry", evictedOldest),
+            ("eviction keeps the newest entry", keptNewest),
+            ("re-storing the same key does not grow the cache", repeated.count == 1),
+
+            // --- the stream contract
+            ("stream elements are cumulative: they replace, never append",
+             fold(["The", "The Swift", "The Swift Programming Language"]).text
+                == "The Swift Programming Language"),
+            ("a final empty element discards everything already shown",
+             fold(["The Swift", "The Swift Programming Language", ""]).text.isEmpty),
+            ("a discarded answer is marked as discarded",
+             fold(["something", ""]).discarded),
+            ("a completed answer is not marked discarded",
+             fold(["something", "something whole"]).discarded == false),
+            ("an empty stream means the model was never called",
+             fold([]).ran == false && fold([]).text.isEmpty),
+            ("a stream that yielded anything is marked as having run", fold(["a"]).ran),
+            ("an empty element stops the stream being read any further",
+             { var f = Fold(); return f.take("partial") && !f.take("") }()),
+            ("a stream that is only the empty element still counts as having run",
+             fold([""]).ran && fold([""]).text.isEmpty),
+
+            // --- the publish gate
+            ("a cancelled request publishes nothing", cancelled.current == nil),
+            ("a superseded request publishes nothing", afterStale == nil),
+            ("the live request does publish", superseded.current?.title == "https://a.test/second"),
+            ("a stale id is refused without cancelling anything",
+             stale(request: 1, latest: 2) && !stale(request: 2, latest: 2)),
+            ("cancel clears what was already on screen",
+             wasShowing && cleared.current == nil),
+        ]
+    }
+}

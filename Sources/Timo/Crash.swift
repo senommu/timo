@@ -1,0 +1,246 @@
+import AppKit
+
+/// A dirty marker detects unclean exits, including force quit. Saved originals are
+/// preserved before restoration; pages from an unclean launch load fresh URLs when shown.
+/// No unsafe signal handlers: the periodic snapshot bounds unsaved changes to 30 seconds
+/// when storage is working. A missing/unwritable marker cannot safely begin a session.
+@MainActor enum Crash {
+
+    /// Pointed at a temp directory under `check()`; nil means the real Store directory.
+    private static var directory: URL?
+    private static var marker: URL {
+        (directory ?? Store.directory).appendingPathComponent("running")
+    }
+
+    /// 30 seconds. Long enough that it is nothing next to what a browser writes anyway
+    /// (a few hundred bytes of urls, once), short enough that the worst case is losing the
+    /// last half-minute of tab changes. Crucially it is *time*-based, not navigation-based:
+    /// a redirect-heavy site can fire twenty navigations a second and still cost one write.
+    static let interval: TimeInterval = 30
+
+    private static var timer: Timer?
+    private static var lastSave: Date = .distantPast
+    private static var crashed = false
+
+    /// True when the previous run did not shut down cleanly. Fixed at `begin()`, so it
+    /// keeps answering the same way for the rest of the launch.
+    static var didCrashLastLaunch: Bool { crashed }
+
+    /// The save itself, behind a variable so `check()` can count calls without writing to
+    /// the user's real session.json.
+    static var write: () -> Bool = { Session.save() }
+
+    /// Call before restoring anything — the marker has to be read before it is rewritten.
+    @discardableResult
+    static func begin(now: Date = .now) -> Bool {
+        timer?.invalidate()
+        timer = nil
+        crashed = FileManager.default.fileExists(atPath: marker.path)
+        do {
+            if crashed { try RecoverySnapshots.preserveLaunch(in: marker.deletingLastPathComponent()) }
+        } catch {
+            NSLog("Timo: cannot preserve session recovery originals: %@", error.localizedDescription)
+            return false
+        }
+        guard SnapshotPersistence.write(Data(), to: marker) else { return false }
+        lastSave = now
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
+            Task { @MainActor in _ = await autosavePersisted() }
+        }
+        return true
+    }
+
+    /// Normal termination. Save once more, then clear the marker so the next launch knows
+    /// this one ended on purpose.
+    static func markClean() {
+        timer?.invalidate()
+        timer = nil
+        // A clean exit with an incomplete snapshot still needs recovery next launch.
+        guard write() else { return }
+        try? FileManager.default.removeItem(at: marker)
+    }
+
+    /// Throttled: returns false when it was called again too soon. The timer alone would
+    /// be enough, but going through here means any other caller (a future "save on tab
+    /// close") can't turn the session file into a write amplifier.
+    @discardableResult
+    static func autosave(now: Date = .now) -> Bool {
+        guard now.timeIntervalSince(lastSave) >= interval else { return false }
+        guard write() else { return false }
+        lastSave = now
+        return true
+    }
+
+    private static var saving = false
+
+    /// Timer saves capture native values on MainActor and await worker IO without
+    /// occupying it. A failed write remains dirty and can be retried next interval.
+    @discardableResult
+    static func autosavePersisted(now: Date = .now) async -> Bool {
+        guard !saving, now.timeIntervalSince(lastSave) >= interval else { return false }
+        saving = true
+        defer { saving = false }
+        guard Session.enqueueSave() else { return false }
+        guard await Session.flushPersistence() else { return false }
+        lastSave = now
+        return true
+    }
+
+    static func stopAutosave() { timer?.invalidate(); timer = nil }
+    static func resumeAutosave() {
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
+            Task { @MainActor in _ = await autosavePersisted() }
+        }
+    }
+
+    static func markDirtyAsync() async -> Bool {
+        let marker = marker
+        return await SessionPersistence.shared.perform { SnapshotPersistence.write(Data(), to: marker) }
+    }
+
+    /// A clean marker is published only after every accepted session/Boost write has
+    /// completed. Failure keeps the marker and original recovery generations intact.
+    static func markCleanAsync() async -> Bool {
+        stopAutosave()
+        guard Session.enqueueSave(), await Session.flushPersistence() else { return false }
+        let marker = marker
+        return await SessionPersistence.shared.perform {
+            do {
+                try FileManager.default.removeItem(at: marker)
+                return true
+            } catch CocoaError.fileNoSuchFile { return true }
+            catch { NSLog("Timo: could not clear session marker: %@", error.localizedDescription); return false }
+        }
+    }
+
+    /// Stands in for `Session.restore()` in main.swift. On a clean launch it *is*
+    /// `Session.restore()` — the alert only exists on the crash path, so the normal
+    /// restore is untouched.
+    @discardableResult
+    static func offerRestore() -> Bool {
+        guard crashed else { return Session.restore() }
+        // Settings › General decides; the alert is only for whoever asked to be asked.
+        switch Prefs.afterCrash {
+        case "fresh": return false
+        case "ask": break
+        default: return Session.restore()
+        }
+        let alert = NSAlert()
+        alert.messageText = "Timo quit unexpectedly the last time it was open."
+        alert.informativeText = "Reopen the saved windows and tabs? Pages load when shown, without resubmitting saved forms. Unsaved form input may be lost."
+        alert.addButton(withTitle: "Reopen Tabs")   // default: the user's work is the safe choice here
+        alert.addButton(withTitle: "Start Fresh")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        return Session.restore()
+    }
+
+    // MARK: - check
+
+    /// Runs entirely in a temp directory against a counting stand-in for the session save;
+    /// the real ~/Library/Application Support/Timo is never read or written.
+    static func check() -> [(String, Bool)] {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("timo-crashcheck-\(ProcessInfo.processInfo.processIdentifier)")
+        try? FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        let realWrite = write
+        var saves = 0
+        directory = temp
+        write = { saves += 1; return true }
+        defer {
+            timer?.invalidate()
+            timer = nil
+            directory = nil
+            write = realWrite
+            crashed = false
+            lastSave = .distantPast
+            try? FileManager.default.removeItem(at: temp)
+        }
+        func markerExists() -> Bool { FileManager.default.fileExists(atPath: marker.path) }
+
+        var out: [(String, Bool)] = []
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+
+        // First launch ever: no marker, so nothing crashed.
+        out.append(("a first launch with no marker is not a crash", { begin(now: t0); return !didCrashLastLaunch }()))
+        out.append(("launching writes the dirty marker", markerExists()))
+
+        // Clean quit.
+        markClean()
+        out.append(("a clean shutdown clears the marker", !markerExists()))
+        out.append(("a clean shutdown saves the session one last time", saves == 1))
+
+        // Launch after that clean quit.
+        begin(now: t0)
+        out.append(("the launch after a clean shutdown is not a crash", !didCrashLastLaunch))
+
+        // Crash: the marker is simply never cleared, and the next begin() sees it.
+        out.append(("the marker survives a run that never cleans up", markerExists()))
+        begin(now: t0)
+        out.append(("a launch that finds the marker reports a crash", didCrashLastLaunch))
+        out.append(("the crashed launch re-arms the marker for itself", markerExists()))
+
+        // ...and the launch after *that* one, if it quits cleanly, is clean again. This is
+        // the sequence that a sticky flag would get wrong.
+        markClean()
+        begin(now: t0)
+        out.append(("a clean launch after a crashed one is not itself a crash", !didCrashLastLaunch))
+        markClean()
+
+        // Throttling. begin() stamps lastSave, so the clock starts at the launch.
+        saves = 0
+        begin(now: t0)
+        out.append(("launching does not immediately autosave", saves == 0))
+        out.append(("an autosave one second in is throttled away",
+                    autosave(now: t0.addingTimeInterval(1)) == false && saves == 0))
+        out.append(("an autosave just short of the interval is still throttled",
+                    autosave(now: t0.addingTimeInterval(interval - 0.5)) == false && saves == 0))
+        out.append(("an autosave at the interval writes",
+                    autosave(now: t0.addingTimeInterval(interval)) == true && saves == 1))
+        out.append(("a second autosave right after the first is throttled",
+                    autosave(now: t0.addingTimeInterval(interval + 1)) == false && saves == 1))
+        out.append(("the throttle window restarts from the last write, not from launch",
+                    autosave(now: t0.addingTimeInterval(interval * 2)) == true && saves == 2))
+        // Fifty navigations in a second must cost nothing.
+        let before = saves
+        for i in 0..<50 { autosave(now: t0.addingTimeInterval(interval * 2 + Double(i) / 50)) }
+        out.append(("fifty calls inside one interval cost one write at most", saves == before))
+        markClean()
+        out.append(("markClean flushes past the throttle", saves == before + 1))
+        begin(now: t0)
+        write = { false }
+        markClean()
+        out.append(("a failed final save preserves the crash marker", markerExists()))
+        begin(now: t0)
+        out.append(("the next launch sees an incomplete final snapshot", didCrashLastLaunch))
+        out.append(("a failed autosave reports failure", !autosave(now: t0.addingTimeInterval(interval))))
+        write = { true }
+        out.append(("a failed autosave does not consume the retry interval",
+                    autosave(now: t0.addingTimeInterval(interval))))
+        markClean()
+        out.append(("a successful retry can mark the session clean", !markerExists()))
+
+        let session = temp.appendingPathComponent("session.json")
+        let original = Data("saved launch original".utf8)
+        try? original.write(to: session)
+        let privateName = "session-00000000-0000-0000-0000-000000000001.json"
+        try? Data("private sentinel".utf8).write(to: temp.appendingPathComponent(privateName))
+        _ = begin(now: t0)
+        let preserved = begin(now: t0) && begin(now: t0)
+        let recovery = temp.appendingPathComponent("Session Recovery")
+        let launches = (try? FileManager.default.contentsOfDirectory(at: recovery, includingPropertiesForKeys: nil)) ?? []
+        out.append(("repeated unclean launches preserve independent originals", preserved && launches.count == 2
+                    && launches.allSatisfy { (try? Data(contentsOf: $0.appendingPathComponent("session.json"))) == original }))
+        out.append(("crash originals exclude private session files", launches.allSatisfy {
+            !FileManager.default.fileExists(atPath: $0.appendingPathComponent(privateName).path)
+        }))
+        try? FileManager.default.removeItem(at: recovery)
+        try? Data().write(to: recovery) // An unavailable archive destination.
+        out.append(("startup stops when originals cannot be preserved", !begin(now: t0)
+                    && (try? Data(contentsOf: session)) == original && markerExists()))
+        directory = temp.appendingPathComponent("missing")
+        out.append(("startup stops when the dirty marker cannot be written", !begin(now: t0)))
+        directory = temp
+        return out
+    }
+}

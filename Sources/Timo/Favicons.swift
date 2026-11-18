@@ -1,0 +1,1002 @@
+import AppKit
+import Combine
+import CryptoKit
+import ImageIO
+import WebKit
+
+final class FaviconRequestPolicy: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(Favicons.redirect(from: response.url, to: request))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
+            completionHandler(.performDefaultHandling, nil)
+        } else { completionHandler(.cancelAuthenticationChallenge, nil) }
+    }
+}
+
+/// Owned by mounted leaves, weakly indexed by one profile cache. No artwork or
+/// view is retained here; a host arrival invalidates only its matching consumers.
+@MainActor final class FaviconHostArrival: @MainActor ObservableObject {
+    let objectWillChange = ObservableObjectPublisher()
+}
+
+/// A bounded per-profile LRU. Every stored image is decoded to at most 64×64 pixels,
+/// so 300 hosts retain at most about 5 MiB of bitmap storage rather than site-sized art.
+@MainActor struct FaviconMemoryCache {
+    private let capacity: Int
+    private struct Entry {
+        let image: NSImage
+        let artwork: Data?
+    }
+    private var images: [String: Entry] = [:]
+    private var recent: [String] = []
+
+    init(capacity: Int = 300) { self.capacity = max(0, capacity) }
+
+    mutating func image(for key: String) -> NSImage? {
+        guard let image = images[key] else { return nil }
+        recent.removeAll { $0 == key }
+        recent.append(key)
+        return image.image
+    }
+
+    @discardableResult
+    mutating func store(_ image: NSImage, for key: String, artwork: Data? = nil) -> NSImage {
+        guard capacity > 0 else { return image }
+        let entry: Entry
+        if let artwork, let existing = images[key], existing.artwork == artwork {
+            entry = existing
+        } else {
+            entry = Entry(image: image, artwork: artwork)
+        }
+        images[key] = entry
+        recent.removeAll { $0 == key }
+        recent.append(key)
+        while recent.count > capacity { images.removeValue(forKey: recent.removeFirst()) }
+        return entry.image
+    }
+
+    subscript(key: String) -> NSImage? {
+        mutating get { image(for: key) }
+        set {
+            if let newValue { store(newValue, for: key) }
+            else { images[key] = nil; recent.removeAll { $0 == key } }
+        }
+    }
+}
+
+/// Favicons, fetched from the site itself and cached by host.
+///
+/// ponytail: no favicon proxy service. Those are one HTTP request per site you visit sent
+/// to a third party — that is a browsing-history feed, and it is not worth a rounder icon.
+/// Ceiling: no ETag/Cache-Control handling, so an icon only changes when the LRU sweep
+/// evicts it; the upgrade path is writing the response headers next to the bytes.
+@MainActor final class Favicons: ObservableObject {
+    /// The active profile's cache. An icon on disk is a record that a host was visited, so
+    /// it is profile data like any other; the default profile still uses the `favicons/`
+    /// folder it always used.
+    static var shared: Favicons { cache(for: ProfileManager.shared.active.id) }
+
+    private static var caches: [UUID: Favicons] = [:]
+    private static var retirements: [UUID: Task<Void, Never>] = [:]
+    private static var retiredProfiles: Set<UUID> = []
+
+    static func cache(for profileID: UUID) -> Favicons {
+        if let hit = caches[profileID] { return hit }
+        let fresh = Favicons(profileID: profileID)
+        if retiredProfiles.contains(profileID) || retirements[profileID] != nil {
+            fresh.retire()
+            return fresh
+        }
+        caches[profileID] = fresh
+        return fresh
+    }
+
+    @discardableResult
+    static func forget(_ profileID: UUID, retiring: Bool = false) -> Task<Void, Never> {
+        if retiring { retiredProfiles.insert(profileID) }
+        if let running = retirements[profileID] { return running }
+        let directory = ProfileManager.faviconDir(for: profileID, in: Store.directory)
+        guard let cache = caches.removeValue(forKey: profileID) else {
+            try? FileManager.default.removeItem(at: directory)
+            return Task {}
+        }
+        let drained = cache.retire()
+        let task = Task {
+            await drained.value
+            // Each admitted writer is awaited by its owning task. Only after all of
+            // them finish may deletion unlink the directory they could recreate.
+            await Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: directory)
+            }.value
+            retirements[profileID] = nil
+        }
+        retirements[profileID] = task
+        return task
+    }
+
+    let profileID: UUID
+    let session: URLSession
+
+    private let fetchImageData: @Sendable (URL) async -> Data?
+
+    init(profileID: UUID = ProfileManager.defaultID,
+         fetch: (@Sendable (URL) async -> Data?)? = nil) {
+        self.profileID = profileID
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.urlCache = nil
+        configuration.urlCredentialStorage = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: configuration)
+        self.session = session
+        self.fetchImageData = fetch ?? { await Favicons.fetch($0, session: session) }
+    }
+
+    deinit { session.invalidateAndCancel() }
+
+    private var retired = false
+    private var retirement: Task<Void, Never>?
+    private var loads: [UUID: Task<Void, Never>] = [:]
+
+    /// Revoke publication synchronously, then drain even cancellation-insensitive
+    /// decode/disk workers through the tasks that await them.
+    @discardableResult
+    func retire() -> Task<Void, Never> {
+        if let retirement { return retirement }
+        retired = true
+        let work = Array(inflight.values) + Array(diskInflight.values) + Array(loads.values)
+        pending.removeAll()
+        work.forEach { $0.cancel() }
+        memory = FaviconMemoryCache()
+        discoveries.removeAll()
+        misses.removeAll()
+        tabs.removeAllObjects()
+        hostObservers.removeAllObjects()
+        let session = session
+        let task = Task {
+            for task in work { await task.value }
+            // A cancelled fetch may still be entering URLSession. Invalidating only
+            // after it drains avoids Foundation's exception for new tasks on a dead session.
+            session.invalidateAndCancel()
+        }
+        retirement = task
+        return task
+    }
+
+    /// Bumped when a fetch lands, so views that asked for a nil icon redraw.
+    @Published private(set) var generation = 0
+
+    private let hostObservers = NSMapTable<NSString, FaviconHostArrival>.strongToWeakObjects()
+
+    func observation(for key: String) -> FaviconHostArrival {
+        let key = key as NSString
+        if let observer = hostObservers.object(forKey: key) { return observer }
+        // Weak values do not promise immediate removal of their strong keys.
+        // Prune before insertion so visits cannot accumulate dead host entries.
+        for case let stale as NSString in hostObservers.keyEnumerator().allObjects {
+            if hostObservers.object(forKey: stale) == nil { hostObservers.removeObject(forKey: stale) }
+        }
+        let observer = FaviconHostArrival()
+        hostObservers.setObject(observer, forKey: key)
+        return observer
+    }
+
+    private func publishArrival(for key: String) {
+        hostObservers.object(forKey: key as NSString)?.objectWillChange.send()
+        generation += 1
+    }
+
+    private var memory = FaviconMemoryCache()
+    private var inflight: [String: Task<Void, Never>] = [:]
+    private var diskInflight: [String: Task<Void, Never>] = [:]
+    /// Inspect loaded pages even after a root fallback has been cached. The same set of
+    /// declarations needs one fetch per session, not another fetch on every reload.
+    private var discoveries: [String: [URL]] = [:]
+    private struct Pending {
+        var urls: [URL] = []
+        var seen: Set<URL> = []
+        var persistentURLs: Set<URL> = []
+        var fallbackURLs: Set<URL> = []
+        var revision = 0
+        var requestedRevision: [URL: Int] = [:]
+
+        mutating func append(_ candidates: [URL], persist: Bool, fallback: URL?) {
+            revision += 1
+            for url in candidates {
+                requestedRevision[url] = revision
+                if seen.insert(url).inserted { urls.append(url) }
+            }
+            if persist { persistentURLs.formUnion(candidates) }
+            if let fallback { fallbackURLs.insert(fallback) }
+        }
+
+        mutating func discardAlternatives(through revision: Int) {
+            let obsolete = Set(urls.filter { requestedRevision[$0, default: 0] <= revision })
+            urls.removeAll { obsolete.contains($0) }
+            seen.subtract(obsolete)
+            for url in obsolete { requestedRevision[url] = nil }
+        }
+    }
+    private var pending: [String: Pending] = [:]
+    /// Parked tabs have no didFinish callback to pick up an icon discovered later by
+    /// another tab. Weak references let every row for that host receive the result.
+    private let tabs = NSHashTable<Tab>.weakObjects()
+    /// Hosts that had nothing to give, and when they said so. A 404 isn't re-requested on
+    /// every page load — but a timeout during a busy restore is not a verdict for the whole
+    /// session either, and it left a real icon showing as a letter until relaunch. After
+    /// `missFor` the host is asked again.
+    private var misses: [String: Date] = [:]
+    private static let missFor: TimeInterval = 600
+    private func missed(_ key: String, at date: Date = .now) -> Bool {
+        misses[key].map { date.timeIntervalSince($0) < Self.missFor } ?? false
+    }
+
+    private func recordMiss(_ key: String, attemptedFallback: Bool, at date: Date = .now) {
+        guard attemptedFallback else { return }
+        misses[key] = date
+        if misses.count > Self.maxFiles,
+           let oldest = misses.min(by: { $0.value < $1.value })?.key { misses[oldest] = nil }
+    }
+
+    nonisolated static let maxBytes = 512_000     // an icon that big is a mistake, not an icon
+    nonisolated private static let maxFiles = 300
+    nonisolated static let maxPixelDimension = 64
+
+    // MARK: Public
+
+    /// Cached icon if there is one, otherwise nil and a fetch starts; `generation` bumps
+    /// when it lands.
+    func icon(for url: URL) -> NSImage? {
+        guard !retired, let key = Favicons.key(for: url) else { return nil }
+        if let img = memory[key] { return img }
+        guard !missed(key), diskInflight[key] == nil, inflight[key] == nil,
+              let fallback = Favicons.fallback(for: url) else { return nil }
+        if profileID == Profile.incognito.id {
+            warm(key: key, urls: [fallback], persist: false, fallback: fallback)
+        } else {
+            readDisk(key, fallback: fallback)
+        }
+        return nil
+    }
+
+    /// Call on didFinish or restoration. Loaded pages supply their declarations; parked
+    /// tabs use the cache and root fallback without starting a WebContent process.
+    func load(for tab: Tab) {
+        guard !retired else { return }
+        tabs.add(tab)
+        if let url = tab.currentURL, url.isFileURL { tab.favicon = Files.icon(for: url); return }
+        guard let url = tab.currentURL, let key = Favicons.key(for: url) else { tab.favicon = nil; return }
+        if let img = memory[key] {
+            if tab.favicon !== img { tab.favicon = img }
+            if tab.suspended { return }
+        }
+        // Keep disk reads and decoding off the main actor, including during restoration.
+        let file = profileID == Profile.incognito.id ? nil : dir.appendingPathComponent(key)
+        let web = tab.existingWeb
+        let id = UUID()
+        loads[id] = Task { @MainActor [weak self, weak tab, weak web] in
+            defer { self?.loads[id] = nil }
+            guard !Task.isCancelled else { return }
+            let diskImage = if self?.memory[key] == nil, let file {
+                await Favicons.decoded(file)
+            } else { Icon(image: nil) }
+            // Neither the page's script reply nor an icon download belongs to the tab's
+            // lifetime. Keep it weak across both awaits so Close can release it at once.
+            guard let self, !self.retired, !Task.isCancelled,
+                  tab?.existingWeb === web, tab?.currentURL == url else { return }
+            if let img = self.memory[key] {
+                if tab?.favicon !== img { tab?.favicon = img }
+            } else if let image = diskImage.image {
+                let stored = self.memory.store(image, for: key, artwork: diskImage.artwork)
+                if tab?.favicon !== stored { tab?.favicon = stored }
+                // Cache-only leaves may be waiting on the same host. Publish even
+                // when restoration's worker beats their own pending disk read.
+                self.publishArrival(for: key)
+            }
+            if tab?.suspended == true {
+                if tab?.favicon !== self.memory[key] { tab?.favicon = self.memory[key] }
+                if self.memory[key] == nil, !self.missed(key), let fallback = Favicons.fallback(for: url) {
+                    self.warm(key: key, urls: [fallback], persist: tab?.isPrivate == false, fallback: fallback)
+                }
+                return
+            }
+            guard let web else { return }
+            // A failed root probe says nothing about the icons declared by this page.
+            let declared = Favicons.declared(try? await web.evaluateJavaScript(Favicons.linkJS))
+            guard !self.retired, !Task.isCancelled,
+                  tab?.existingWeb === web, tab?.currentURL == url else { return }
+            if !declared.isEmpty, self.discoveries[key] == declared, self.memory[key] != nil { return }
+            if !declared.isEmpty {
+                self.discoveries[key] = declared
+                if self.discoveries.count > Self.maxFiles,
+                   let other = self.discoveries.keys.first(where: { $0 != key }) {
+                    self.discoveries[other] = nil
+                }
+            }
+            var candidates = declared
+            let fallback = self.memory[key] != nil || self.missed(key) ? nil : Favicons.fallback(for: url)
+            if let fallback { candidates.append(fallback) }
+            guard !candidates.isEmpty else {
+                if tab?.favicon !== self.memory[key] { tab?.favicon = self.memory[key] }
+                return
+            }
+            let persist = tab?.isPrivate == false
+            await self.warm(key: key, urls: candidates, persist: persist, fallback: fallback).value
+            guard !self.retired, !Task.isCancelled,
+                  tab?.existingWeb === web, tab?.currentURL == url else { return }
+            if tab?.favicon !== self.memory[key] { tab?.favicon = self.memory[key] }
+        }
+    }
+
+    // MARK: Fetch
+
+    /// One fetch per host at a time; a second tab on the same host awaits the same task.
+    @discardableResult
+    private func warm(key: String, urls: [URL], persist: Bool, fallback: URL?) -> Task<Void, Never> {
+        guard !retired else { return Task {} }
+        var request = pending[key] ?? Pending()
+        request.append(urls, persist: persist, fallback: fallback)
+        pending[key] = request
+        if let running = inflight[key] { return running }
+        let task = Task { @MainActor [weak self] in
+            guard let self, !self.retired, !Task.isCancelled else { return }
+            var received: URL?
+            defer {
+                self.inflight[key] = nil
+                self.pending[key] = nil
+                // Failed declarations remain retryable. Only a result that actually
+                // came from this declaration set makes it reusable across reloads.
+                if received.map({ self.discoveries[key]?.contains($0) == true }) != true {
+                    self.discoveries[key] = nil
+                }
+            }
+            var attemptedFallback = false
+            // A page may finish while a cache-only /favicon.ico probe is awaiting its
+            // response. Keep its declarations in the same queue instead of losing them.
+            while let url = self.pending[key]?.urls.first {
+                let acceptedRevision = self.pending[key]?.revision ?? 0
+                self.pending[key]?.urls.removeFirst()
+                let data = await self.fetchImageData(url)
+                guard !self.retired, !Task.isCancelled else { return }
+                if self.pending[key]?.fallbackURLs.contains(url) == true { attemptedFallback = true }
+                guard let data else { continue }
+                let decoded = await Favicons.decoded(data)
+                guard !self.retired, !Task.isCancelled else { return }
+                guard let image = decoded.image else { continue }
+                let previous = self.memory[key]
+                let img = self.memory.store(image, for: key, artwork: decoded.artwork)
+                received = url
+                self.misses.removeValue(forKey: key)
+                // Eligibility belongs to the successful URL, before publication can
+                // synchronously notify observers that enqueue another request.
+                let shouldPersist = self.pending[key]?.persistentURLs.contains(url) == true
+                let isFallback = self.pending[key]?.fallbackURLs.contains(url) == true
+                if !isFallback {
+                    // Success supersedes its old lower-priority alternatives,
+                    // while another page's newer declaration remains queued.
+                    self.pending[key]?.discardAlternatives(through: acceptedRevision)
+                }
+                for tab in self.tabs.allObjects where tab.currentURL.flatMap(Favicons.key) == key {
+                    if tab.favicon !== img { tab.favicon = img }
+                }
+                if previous !== img { self.publishArrival(for: key) }
+                // Show decoded artwork before utility-priority persistence and pruning.
+                // A public fallback does not authorize storing another tab's private-only
+                // declaration. Eligibility follows the successful URL, not the batch.
+                if shouldPersist { await self.writeDisk(key, data) }
+                guard !self.retired, !Task.isCancelled else { return }
+                // A restored row may already be fetching /favicon.ico when its page
+                // supplies better artwork. Let that queued declaration upgrade it.
+                if !isFallback, self.pending[key]?.urls.isEmpty != false { return }
+            }
+            if self.memory[key] == nil { self.recordMiss(key, attemptedFallback: attemptedFallback) }
+        }
+        inflight[key] = task
+        return task
+    }
+
+    nonisolated static func fetch(_ url: URL, session: URLSession) async -> Data? {
+        guard !Task.isCancelled, var req = cleanRequest(URLRequest(url: url)) else { return nil }
+        req.timeoutInterval = 8
+        // An icon is small and already compressed, so asking for it uncompressed costs
+        // nothing — and it sidesteps a class of misconfigured server that answers a
+        // gzip-accepting request for /favicon.ico with its cached, gzipped index page.
+        // Seen on a school portal: the same url gave curl the icon and URLSession the html,
+        // and the html decoded to no image, so the host was filed as a miss.
+        req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        req.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        do {
+            let (bytes, response) = try await session.bytes(for: req, delegate: FaviconRequestPolicy())
+            // Stop the underlying transfer on every early return, including unknown-length
+            // and chunked responses. The old data(for:) buffered everything before checking.
+            defer { bytes.task.cancel() }
+            guard (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
+                  response.expectedContentLength <= Int64(maxBytes) else { return nil }
+            var data = Data()
+            if response.expectedContentLength > 0 {
+                data.reserveCapacity(Int(response.expectedContentLength))
+            }
+            for try await byte in bytes {
+                guard data.count < maxBytes, !Task.isCancelled else { return nil }
+                data.append(byte)
+            }
+            return data.isEmpty ? nil : data
+        } catch { return nil }
+    }
+
+    /// A favicon never follows an HTTPS response down to plain HTTP.
+    nonisolated static func redirect(from source: URL?, to request: URLRequest) -> URLRequest? {
+        if source?.scheme?.lowercased() == "https", request.url?.scheme?.lowercased() != "https" { return nil }
+        return cleanRequest(request)
+    }
+
+    nonisolated static func cleanRequest(_ request: URLRequest) -> URLRequest? {
+        guard let scheme = request.url?.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
+        var clean = request
+        clean.httpShouldHandleCookies = false
+        clean.cachePolicy = .reloadIgnoringLocalCacheData
+        for header in ["Cookie", "Authorization", "Proxy-Authorization"] {
+            clean.setValue(nil, forHTTPHeaderField: header)
+        }
+        return clean
+    }
+
+    /// The page's own declarations, including touch icons preloaded as images (ManageBac).
+    /// Rel and sizes are retained: the URL's filename is not its declaration type.
+    static let linkJS = """
+    (function(){var o=[];document.querySelectorAll(\
+    "link[rel~='icon' i],link[rel~='apple-touch-icon' i],link[rel~='apple-touch-icon-precomposed' i],link[rel~='preload' i][as='image' i]")\
+    .forEach(function(l){if(o.length>=32||!l.href)return;\
+    if(l.rel.toLowerCase().split(/\\s+/).includes('preload')&&!/apple-touch-icon/i.test(l.href))return;\
+    o.push({href:l.href,rel:l.rel,sizes:l.getAttribute('sizes')||'',type:l.type||''})});return o})()
+    """
+
+    struct Declaration {
+        let url: URL
+        var rel = "icon"
+        var sizes = ""
+        var type = ""
+
+        var priority: Int {
+            // JPEG touch artwork often includes a white matte (Cialfo's crest). Prefer
+            // its transparent favicon; PNG touch artwork is usually the sharpest mark.
+            if type.lowercased() == "image/jpeg" || ["jpg", "jpeg"].contains(url.pathExtension.lowercased()) {
+                return 0
+            }
+            let touch = rel.lowercased().split(whereSeparator: \.isWhitespace).contains {
+                $0 == "apple-touch-icon" || $0 == "apple-touch-icon-precomposed"
+            } || (rel.lowercased() == "preload" && url.path.lowercased().contains("apple-touch-icon"))
+            return touch ? 2 : 1
+        }
+
+        var pixels: Int {
+            let source = sizes.isEmpty ? url.lastPathComponent.lowercased() : sizes.lowercased()
+            let pattern = "[0-9]+x[0-9]+"
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return 0 }
+            return regex.matches(in: source, range: NSRange(source.startIndex..., in: source)).compactMap { match in
+                guard let range = Range(match.range, in: source) else { return nil }
+                let dimensions = source[range].split(separator: "x").compactMap { Int($0) }
+                return dimensions.count == 2 ? dimensions.min() : nil
+            }.max() ?? 0
+        }
+    }
+
+    static func declared(_ value: Any?) -> [URL] {
+        guard let entries = value as? NSArray else { return [] }
+        let declarations = entries.prefix(32).compactMap { raw -> Declaration? in
+            guard let native = raw as? NSDictionary, native.count <= 4 else { return nil }
+            var entry: [String: String] = [:]
+            for key in ["href", "rel", "sizes", "type"] {
+                guard let value = native[key] else { continue }
+                guard let text = value as? NSString, text.length <= 8192 else { return nil }
+                entry[key] = String(text)
+            }
+            guard let href = entry["href"], href.utf8.count <= 8192, let url = URL(string: href),
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+            return Declaration(url: url, rel: entry["rel"] ?? "icon", sizes: entry["sizes"] ?? "", type: entry["type"] ?? "")
+        }
+        return ordered(declarations)
+    }
+
+    static func ordered(_ declarations: [Declaration]) -> [URL] {
+        var seen = Set<URL>()
+        return declarations.enumerated().sorted {
+            if $0.element.priority != $1.element.priority { return $0.element.priority > $1.element.priority }
+            if $0.element.pixels != $1.element.pixels { return $0.element.pixels > $1.element.pixels }
+            return $0.offset < $1.offset
+        }.map(\.element.url).filter { seen.insert($0).inserted }
+    }
+
+    /// Always the site's own host — never a third party's icon service.
+    static func fallback(for url: URL) -> URL? {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              url.host != nil,
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        components.user = nil
+        components.password = nil
+        components.path = "/favicon.ico"
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
+    /// Cache key: the host, with a leading "www." folded onto the apex, and anything that
+    /// isn't safe in a file name replaced. Doubles as the on-disk file name.
+    static func key(for url: URL) -> String? {
+        guard url.scheme?.hasPrefix("http") == true,
+              let host = url.host?.lowercased(), !host.isEmpty else { return nil }
+        let bare = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        return String(bare.map { c in
+            (c.isASCII && (c.isLetter || c.isNumber)) || c == "." || c == "-" ? c : "_"
+        })
+    }
+
+    /// The letter a site is known by, for the box a favicon has not filled yet — a brand-new
+    /// tab, a site that declares no icon, a page still being fetched from a host we have
+    /// never been to. Arc puts the site's initial there; it never puts a spinner there, which
+    /// is the whole point: a row is a place, and a place does not flicker while it loads.
+    ///
+    /// The name is the label under the public suffix, so `mail.google.com` is a G and not an
+    /// M, and `www.bbc.co.uk` is a B and not a C. That is `TidyTabs.registrableDomain`'s
+    /// question and it is asked there rather than answered twice: a tab with no icon and a
+    /// group of tabs with one then agree about what the site is called, and the handful of
+    /// two-part suffixes it knows (co.uk, com.au, co.jp …) is one list to fix, not two.
+    ///
+    /// Two hosts have no name to take a letter from:
+    ///
+    /// - An address literal. Every label is a number, and "the label under the suffix" would
+    ///   make `127.0.0.1` a 0; its first digit is at least stable.
+    /// - A punycode host. `xn--fiqs8s` is an encoding, not a word, and every one of them
+    ///   would be an X — the one letter that would be wrong for all of them at once. There
+    ///   is no public API to turn it back into the label a reader would recognise, so this
+    ///   gives up and the globe stands in. Upgrade path: an IDN decode, and the letter falls
+    ///   out of it.
+    nonisolated static func letter(for url: URL?) -> String? {
+        guard let host = url?.host()?.lowercased(), !host.isEmpty else { return nil }
+        let labels = host.split(separator: ".")
+        let name = labels.allSatisfy({ $0.allSatisfy(\.isNumber) })
+            ? labels.first.map(String.init)
+            : TidyTabs.registrableDomain(host).split(separator: ".").first.map(String.init)
+        guard let name, !name.hasPrefix("xn--"),
+              let c = name.first(where: { $0.isLetter || $0.isNumber }) else { return nil }
+        return String(c).uppercased()
+    }
+
+    // MARK: Disk
+
+    /// A dark mark on transparency (such as GitHub's favicon) is an alpha mask, so let
+    /// AppKit/SwiftUI draw it with the surrounding ink in both light and dark chrome.
+    /// Colored artwork, light details, and opaque tiles keep their original pixels.
+    /// Applied on decode so old disk entries benefit without changing the cached bytes.
+    nonisolated static func image(from data: Data) -> NSImage? {
+        guard !data.isEmpty, data.count <= maxBytes else { return nil }
+        guard let bitmap = thumbnail(from: data) ?? vectorBitmap(from: data),
+              bitmap.width > 0, bitmap.height > 0,
+              bitmap.width <= maxPixelDimension, bitmap.height <= maxPixelDimension else { return nil }
+        return displayImage(bitmap)
+    }
+
+    private nonisolated static func thumbnail(from data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData,
+            [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+        guard let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelDimension,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary), bitmap.width > 0, bitmap.height > 0,
+              bitmap.width <= maxPixelDimension, bitmap.height <= maxPixelDimension else { return nil }
+        return bitmap
+    }
+
+    private nonisolated static func displayImage(_ bitmap: CGImage) -> NSImage {
+        let image = NSImage(cgImage: bitmap, size: NSSize(width: 16, height: 16))
+        image.isTemplate = isDarkMark(image)
+        // Pin the point size regardless of the site's bitmap resolution.
+        image.size = NSSize(width: 16, height: 16)
+        return image
+    }
+
+    /// ImageIO does not decode SVG. AppKit's SVG representation is a vector; draw it
+    /// into our own small bitmap rather than asking it to create an intrinsic-size image.
+    /// Production callers use a worker for this path, including pre-existing disk entries.
+    private nonisolated static func vectorBitmap(from data: Data) -> CGImage? {
+        guard let vector = NSImage(data: data),
+              vector.size.width.isFinite, vector.size.height.isFinite,
+              vector.size.width > 0, vector.size.height > 0,
+              vector.size.width <= 16_384, vector.size.height <= 16_384,
+              !vector.representations.isEmpty,
+              vector.representations.allSatisfy({ $0.pixelsWide == 0 && $0.pixelsHigh == 0 }),
+              let context = CGContext(data: nil, width: maxPixelDimension, height: maxPixelDimension,
+                bitsPerComponent: 8, bytesPerRow: maxPixelDimension * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        vector.draw(in: NSRect(x: 0, y: 0, width: maxPixelDimension, height: maxPixelDimension),
+                    from: .zero, operation: .copy, fraction: 1)
+        return context.makeImage()
+    }
+
+    private nonisolated static func isDarkMark(_ image: NSImage) -> Bool {
+        guard let source = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let context = CGContext(data: nil, width: 32, height: 32, bitsPerComponent: 8,
+                bytesPerRow: 32 * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+        context.draw(source, in: CGRect(x: 0, y: 0, width: 32, height: 32))
+        guard let bytes = context.data?.assumingMemoryBound(to: UInt8.self) else { return false }
+        var visible = 0
+        var transparent = 0
+        var solid = 0
+        var lowerInk = 0.0
+        var upperInk = 1.0
+        for pixel in 0..<(32 * 32) {
+            let offset = pixel * 4
+            let alpha = Double(bytes[offset + 3])
+            if alpha < 16 { transparent += 1; continue }
+            visible += 1
+            let red = Double(bytes[offset])
+            let green = Double(bytes[offset + 1])
+            let blue = Double(bytes[offset + 2])
+            let high = max(red, green, blue)
+            let low = min(red, green, blue)
+            // Components are premultiplied: compare against alpha, not 255, so a
+            // translucent colored logo is never mistaken for a dark gray mark.
+            guard high <= alpha * 0.35, high - low <= alpha * 0.025 + 1 else { return false }
+            // Require one flat ink, not merely a collection of dark gray tones.
+            // Allow one byte of rounding at antialiased edges after unpremultiplying.
+            let ink = (red + green + blue) / (3 * alpha)
+            lowerInk = max(lowerInk, ink - 1 / alpha)
+            upperInk = min(upperInk, ink + 1 / alpha)
+            guard lowerInk - upperInk <= 0.025 else { return false }
+            if alpha >= 127 { solid += 1 }
+        }
+        return visible >= 32 && transparent >= 32 && solid >= 32
+    }
+
+    /// Resolve once per profile, never recreate directories from a row's body.
+    private lazy var dir = ProfileManager.faviconDir(for: profileID, in: Store.directory)
+
+    private func readDisk(_ key: String, fallback: URL) {
+        let file = dir.appendingPathComponent(key)
+        diskInflight[key] = Task { @MainActor [weak self] in
+            guard !Task.isCancelled else { return }
+            // PNG/ICO reads and decode are just as capable of blocking a frame as
+            // SVG rasterization. One pending read per host also coalesces row redraws.
+            let decoded = await Self.decoded(file)
+            guard let self else { return }
+            defer { self.diskInflight[key] = nil }
+            guard !self.retired, !Task.isCancelled, self.memory[key] == nil else { return }
+            if let image = decoded.image {
+                let image = self.memory.store(image, for: key, artwork: decoded.artwork)
+                for tab in self.tabs.allObjects where tab.currentURL.flatMap(Favicons.key) == key {
+                    if tab.favicon !== image { tab.favicon = image }
+                }
+                self.publishArrival(for: key)
+            } else if !self.missed(key) {
+                self.warm(key: key, urls: [fallback], persist: true, fallback: fallback)
+            }
+        }
+    }
+
+    /// Freshly made here and handed over untouched, which is the whole of what the box
+    /// asserts: nothing else has a reference to it on either side.
+    private struct Icon: @unchecked Sendable {
+        let image: NSImage?
+        let artwork: Data?
+        nonisolated init(image: NSImage?) {
+            self.image = image
+            artwork = image.flatMap(Favicons.canonicalArtwork)
+        }
+    }
+
+    /// Decode workers compare rendered artwork, so URL/encoding changes do not restart
+    /// every mounted image transition. The bounded bytes share the image's LRU lifetime.
+    private nonisolated static func canonicalArtwork(_ image: NSImage) -> Data? {
+        let side = maxPixelDimension
+        guard let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let context = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8,
+                bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+              let bytes = context.data else { return nil }
+        context.clear(CGRect(x: 0, y: 0, width: side, height: side))
+        context.draw(bitmap, in: CGRect(x: 0, y: 0, width: side, height: side))
+        var artwork = Data(bytes: bytes, count: side * side * 4)
+        artwork.append(image.isTemplate ? 1 : 0)
+        return Data(SHA256.hash(data: artwork))
+    }
+
+    private nonisolated static func readData(_ file: URL) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maxBytes + 1), data.count <= maxBytes else { return nil }
+        return data
+    }
+
+    private nonisolated static func read(_ file: URL) -> Icon {
+        Icon(image: readData(file).flatMap(image(from:)))
+    }
+
+    /// The same read, off the main actor. The caller publishes the result — nothing here
+    /// touches the cache, because the cache belongs to the actor this has just left.
+    private nonisolated static func decoded(_ file: URL) async -> Icon {
+        await Task.detached(priority: .userInitiated) { read(file) }.value
+    }
+
+    private nonisolated static func decoded(_ data: Data) async -> Icon {
+        await Task.detached(priority: .userInitiated) { Icon(image: image(from: data)) }.value
+    }
+
+    private func writeDisk(_ key: String, _ data: Data) async {
+        guard !retired, !Task.isCancelled, profileID != Profile.incognito.id else { return }
+        let directory = dir
+        await Task.detached(priority: .utility) {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? data.write(to: directory.appendingPathComponent(key))
+            Self.prune(in: directory)
+        }.value
+    }
+
+    /// Oldest-first eviction once the directory gets silly. Modification date is the only
+    /// access record kept, which makes this LRU-by-write rather than true LRU.
+    private nonisolated static func prune(in directory: URL) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: directory,
+                                                      includingPropertiesForKeys: [.contentModificationDateKey]),
+              files.count > Favicons.maxFiles else { return }
+        let byAge = files.sorted {
+            let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return a < b
+        }
+        for url in byAge.prefix(files.count - Favicons.maxFiles / 2) { try? fm.removeItem(at: url) }
+    }
+
+    // MARK: Checks
+
+    /// Offline assertions for the pure logic. No network, no disk.
+    static func check() -> [(String, Bool)] {
+        let u = { (s: String) in URL(string: s)! }
+        let d = { (t: Double) in Date(timeIntervalSince1970: t) }
+        let retry = Favicons()
+        retry.recordMiss("retry-fixture", attemptedFallback: true, at: d(100))
+        retry.recordMiss("retry-fixture", attemptedFallback: false, at: d(500))
+        let declarationKeepsDeadline = !retry.missed("retry-fixture", at: d(710))
+        retry.recordMiss("retry-fixture", attemptedFallback: true, at: d(750))
+        let fallbackRestartsDeadline = retry.missed("retry-fixture", at: d(800))
+        return [
+            ("a failed declaration does not extend the fallback retry delay", declarationKeepsDeadline),
+            ("a newly attempted fallback starts its own retry delay", fallbackRestartsDeadline),
+            ("cache key is the host", key(for: u("https://example.com/a?b=c")) == "example.com"),
+            ("www folds onto the apex", key(for: u("https://WWW.Example.com/")) == "example.com"),
+            ("a subdomain keeps its own key", key(for: u("https://a.example.com/")) == "a.example.com"),
+            ("non-http urls have no key", key(for: u("file:///tmp/x.html")) == nil),
+            ("a key can never contain a path separator",
+             key(for: u("https://a.example.com/x/y"))?.contains("/") == false),
+            ("fallback is the site's own /favicon.ico",
+             fallback(for: u("https://www.example.com/deep/page"))?.absoluteString
+                == "https://www.example.com/favicon.ico"),
+            ("fallback never points at a third-party host",
+             fallback(for: u("https://example.com/x"))?.host == "example.com"),
+            ("fallback preserves HTTP and a custom port",
+             fallback(for: u("http://127.0.0.1:8123/page?q=x#part"))?.absoluteString
+                == "http://127.0.0.1:8123/favicon.ico"),
+            ("fallback preserves HTTPS and a custom port",
+             fallback(for: u("https://example.com:8443/page"))?.absoluteString
+                == "https://example.com:8443/favicon.ico"),
+            ("apple-touch-icon is tried before a .ico",
+             ordered([Declaration(url: u("https://e.com/favicon.ico")),
+                      Declaration(url: u("https://e.com/apple-touch-icon.png"), rel: "apple-touch-icon")])
+                .first?.lastPathComponent == "apple-touch-icon.png"),
+            ("declaration order is otherwise preserved",
+             ordered([Declaration(url: u("https://e.com/a.png")), Declaration(url: u("https://e.com/b.png"))])
+                .last?.lastPathComponent == "b.png"),
+
+            // The stand-in a row shows while a tab has no favicon. There is no spinner to
+            // fall back to any more, so this is what a brand-new tab is recognised by.
+            ("a site with no icon yet is known by its initial",
+             letter(for: u("https://example.com/a")) == "E"),
+            ("…the site's own, not the subdomain's",
+             letter(for: u("https://mail.google.com/mail/u/0")) == "G"),
+            ("…and www is not a name", letter(for: u("https://www.example.com/")) == "E"),
+            ("…nor is a mobile prefix", letter(for: u("https://m.example.com/")) == "E"),
+            ("a two-part suffix is a suffix: bbc.co.uk is a B, not a C",
+             letter(for: u("https://www.bbc.co.uk/news")) == "B"
+                && letter(for: u("https://news.bbc.co.uk/")) == "B"),
+            ("…the same list the tab grouping folds hosts with, so the two agree",
+             letter(for: u("https://example.com.au/")) == "E"
+                && letter(for: u("https://shop.example.co.jp/")) == "E"),
+            ("a punycode host is an encoding, not a word: every one of them would be an X",
+             letter(for: u("https://xn--fiqs8s.example/")) == nil),
+            ("…and it is the site's own label that has to be readable, not a subdomain's",
+             letter(for: u("https://www.xn--fiqs8s.com/")) == nil),
+            ("a bare host is its own name", letter(for: u("http://localhost:8000/")) == "L"),
+            ("an address literal is not a name with an initial in the middle of it",
+             letter(for: u("http://127.0.0.1:8000/")) == "1"),
+            ("a digit is a letter here, since a host may start with one",
+             letter(for: u("https://1password.com/")) == "1"),
+            ("the letter is upper case however the host was typed",
+             letter(for: u("https://EXAMPLE.com/")) == "E"),
+            ("a url with no host has no letter, and gets the globe",
+             letter(for: u("about:blank")) == nil && letter(for: nil) == nil),
+            ("neither does a local file — Finder's own icon stands in for those",
+             letter(for: u("file:///tmp/x.html")) == nil),
+
+            // The one ordering invariant: the strip is sorted by section. `others` is the
+            // strip with the moved tab already taken out. F = favourite, P = pinned,
+            // T = today.
+            ("a favourite stays inside the favourites run",
+             TabStore.clampedDestination(others: [.favourite, .favourite, .today, .today],
+                                         moving: .favourite, to: 4) == 2),
+            ("a pinned tab lands between the favourites and today",
+             TabStore.clampedDestination(others: [.favourite, .favourite, .today, .today],
+                                         moving: .pinned, to: 0) == 2),
+            ("a today tab can't jump ahead of what stays",
+             TabStore.clampedDestination(others: [.favourite, .pinned, .today, .today],
+                                         moving: .today, to: 0) == 2),
+            ("an in-range drop is left alone",
+             TabStore.clampedDestination(others: [.favourite, .pinned, .today, .today],
+                                         moving: .today, to: 3) == 3),
+            ("a drop past the end lands after the last tab",
+             TabStore.clampedDestination(others: [.today, .today, .today, .today],
+                                         moving: .today, to: 9) == 4),
+            ("with nothing above it, any position is allowed",
+             TabStore.clampedDestination(others: [.today, .today], moving: .today, to: 0) == 0),
+            ("the first favourite of an all-today strip lands at the head",
+             TabStore.clampedDestination(others: [.today, .today], moving: .favourite, to: 2) == 0),
+            ("a section that does not exist yet still has exactly one legal slot",
+             TabStore.clampedDestination(others: [.favourite, .today], moving: .pinned, to: 0) == 1
+                && TabStore.clampedDestination(others: [.favourite, .today], moving: .pinned, to: 9) == 1),
+            ("an empty strip takes anything at 0",
+             TabStore.clampedDestination(others: [], moving: .pinned, to: 5) == 0),
+
+            // The same invariant, restored after a batch rather than kept one move at a
+            // time. Tidy's undo is the caller: it puts a whole strip's saved order back, and
+            // a tab the user pinned by hand while the tidy was thinking is in that order
+            // carrying a section the saved order never knew about.
+            ("a strip already in section order is left exactly as it is",
+             TabStore.sectionOrder([.favourite, .pinned, .pinned, .today]) == [0, 1, 2, 3]),
+            ("a pinned tab stranded below Today is lifted above it",
+             TabStore.sectionOrder([.today, .pinned, .today]) == [1, 0, 2]),
+            ("every favourite ends up ahead of every pinned tab, and those ahead of Today",
+             TabStore.sectionOrder([.today, .pinned, .favourite]) == [2, 1, 0]),
+            ("nothing moves within a section",
+             TabStore.sectionOrder([.today, .today, .pinned, .today]) == [2, 0, 1, 3]),
+            ("the result is always a permutation, losing and inventing nothing",
+             TabStore.sectionOrder([.today, .pinned, .favourite, .today, .pinned]).sorted()
+                == [0, 1, 2, 3, 4]),
+            ("an empty strip sorts to nothing", TabStore.sectionOrder([]).isEmpty),
+            // The "Unpinned" toast's Undo is the other caller, and its saved order is older
+            // than the tidy's: it was taken one press ago, so a tab the user pinned *while
+            // the toast was up* is in it sitting among Today tabs. Put back unsettled, the
+            // repinned row P1 leads and the newly pinned T2 sits below a Today tab — the
+            // strip invariant broken by an undo. Settled, T2 joins the Pinned run.
+            ("a tab pinned while the Unpinned toast was up joins the Pinned run",
+             TabStore.sectionOrder([.pinned, .today, .pinned]) == [0, 2, 1]),
+
+            // The favourites grid: columns from the count, Arc's way.
+            ("no favourites is one placeholder column", TabStore.favouriteColumns(0) == 1),
+            ("one favourite is one full-width tile", TabStore.favouriteColumns(1) == 1),
+            ("two and three favourites get a column each",
+             TabStore.favouriteColumns(2) == 2 && TabStore.favouriteColumns(3) == 3),
+            ("four favourites are a 2×2", TabStore.favouriteColumns(4) == 2),
+            ("five and six run three across",
+             TabStore.favouriteColumns(5) == 3 && TabStore.favouriteColumns(6) == 3),
+            ("seven or more run four across",
+             TabStore.favouriteColumns(7) == 4 && TabStore.favouriteColumns(12) == 4),
+
+            // Closing: a favourite or a pinned tab parks in place, a today tab goes.
+            ("closing a favourite keeps its tile",
+             TabStore.closing(0, kinds: [.favourite, .today], lastActive: [d(0), d(1)]).keep),
+            ("closing a pinned tab keeps its row",
+             TabStore.closing(0, kinds: [.pinned, .today], lastActive: [d(0), d(1)]).keep),
+            ("closing a today tab removes it",
+             !TabStore.closing(1, kinds: [.favourite, .today], lastActive: [d(0), d(1)]).keep),
+            ("a closed favourite hands over to the most recently used today tab",
+             TabStore.closing(0, kinds: [.favourite, .pinned, .today, .today],
+                              lastActive: [d(9), d(9), d(2), d(1)]).next == 2),
+            ("a closed favourite with no today tabs leaves the column bare",
+             TabStore.closing(1, kinds: [.favourite, .pinned], lastActive: [d(0), d(1)]).next == nil),
+            ("closing a today tab shows its neighbour",
+             TabStore.closing(1, kinds: [.favourite, .today, .today], lastActive: [d(0), d(0), d(0)]).next == 1),
+            ("closing the last today tab never wakes a favourite or a pin",
+             TabStore.closing(2, kinds: [.favourite, .pinned, .today], lastActive: [d(0), d(0), d(0)]).next == nil),
+            ("closing the only tab leaves nothing to show",
+             TabStore.closing(0, kinds: [.today], lastActive: [d(0)]) == (false, nil)),
+
+            // What stays is written down as the page it stands for, wherever it has since
+            // been taken. See `Tab.homeURL`: a pinned row or a favourite remembers the url
+            // it was pinned at, and that is the one that goes to disk.
+            ("a favourite is saved as the page it is on",
+             TabStore.pinURL(u("https://elsewhere.example/x")) == "https://elsewhere.example/x"),
+            ("one on no page is not written down", TabStore.pinURL(nil) == nil),
+            ("a non-http page is not written down", TabStore.pinURL(u("file:///x.html")) == nil),
+
+            // Home: the url a favourite or a pinned row stands for.
+            ("pinning a tab records the page it was pinned at",
+             TabStore.home(entering: .pinned, at: u("https://google.example/")) == u("https://google.example/")),
+            ("favouriting one records it the same way",
+             TabStore.home(entering: .favourite, at: u("https://google.example/")) == u("https://google.example/")),
+            ("a row that leaves for Today stands for nothing and forgets it",
+             TabStore.home(entering: .today, at: u("https://google.example/")) == nil),
+            ("a tab pinned while it is still blank has no home to be sent back to",
+             TabStore.home(entering: .pinned, at: nil) == nil),
+
+            // …and that home, not the wander, is what both writers put on disk. `savePins`
+            // and `saveCurrentSpace` write the same two lists and the Space fingerprint is
+            // taken off what they leave there, so they read this one expression.
+            ("a pinned row browsed elsewhere is still written down as its own page",
+             TabStore.pinned(home: u("https://google.example/"), at: u("https://wandered.example/x"))
+                == u("https://google.example/")),
+            ("…which is what the Space fingerprint is taken off, so a wander is no edit",
+             TabStore.fingerprint(
+                tabURLs: [], pinnedTabURLs: [TabStore.pinned(home: u("https://google.example/"),
+                                                             at: u("https://wandered.example/x"))!],
+                shapes: [nil, nil])
+                == TabStore.fingerprint(tabURLs: [], pinnedTabURLs: [u("https://google.example/")],
+                                        shapes: [nil, nil])),
+            ("a row with no home is written down as the page it is on, exactly as before",
+             TabStore.pinned(home: nil, at: u("https://wandered.example/x")) == u("https://wandered.example/x")),
+            ("a Today tab has no home, so its url is untouched by any of this",
+             TabStore.pinned(home: TabStore.home(entering: .today, at: u("https://a.example/")),
+                             at: u("https://a.example/")) == u("https://a.example/")),
+
+            // Closing a row that has wandered sends it home rather than parking it there.
+            ("a pinned row browsed away from its page is sent back to it",
+             TabStore.goesHome(home: u("https://google.example/"), at: u("https://wandered.example/x"))
+                == u("https://google.example/")),
+            ("one already on its own page has nowhere to go and parks in place",
+             TabStore.goesHome(home: u("https://google.example/"), at: u("https://google.example/")) == nil),
+            ("a row with no home parks in place, which is what every row used to do",
+             TabStore.goesHome(home: nil, at: u("https://wandered.example/x")) == nil),
+            // The resume gap: `resume` clears `parkedURL` before `WKWebView.url` catches up,
+            // so for that width the tab has no url at all. Unknown is not "wandered".
+            ("a row whose whereabouts are unknown is left exactly where it is",
+             TabStore.goesHome(home: u("https://google.example/"), at: nil) == nil),
+
+            // And it says where it went. The wandered page's title goes with the wander.
+            ("a row sent home takes the name history knows that page by",
+             TabStore.homeTitle(known: "Google", url: u("https://google.example/")) == "Google"),
+            ("…the host when this profile has never been there",
+             TabStore.homeTitle(known: nil, url: u("https://google.example/")) == "google.example"),
+            ("…and the host again for a page whose title never arrived",
+             TabStore.homeTitle(known: "", url: u("https://google.example/")) == "google.example"),
+            ("favourites and pinned rows are written to different keys",
+             TabStore.defaultsKey(.favourite, ProfileManager.defaultID)
+                != TabStore.defaultsKey(.pinned, ProfileManager.defaultID)),
+            ("the favourites key is still the one that predates the split",
+             TabStore.defaultsKey(.favourite, ProfileManager.defaultID) == "pinnedTabs"),
+
+            // Drop index math: where a dragged tab lands before or after its target.
+            ("dropping before a later target lands one short of it",
+             TabStore.insertionIndex(from: 0, target: 3, after: false) == 2),
+            ("dropping after a later target lands on it",
+             TabStore.insertionIndex(from: 0, target: 3, after: true) == 3),
+            ("dropping before an earlier target lands on it",
+             TabStore.insertionIndex(from: 3, target: 0, after: false) == 0),
+            ("dropping after an earlier target lands one past it",
+             TabStore.insertionIndex(from: 3, target: 0, after: true) == 1),
+            ("a today row dropped after the last tile joins the favourites at the end",
+             TabStore.clampedDestination(others: [.favourite, .favourite, .today, .today],
+                                         moving: .favourite,
+                                         to: TabStore.insertionIndex(from: 4, target: 1, after: true)) == 2),
+            ("a tile dropped above the first today row joins today at its head",
+             TabStore.clampedDestination(others: [.favourite, .today, .today, .today],
+                                         moving: .today,
+                                         to: TabStore.insertionIndex(from: 0, target: 2, after: false)) == 1),
+            ("a today row dropped onto a pinned row joins the pinned run",
+             TabStore.clampedDestination(others: [.favourite, .pinned, .today],
+                                         moving: .pinned,
+                                         to: TabStore.insertionIndex(from: 3, target: 1, after: true)) == 2),
+        ]
+    }
+}

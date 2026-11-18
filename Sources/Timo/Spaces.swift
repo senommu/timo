@@ -1,0 +1,1057 @@
+import AppKit
+import Foundation
+
+/// Everything Arc's Spaces do that is not a view.
+///
+/// The one idea the rest of the file falls out of: in Arc **the only thing Spaces share is
+/// Favourites**. A Space owns its Pinned rows, its Today tabs, its name, icon, theme colour
+/// and appearance; the Favourites grid belongs to the *profile* and shows in every Space of
+/// it. Timo wrote Favourites into each Space (`Space.pinnedURLs`), so switching Space swapped
+/// the grid out — `migrate` is what un-does that on the first read, once, in place.
+enum Spaces {
+    /// Curated SF Symbols offered beside the system emoji picker.
+    static let icons = [
+        "cloud", "star", "bolt", "book", "briefcase", "gamecontroller",
+        "music.note", "heart", "leaf", "flame", "house", "cart",
+        "graduationcap", "hammer", "paintbrush", "globe", "camera", "film",
+        "airplane", "car", "cup.and.saucer", "sparkles", "moon", "sun.max",
+    ]
+
+    /// Filled, compact symbols for the Space picker. Persisted legacy names remain valid.
+    static let pickerIcons = [
+        "star.fill", "bookmark.fill", "heart.fill", "flag.fill", "bolt.fill", "triangle.fill", "asterisk", "bell.fill",
+        "lightbulb.fill", "triangle.lefthalf.filled", "square.grid.2x2.fill", "circle.grid.3x3.fill", "square.3.layers.3d", "cylinder.fill", "archivebox.fill", "square.on.square.fill",
+        "folder.fill", "tray.fill", "calendar", "envelope.fill", "checkmark.square.fill", "doc.fill", "book.fill", "message.fill",
+        "person.2.fill", "terminal.fill", "wrench.and.screwdriver.fill", "square.fill", "oval.portrait.fill", "circle.fill", "moon.fill", "sun.max.fill",
+        "globe.americas.fill", "leaf.fill", "cloud.fill", "pawprint.fill", "basket.fill", "gift.fill", "bed.double.fill", "fork.knife",
+        "dumbbell.fill", "airplane", "music.note", "paintpalette.fill", "video.fill", "bandage.fill", "chevron.left.forwardslash.chevron.right", "globe.europe.africa.fill",
+        "cloud", "map.fill", "bird.fill", "cup.and.saucer.fill", "flame.fill", "scroll.fill", "hand.thumbsup.fill", "tram.fill",
+    ]
+
+    // MARK: - Legacy migration
+
+    /// Before Spaces, a window kept its pinned rows in a profile-level `pinnedRows`
+    /// key and its Today tabs in the session file, which is a second, invisible Space that
+    /// nothing could name, switch to or move a tab out of.
+    ///
+    /// This is the Space such a profile is folded into, once. Named after the profile (the
+    /// default profile is already called "Personal", which is Arc's name for the first
+    /// Space) and wearing its colour, so the migration is invisible rather than a Space
+    /// called "New Space" appearing out of nowhere.
+    ///
+    /// Pure, because it is the one function that can lose somebody's pinned tabs: `pinned`
+    /// is what the old profile-level key held and `today` is what the session file held,
+    /// and everything web-shaped in either has to come out the other side exactly once.
+    static func firstSpace(id: UUID = UUID(), profileID: UUID, name: String, colorHex: String?,
+                           pinned: [URL], today: [URL]) -> Space {
+        func web(_ list: [URL], skipping seen: inout Set<String>) -> [URL] {
+            list.filter { TabAddress.restorable($0) && seen.insert($0.absoluteString).inserted }
+        }
+        var seen = Set<String>()
+        // Pinned first, so a url that was both a pinned row and an open tab stays pinned:
+        // the tab it also was comes back as that pinned row.
+        let rows = web(pinned, skipping: &seen)
+        let tabs = web(today, skipping: &seen)
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        return Space(id: id, name: trimmed.isEmpty ? "Personal" : trimmed, profileID: profileID,
+                     tabURLs: tabs, pinnedURLs: [], pinnedTabURLs: rows,
+                     colorHex: colorHex, icon: "cloud")
+    }
+
+    /// Rows that were stranded at profile level, appended to a Space's Pinned section: web
+    /// pages only, never a second copy of one already there, and the Space's own order kept
+    /// in front. Pure — this is the other function that can silently lose somebody's pinned
+    /// tabs.
+    static func mergedPins(_ existing: [URL], _ stranded: [URL]) -> [URL] {
+        var seen = Set(existing.map(\.absoluteString))
+        return existing + stranded.filter {
+            TabAddress.restorable($0) && seen.insert($0.absoluteString).inserted
+        }
+    }
+
+    /// Which Space an ordinary window opens in: the one it was asked for, else the profile's
+    /// last-used one, else its first. Nil for a profile with no Spaces.
+    ///
+    /// A Space that is not in `all` is not a Space this profile can show — it was deleted,
+    /// or belongs to somebody else — so the request is answered with a real one rather than
+    /// with a window pointing at a Space that is not on disk.
+    ///
+    /// Pure so the rule can be proved without a window server; `resolve` is the one line of
+    /// I/O around it.
+    static func pick(asked: Space?, last: UUID?, from all: [Space]) -> Space? {
+        if let asked, all.contains(where: { $0.id == asked.id }) { return asked }
+        return all.first { $0.id == last } ?? all.first
+    }
+
+    /// `pick`, against the profile's real Spaces — migrating a first one only when there
+    /// is no Spaces file yet. Private windows never come through here: incognito has no Spaces
+    /// either, and a window that writes nothing down must not create a Space as a side
+    /// effect of being opened.
+    ///
+    /// Deliberately no session tabs: opening a window is not restoring a session, and
+    /// folding session.json in here would resurrect the pages a user refused with "Start
+    /// Fresh" — permanently, because the Space is then what holds them. `Session.restore` is
+    /// the one caller that passes them.
+    @MainActor static func resolve(_ asked: Space?, for profile: Profile) -> Space? {
+        let all = ProfileManager.shared.ensureSpaces(for: profile)
+        return pick(asked: asked, last: TabStore.lastSpaceID(for: profile.id), from: all)
+    }
+
+    // MARK: - The tab a Space is left on
+
+    /// Arc lands you back on the tab you were reading, not on whatever happens to be first:
+    /// swiping to Work and back to Personal puts the same page in front of you again.
+    ///
+    /// `tabs` is the strip as it has just been rebuilt, in sidebar order; `last` is the url
+    /// written down when the Space was left. The fallbacks are the ones the sidebar has to
+    /// survive: the first Today tab, then the first pinned row, then nothing at all — an
+    /// empty pill over a Space with no pages is a real answer, and the chrome stays put.
+    ///
+    /// A favourite is never landed on, whatever was written down: the grid belongs to the
+    /// profile and shows in every Space, so landing there would answer "which of this Space's
+    /// tabs?" with a tab that is not the Space's at all — and every Space would land on the
+    /// same tile. `rememberTab` refuses to write one for the same reason.
+    ///
+    /// Pure, so `selfcheck --pure` can prove the ladder without a window.
+    /// ponytail: the same url twice in a Space lands on the first of them. Telling them apart
+    /// needs a stable per-tab id in the Space file, which is a format change to remember which
+    /// of two identical pages you were reading.
+    static func landing(on tabs: [(url: String?, kind: TabKind)], last: String?) -> Int? {
+        if let last, let i = tabs.firstIndex(where: { $0.url == last && $0.kind != .favourite }) {
+            return i
+        }
+        return tabs.firstIndex { $0.kind == .today } ?? tabs.firstIndex { $0.kind == .pinned }
+    }
+
+    /// Where `landing`'s `last` comes from, and goes.
+    ///
+    /// ponytail: one defaults dictionary, space id → url, next door to `lastSpace` — which
+    /// is this same idea one level up. Not a field on `Space`: spaces.json is another file's
+    /// Codable struct, every window rewrites it, and this is pure cache — delete it and
+    /// Spaces still switch, just landing on the first tab the way they used to. Ceiling: a
+    /// deleted Space leaves its row behind (~60 bytes), and a Space open in two windows
+    /// remembers whichever one left it last.
+    private static let lastTabKey = "lastSpaceTab"
+
+    static func lastTab(in space: UUID, defaults: UserDefaults = .timo) -> String? {
+        (defaults.dictionary(forKey: lastTabKey) as? [String: String])?[space.uuidString]
+    }
+
+    /// A `url` of nil forgets the Space's row. Callers retain web pages and local
+    /// Easels, while blank tabs, files and other internal addresses remain transient.
+    static func rememberTab(_ url: String?, in space: UUID, defaults: UserDefaults = .timo) {
+        var all = (defaults.dictionary(forKey: lastTabKey) as? [String: String]) ?? [:]
+        all[space.uuidString] = url
+        defaults.set(all, forKey: lastTabKey)
+    }
+
+    // MARK: - Favourites are global
+
+    /// Arc caps the grid at twelve tiles.
+    static let favouritesCap = 12
+
+    /// The union of the profile's Favourites and every Space's old per-space grid, in order:
+    /// what the profile already had first (it is the newest list, written by the last window
+    /// to save), then each Space's, in the Space order the sidebar shows. Deduped on the
+    /// absolute string, capped, and never reordered — a user's grid is muscle memory.
+    ///
+    /// Pure so the migration can be proved without a disk: this is the one function that can
+    /// silently lose somebody's favourites.
+    static func mergedFavourites(existing: [URL], perSpace: [[URL]],
+                                 cap: Int = favouritesCap) -> [URL] {
+        var seen = Set<String>()
+        var out: [URL] = []
+        for url in existing + perSpace.flatMap({ $0 }) {
+            guard out.count < cap, seen.insert(url.absoluteString).inserted else { continue }
+            out.append(url)
+        }
+        return out
+    }
+
+    /// The profile's Favourites, migrating any per-space grids into them the first time. The
+    /// migration is idempotent because it clears `pinnedURLs` as it goes: a second call sees
+    /// nothing left to merge.
+    @MainActor static func favourites(for profileID: UUID) -> [URL] {
+        let key = TabStore.defaultsKey(.favourite, profileID)
+        let existing = (UserDefaults.timo.stringArray(forKey: key) ?? [])
+            .compactMap(URL.init(string:))
+        let spaces = ProfileManager.shared.spaces(for: profileID)
+        guard spaces.contains(where: { !$0.pinnedURLs.isEmpty }) else {
+            return Array(existing.prefix(favouritesCap))
+        }
+        let merged = mergedFavourites(existing: existing, perSpace: spaces.map(\.pinnedURLs))
+        UserDefaults.timo.set(merged.map(\.absoluteString), forKey: key)
+        var cleared = spaces
+        for i in cleared.indices { cleared[i].pinnedURLs = [] }
+        ProfileManager.shared.saveSpaces(cleared, for: profileID)
+        return merged
+    }
+
+    // MARK: - Moving a tab to another Space
+
+    /// A url appended to a Space's list, without ever landing there twice. Arc drops a moved
+    /// tab at the end of the section it was moved into.
+    static func appending(_ url: URL, to list: [URL]) -> [URL] {
+        list.contains(url) ? list : list + [url]
+    }
+
+    /// "Move to Space ▸ Work ▸ Pinned". The tab's page is written into the target Space on
+    /// disk and the tab is closed here.
+    ///
+    /// ponytail: the url moves, not the `WKWebView`. A Space that is not on screen has no
+    /// window, no web view and no strip to insert into — handing it a live tab would mean
+    /// keeping every Space's tabs alive at once, which is the opposite of what a Space is
+    /// for. Ceiling: the moved tab loses its scroll position and back/forward list.
+    @MainActor static func move(_ id: Tab.ID, to spaceID: UUID, as kind: TabKind,
+                                from store: TabStore) {
+        // A private window has no Space and writes nothing down; moving one of its tabs into
+        // a Space would put a page the user asked not to be remembered into spaces.json.
+        guard !store.isPrivate, !store.isTabLocked(id),
+              let tab = store.tabs.first(where: { $0.id == id }),
+              let url = tab.pinnedURL, TabAddress.restorable(url),   // home, not the wander
+              var space = store.spaces.first(where: { $0.id == spaceID }),
+              space.id != store.currentSpaceID
+        else { return }
+        switch kind {
+        case .pinned: space.pinnedTabURLs = appending(url, to: space.pinnedTabURLs ?? [])
+        default:      space.tabURLs = appending(url, to: space.tabURLs)
+        }
+        // The state sidecar too, so the tab comes up where it was left rather than reloading
+        // from the top — unless it has wandered from its home: then it is handed over the
+        // way its × would hand it over, at home with none of the wander's state, or the
+        // list would say one page and the sidecar wake it on another.
+        var parked = Suspension.SpaceState.load(space: spaceID, profileID: store.profileID,
+                                                in: Store.directory)
+        // `==`, not `atHome`: in the resume gap a row has no `currentURL` yet, reads as
+        // at home, and its snapshot is still the wander's.
+        parked[url.absoluteString] = tab.currentURL == url ? tab.snapshot
+            : Parked(title: TabStore.homeTitle(known: tab.history.title(for: url), url: url))
+        Suspension.SpaceState.save(parked, space: spaceID, profileID: store.profileID,
+                                   in: Store.directory)
+        ProfileManager.shared.updateSpace(space)
+        // A favourite is global, so moving one to a Space would take it out of every other
+        // Space's grid — send it down to Today first, then close it like any other tab.
+        if tab.kind != .today { store.move(id, to: .today) }
+        store.close(id)
+        SharedTabs.receiveSavedTab(url, parked: parked[url.absoluteString] ?? Parked(),
+                                   kind: kind, in: spaceID, profileID: store.profileID)
+        store.spacesChanged()
+    }
+
+    @MainActor static func moveAsync(_ id: Tab.ID, to spaceID: UUID, as kind: TabKind,
+                                from store: TabStore) async {
+        PendingSessionTransactions.begin()
+        defer { PendingSessionTransactions.end() }
+        // A private window has no Space and writes nothing down; moving one of its tabs into
+        // a Space would put a page the user asked not to be remembered into spaces.json.
+        guard !store.isPrivate, !store.isTabLocked(id),
+              let tab = store.tabs.first(where: { $0.id == id }),
+              let url = tab.pinnedURL, TabAddress.restorable(url),   // home, not the wander
+              var space = store.spaces.first(where: { $0.id == spaceID }),
+              space.id != store.currentSpaceID
+        else { return }
+        let destinationBefore = space
+        switch kind {
+        case .pinned: space.pinnedTabURLs = appending(url, to: space.pinnedTabURLs ?? [])
+        default:      space.tabURLs = appending(url, to: space.tabURLs)
+        }
+        // The state sidecar too, so the tab comes up where it was left rather than reloading
+        // from the top — unless it has wandered from its home: then it is handed over the
+        // way its × would hand it over, at home with none of the wander's state, or the
+        // list would say one page and the sidecar wake it on another.
+        var parked = Suspension.SpaceState.load(space: spaceID, profileID: store.profileID,
+                                                in: Store.directory)
+        // `==`, not `atHome`: in the resume gap a row has no `currentURL` yet, reads as
+        // at home, and its snapshot is still the wander's.
+        parked[url.absoluteString] = tab.currentURL == url ? tab.snapshot
+            : Parked(title: TabStore.homeTitle(known: tab.history.title(for: url), url: url))
+        let sourceSpace = store.currentSpaceID
+        let sourcePage = tab.currentURL
+        guard await Suspension.SpaceState.saveAsync(parked, space: spaceID, profileID: store.profileID,
+                                                   in: Store.directory),
+              store.currentSpaceID == sourceSpace, tab.currentURL == sourcePage,
+              store.tabs.contains(where: { $0 === tab }), !store.isTabLocked(id),
+              store.spaces.first(where: { $0.id == spaceID }) == destinationBefore,
+              ProfileManager.shared.updateSpace(space) else { return }
+        // A favourite is global, so moving one to a Space would take it out of every other
+        // Space's grid — send it down to Today first, then close it like any other tab.
+        if tab.kind != .today { store.move(id, to: .today) }
+        store.close(id)
+        SharedTabs.receiveSavedTab(url, parked: parked[url.absoluteString] ?? Parked(),
+                                   kind: kind, in: spaceID, profileID: store.profileID)
+        store.spacesChanged()
+    }
+
+    // MARK: - Reordering
+
+    /// A list with the item at `from` put back at `to`, clamped. Used by dragging the footer
+    /// dots; `to` is an index into the list *before* the move, the way a drop reports it.
+    static func reordered<T>(_ list: [T], from: Int, to: Int) -> [T] {
+        guard list.indices.contains(from), from != to else { return list }
+        var out = list
+        let item = out.remove(at: from)
+        out.insert(item, at: min(max(to > from ? to - 1 : to, 0), out.count))
+        return out
+    }
+
+    // MARK: - Deleting
+
+    /// Deleting a Space, everything except the asking: its pages to the Archive, the folder
+    /// shape forgotten, the Space gone. One function so the sidebar's "Delete Space" and
+    /// Settings' minus button cannot disagree about what deleting means — Settings used to
+    /// drop the pages and leave the folders behind.
+    ///
+    /// A profile may have no Spaces. Windows leave the deleted Space, switching to a
+    /// survivor when there is one or clearing its tabs when the profile is empty.
+    /// Include cold shapes and every in-memory copy, including empty protected folders.
+    @MainActor private static func protectedFolders(in id: UUID, profile: UUID) -> [Folder] {
+        var shapes = [TabStore.savedShape(.pinned, space: id, profileID: profile),
+                      TabStore.savedShape(.today, space: id, profileID: profile)].compactMap { $0 }
+        for store in TabStore.all where store.profileID == profile {
+            if store.currentSpaceID == id { shapes += [store.pins, store.todayShape] }
+            if let stash = store.stashes[id] { shapes += [stash.pins, stash.todayShape] }
+        }
+        var seen = Set<UUID>()
+        return shapes.flatMap(\.entries).compactMap(\.folder).filter {
+            $0.requiresAuthentication == true && seen.insert($0.id).inserted
+        }
+    }
+
+    @MainActor private static func canDelete(_ id: UUID, profile: UUID,
+                                             authentication: FolderAuthentication) -> Bool {
+        let grants = authentication.grants(for: profile)
+        return protectedFolders(in: id, profile: profile).allSatisfy { grants.contains($0.id) }
+    }
+
+    @discardableResult
+    @MainActor static func delete(_ id: UUID, in profileID: UUID) -> Bool {
+        let showing = TabStore.all.filter { $0.profileID == profileID && $0.currentSpaceID == id }
+        // Flush the shared live tabs before reading the saved Space.
+        guard canDelete(id, profile: profileID, authentication: .shared),
+              showing.allSatisfy({ $0.saveCurrentSpace() }) else { return false }
+        let all = ProfileManager.shared.spaces(for: profileID)
+        // Read the Space back rather than trusting the caller's copy: what is on disk is
+        // what is about to be deleted, and it is newer than the copy a menu was built from.
+        guard let space = all.first(where: { $0.id == id }),
+              canDelete(id, profile: profileID, authentication: .shared),
+              ProfileManager.shared.deleteSpace(id, in: profileID) else { return false }
+        archiveContents(of: space)
+        TabStore.forgetShape(space: id, profileID: profileID)
+        rememberTab(nil, in: id)       // and the row saying which tab it was left on
+        for store in TabStore.all where store.profileID == profileID {
+            // A theme preview can still make `currentSpace` answer with the deleted Space.
+            // Clear it before resolving, so the switch cannot be deferred to a view's task.
+            if store.previewSpace?.id == id { store.previewSpace = nil }
+            if store.currentSpaceID == id { store.resolveStaleSpace() }
+            store.spacesChanged()
+        }
+        return true
+    }
+
+    @discardableResult
+    @MainActor static func deleteAsync(_ id: UUID, in profileID: UUID,
+                                       authentication: FolderAuthentication = .shared) async -> Bool {
+        PendingSessionTransactions.begin()
+        defer { PendingSessionTransactions.end() }
+        let showing = TabStore.all.filter { $0.profileID == profileID && $0.currentSpaceID == id }
+        // Authentication is required before protected URLs can enter the unprotected Archive.
+        for folder in protectedFolders(in: id, profile: profileID) {
+            let granted = await withCheckedContinuation { continuation in
+                authentication.unlock(folder.id, profile: profileID,
+                    reason: "Delete the Space containing locked folder “\(folder.name)”.") {
+                    continuation.resume(returning: $0)
+                }
+            }
+            guard granted else { return false }
+        }
+        // Flush the shared live tabs before reading the saved Space. Grants and folder
+        // topology may change during authentication or the disk barrier.
+        guard showing.allSatisfy({ $0.saveCurrentSpace() }),
+              await SessionPersistence.shared.flush(),
+              canDelete(id, profile: profileID, authentication: authentication) else { return false }
+        let all = ProfileManager.shared.spaces(for: profileID)
+        // Read the Space back rather than trusting the caller's copy: what is on disk is
+        // what is about to be deleted, and it is newer than the copy a menu was built from.
+        guard let space = all.first(where: { $0.id == id }),
+              ProfileManager.shared.deleteSpace(id, in: profileID) else { return false }
+        archiveContents(of: space)
+        TabStore.forgetShape(space: id, profileID: profileID)
+        rememberTab(nil, in: id)       // and the row saying which tab it was left on
+        for store in TabStore.all where store.profileID == profileID {
+            // A theme preview can still make `currentSpace` answer with the deleted Space.
+            // Clear it before resolving, so the switch cannot be deferred to a view's task.
+            if store.previewSpace?.id == id { store.previewSpace = nil }
+            if store.currentSpaceID == id { store.resolveStaleSpace() }
+            store.spacesChanged()
+        }
+        return true
+    }
+
+    /// Arc puts a deleted Space's tabs in the Archive rather than dropping them: the Space is
+    /// gone, the pages are still findable in the Library.
+    @MainActor static func archiveContents(of space: Space) {
+        let entries = (space.tabURLs + (space.pinnedTabURLs ?? [])).compactMap { url -> Archive.Entry? in
+            guard TabAddress.restorable(url) else { return nil }
+            return Archive.Entry(url: url.absoluteString, title: url.host ?? url.absoluteString, at: .now)
+        }
+        Archive.shared(for: space.profileID).add(entries)
+    }
+
+    // MARK: - The theme
+
+    /// How many colours a Space's ground is mixed from at most. Arc's editor caps its canvas
+    /// at three dots and so does this: a fourth band across a 250pt sidebar is a stop nobody
+    /// can see, and the "+" that made it would be a button that does nothing visible.
+    static let maxThemeColors = 3
+
+    /// A Space's colours, first one first. A Space that predates the gradient has only
+    /// `colorHex`, and reads as the one-colour theme it is.
+    static func themeColors(of space: Space) -> [String] {
+        let list = space.colors ?? []
+        return list.isEmpty ? (space.colorHex.map { [$0] } ?? []) : list
+    }
+
+    /// …and the one way to set them, so `colorHex` never drifts out of step with the list it
+    /// is the first of. Everything that only knows about one colour reads `colorHex`.
+    static func setThemeColors(_ list: [String], on space: inout Space) {
+        let capped = Array(list.prefix(maxThemeColors))
+        space.colors = capped.isEmpty ? nil : capped
+        space.colorHex = capped.first
+        space.themePalette = nil
+        space.themeHarmony = nil
+    }
+
+    static func palette(of space: Space) -> [ThemeColor] {
+        let fallback = themeColors(of: space)
+        if let exact = space.themePalette, exact.count == fallback.count, exact.allSatisfy(\.isValid),
+           zip(exact, fallback).allSatisfy({ $0.hex == $1 }) { return exact }
+        return fallback.compactMap(ThemeColor.init(hex:))
+    }
+
+    static func setPalette(_ colors: [ThemeColor], on space: inout Space, harmony: ThemeHarmony? = nil) {
+        let list = Array(colors.prefix(maxThemeColors))
+        setThemeColors(list.map(\.hex), on: &space)
+        space.themePalette = list.isEmpty ? nil : list
+        space.themeHarmony = list.isEmpty ? nil : harmony ?? (list.count > 1 ? ThemeWheel.harmony(palette: list) : nil)
+    }
+
+    static func themePoint(hex: String) -> (x: Double, y: Double)? {
+        guard let color = ThemeColor(hex: hex) else { return nil }
+        let point = ThemeWheel(color).point(color)
+        return (Double(point.x), Double(point.y))
+    }
+
+    static func wheel(x: Double, y: Double) -> (r: Double, a: Double) {
+        let dx = x - 0.5, dy = y - 0.5
+        return (min(1, 2 * (dx * dx + dy * dy).squareRoot()), atan2(dy, dx))
+    }
+
+    static func wheelPoint(r: Double, a: Double) -> (x: Double, y: Double) {
+        (0.5 + r / 2 * cos(a), 0.5 + r / 2 * sin(a))
+    }
+
+    /// The grain dial's sweep: three quarters of a turn. The dead quarter is at the bottom,
+    /// where a knob that went the whole way round would flip 1 back to 0 under the finger.
+    static let dialSweep = Double.pi * 1.5
+
+    /// Radians clockwise from straight up for a 0…1 dial value.
+    static func dialAngle(_ value: Double) -> Double {
+        (min(max(value, 0), 1) - 0.5) * dialSweep
+    }
+
+    /// Where a point sits about the knob's centre: radians clockwise from straight up.
+    static func dialRadians(dx: Double, dy: Double) -> Double { atan2(dx, -dy) }
+
+    /// The knob turned from one angle to the next. Deliberately *relative* — the value moves
+    /// by however far the finger swept, from wherever the knob already was — so a click on the
+    /// dial moves nothing, and a sweep through the dead quarter at the bottom parks at the end
+    /// it came from instead of snapping across to the other one.
+    static func dialTurn(from: Double, to: Double, value: Double) -> Double {
+        var delta = to - from
+        if delta > .pi { delta -= 2 * .pi }
+        if delta < -.pi { delta += 2 * .pi }
+        return min(max(value + delta / dialSweep, 0), 1)
+    }
+
+    // MARK: - The strip runs across profiles
+
+    /// Every Space of every profile, in one list: the profiles in their own order, each
+    /// profile's Spaces in theirs.
+    ///
+    /// Arc's sidebar is *one* strip for the whole app — profile A's Spaces, then B's, then
+    /// C's, side by side — so the swipe, ⌥⌘←/→, ⌃1…9, the footer dots and the Spaces menu all
+    /// walk this rather than one profile's list. Arriving at a Space another profile owns is
+    /// what moves the window to that profile, in place; see `Windows.hop`.
+    ///
+    /// Generic over the profile and pure, so `selfcheck --pure` can prove the order with no
+    /// profiles on disk and no `spaces.json` to read.
+    static func strip<P>(profiles: [P], spacesOf: (P) -> [Space]) -> [Space] {
+        profiles.flatMap(spacesOf)
+    }
+
+    /// Which way the strip slides going from one Space to another: +1 when the destination is
+    /// later along it — contents come in from the right — and -1 when it is earlier.
+    ///
+    /// Over the whole strip, not over one profile's Spaces: a hop into the next profile is a
+    /// step to the *right*, and computed per profile it read as a step back to that profile's
+    /// first Space. A Space that is not on the strip at all — deleted from under the window —
+    /// slides forwards, which is what every other unanswerable case here does.
+    ///
+    /// Pure, so `selfcheck --pure` proves it across profiles.
+    static func direction(from: UUID?, to: UUID, in strip: [UUID]) -> Int {
+        guard let from, let here = strip.firstIndex(of: from),
+              let there = strip.firstIndex(of: to) else { return 1 }
+        return there > here ? 1 : -1
+    }
+
+    // MARK: - Two-finger swipe
+
+    /// The horizontal swipe on the sidebar, as a state machine over scroll deltas so the
+    /// tracking, the rubber band and the commit can all be proved without a trackpad.
+    ///
+    /// The switch happens on fingers-up, not mid-gesture: while the fingers are down the
+    /// strip only *moves*, and the user can carry it back and change their mind. That is the
+    /// whole difference between this and the old 40pt trip-wire, which fired under the
+    /// fingers and then had to spend the rest of the gesture ignoring them.
+    struct Swipe {
+        /// Which part of a trackpad gesture an event belongs to. Momentum is its own case
+        /// because it must be *ignored*: the fingers have already left the trackpad and the
+        /// commit has already been decided, so feeding the coast back in would carry the
+        /// strip through the next Space and the one after it.
+        enum Phase { case began, changed, ended, cancelled, momentum }
+
+        /// How far across the sidebar a released drag must travel to select a Space.
+        /// The fingers can hold or reverse anywhere before release.
+        static let commitFraction: CGFloat = 0.24
+        /// …or this fast, in points per second, so a flick that barely moves still switches.
+        static let flickSpeed: CGFloat = 600
+        /// A few fast pixels at the edge are noise, not a deliberate flick.
+        static let flickFraction: CGFloat = 0.1
+        /// Creating a Space keeps its more deliberate pull even when switching is lighter.
+        static let createFraction: CGFloat = 0.45
+        /// A quick overswipe must not open a form, even if its distance fills the circle.
+        static let createDuration: Double = 0.25
+        /// How much of the travel past the first or last Space actually shows: the strip
+        /// gives, so the gesture is answered, but it plainly does not want to go.
+        static let bandGive: CGFloat = 0.3
+        /// …and never further than this share of the sidebar, so the band has an end.
+        static let bandCap: CGFloat = 0.12
+        /// How much of the new reading each velocity sample carries; the rest is the old
+        /// one. Low enough that the near-zero straggler before fingers-up cannot read as a
+        /// dead stop, high enough that the flick still feels like the last few frames.
+        static let speedSmoothing: CGFloat = 0.6
+        /// The shortest interval a velocity sample is allowed to be measured over, in
+        /// seconds. AppKit coalesces scroll events under load, and two frames' worth of
+        /// travel arriving with a 1ms timestamp gap would otherwise read as ten times the
+        /// speed the fingers were actually going and commit a swipe nobody asked for.
+        static let minInterval: Double = 1.0 / 240
+
+        /// Raw finger travel, signed the way `scrollingDeltaX` is: negative means the fingers
+        /// went left, which brings on the *next* Space.
+        private(set) var travel: CGFloat = 0
+        /// Smoothed points per second, for the flick commit. Smoothed because the last event
+        /// before fingers-up is often a near-zero straggler that would read as a dead stop.
+        private(set) var speed: CGFloat = 0
+        private var creationDuration: Double = 0
+        /// False once this gesture has committed, so one swipe is one Space. A gesture can
+        /// end twice (`.ended` after `.cancelled`), and both would otherwise commit.
+        private(set) var armed = true
+
+        /// A new gesture can catch a landing between Spaces instead of starting at rest.
+        private let initialTravel: CGFloat
+        init(startingAt travel: CGFloat = 0) {
+            initialTravel = travel
+            self.travel = travel
+        }
+
+        /// Feeds one scroll event. `offset` is where the strip should sit right now, or nil
+        /// for "leave it where it is" — an event that is not the fingers moving must never
+        /// stomp on a spring that is already running. `commit` is +1 for "next Space", -1
+        /// for "previous", nil for "spring back".
+        /// `create`: past the last Space there is one more thing to pull for — the Space
+        /// that does not exist yet. The strip bands as it always did, but `pull` reports how
+        /// far towards the line the fingers have got. A full, sustained pull commits `+1`
+        /// from the last index only on release, so it can still be reversed or cancelled.
+        /// Off by default so the band checks hold.
+        mutating func feed(dx: CGFloat, dt: Double, phase: Phase,
+                           width: CGFloat, count: Int, index: Int,
+                           create: Bool = false) -> (offset: CGFloat?, commit: Int?, pull: CGFloat) {
+            switch phase {
+            case .momentum:
+                return (nil, nil, 0)
+            case .cancelled:
+                travel = 0
+                speed = 0
+                creationDuration = 0
+                armed = false
+                return (nil, nil, 0)
+            case .began:
+                travel = initialTravel
+                speed = 0
+                creationDuration = 0
+                armed = true
+                return (initialTravel, nil, 0)
+            case .changed:
+                guard armed else { return (nil, nil, 0) }
+                travel += dx
+                if dt > 0 {
+                    let step = CGFloat(max(dt, Self.minInterval))
+                    speed = Self.speedSmoothing * (dx / step) + (1 - Self.speedSmoothing) * speed
+                }
+                let offset = Self.offset(travel, width: width, count: count, index: index)
+                let distancePull = Self.pull(travel, width: width, count: count, index: index, create: create)
+                if distancePull > 0 { creationDuration += max(0, dt) }
+                else { creationDuration = 0 }
+                // Movement samples reflect both deliberate travel and time. A stationary
+                // hold is accounted for by the next sample, including fingers-up.
+                let pull = min(distancePull, Self.pullFull * CGFloat(creationDuration / Self.createDuration))
+                return (offset, nil, pull)
+            case .ended:
+                defer { travel = 0; speed = 0; creationDuration = 0 }
+                guard armed else { return (nil, nil, 0) }
+                armed = false
+                // AppKit sends no changed packets while the fingers are stationary.
+                // The interval before release still belongs to the held pull; momentum
+                // never reaches this check and cannot turn a released flick into intent.
+                if creationDuration + max(0, dt) >= Self.createDuration,
+                   Self.pull(travel, width: width, count: count, index: index, create: create) >= Self.pullFull {
+                    return (nil, 1, 0)
+                }
+                let direction = Self.commit(travel: travel, speed: speed, width: width,
+                                            count: count, index: index)
+                return (nil, direction, 0)
+            }
+        }
+
+        /// A pull past the last Space is two stages of the same motion: the ring fills to
+        /// 1, then the circle behind it fills solid to `pullFull`. Releasing a sustained
+        /// pull with a solid circle opens the form; a shorter or quick pull springs back.
+        static let pullFull: CGFloat = 2
+
+        /// How far the pull has got, 0…`pullFull` — zero anywhere but past the last Space.
+        static func pull(_ travel: CGFloat, width: CGFloat, count: Int, index: Int,
+                         create: Bool) -> CGFloat {
+            guard create, width > 0, count > 0, travel < 0, index == count - 1 else { return 0 }
+            return min(pullFull, -travel / (width * createFraction))
+        }
+
+        /// Where the strip sits for a given travel: 1:1 with the fingers, up to the one
+        /// sidebar width that lands the neighbour exactly where the current Space is, and
+        /// only `bandGive` of it when there is no Space that way to bring on.
+        static func offset(_ travel: CGFloat, width: CGFloat, count: Int, index: Int) -> CGFloat {
+            let stuck = count < 2
+                || (travel > 0 && index <= 0)                // nothing before the first Space
+                || (travel < 0 && index >= count - 1)        // nor after the last
+            if stuck {
+                let cap = width * bandCap
+                return max(-cap, min(cap, travel * bandGive))
+            }
+            return max(-width, min(width, travel))
+        }
+
+        /// Fingers up: which way the strip should land, or nil to spring back. Far enough or
+        /// fast enough, and the flick has to still be going the way the strip already is —
+        /// a fast swipe back to where it started is a cancellation, not a commit.
+        static func commit(travel: CGFloat, speed: CGFloat, width: CGFloat,
+                           count: Int, index: Int) -> Int? {
+            guard count > 1, travel != 0 else { return nil }
+            let direction = travel < 0 ? 1 : -1
+            // The swipe does not wrap, unlike ⌥⌘←/→: the rubber band has just spent the whole
+            // gesture saying there is nothing over there.
+            guard (0..<count).contains(index + direction) else { return nil }
+            let far = abs(travel) >= width * commitFraction
+            let flick = abs(travel) >= width * flickFraction
+                && abs(speed) >= flickSpeed && (speed < 0) == (travel < 0)
+            return far || flick ? direction : nil
+        }
+    }
+
+    // MARK: - Offline check
+
+    static func check() -> [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        func assert(_ name: String, _ ok: Bool) { out.append((name, ok)) }
+        func u(_ s: String) -> URL { URL(string: "https://example.com/\(s)")! }
+
+        // Every tab lives in a Space: the Space a spaceless profile is folded into.
+        let pid = UUID()
+        let first = firstSpace(profileID: pid, name: "Personal", colorHex: "#6E7DD2",
+                               pinned: [u("p1"), u("p2")], today: [u("t1"), u("t2")])
+        assert("a migrated profile's first space is named after the profile",
+               first.name == "Personal" && first.profileID == pid)
+        assert("it wears the profile's colour and Arc's default icon",
+               first.colorHex == "#6E7DD2" && first.icon == "cloud")
+        assert("the profile-level pinned rows become the space's Pinned section",
+               first.pinnedTabURLs?.map(\.lastPathComponent) == ["p1", "p2"])
+        assert("the spaceless session tabs become the space's Today tabs",
+               first.tabURLs.map(\.lastPathComponent) == ["t1", "t2"])
+        assert("favourites are not migrated in — they are the profile's, in every space",
+               first.pinnedURLs.isEmpty)
+        assert("a url that was both pinned and open stays pinned, and is not also a tab",
+               firstSpace(profileID: pid, name: "P", colorHex: nil,
+                          pinned: [u("a")], today: [u("a"), u("b")]).tabURLs
+                   .map(\.lastPathComponent) == ["b"])
+        assert("the same page twice in the session comes back once",
+               firstSpace(profileID: pid, name: "P", colorHex: nil,
+                          pinned: [], today: [u("a"), u("a")]).tabURLs.count == 1)
+        assert("a blank or non-web tab is not a page to migrate",
+               firstSpace(profileID: pid, name: "P", colorHex: nil, pinned: [],
+                          today: [URL(string: "about:blank")!, u("a")]).tabURLs.count == 1)
+        assert("a profile with nothing to migrate still gets its space",
+               firstSpace(profileID: pid, name: "Work", colorHex: nil, pinned: [], today: [])
+                   .name == "Work")
+        assert("a profile whose name is blank falls back to Arc's \u{201C}Personal\u{201D}",
+               firstSpace(profileID: pid, name: "  ", colorHex: nil, pinned: [], today: []).name
+                   == "Personal")
+
+        // …and which Space an ordinary window resolves to.
+        let a = Space(name: "A", profileID: pid), b = Space(name: "B", profileID: pid)
+        assert("a window asked for a space opens in it",
+               pick(asked: b, last: a.id, from: [a, b])?.id == b.id)
+        assert("a window asked for none opens in the profile's last-used space",
+               pick(asked: nil, last: b.id, from: [a, b])?.id == b.id)
+        assert("with no last-used space it opens in the first",
+               pick(asked: nil, last: nil, from: [a, b])?.id == a.id)
+        assert("a last-used space that has since been deleted falls back to the first",
+               pick(asked: nil, last: UUID(), from: [a, b])?.id == a.id)
+        assert("only a profile with no spaces at all resolves to nothing",
+               pick(asked: nil, last: nil, from: []) == nil)
+        assert("a space that is not this profile's is not opened just because it was asked for",
+               pick(asked: Space(name: "Gone", profileID: pid), last: b.id, from: [a, b])?.id == b.id)
+
+        // The one strip that runs across every profile: what the swipe, ⌥⌘←/→, ⌃1…9 and the
+        // footer dots all walk. Profiles in their own order, each profile's Spaces in theirs.
+        let one = UUID(), two = UUID(), three = UUID()
+        let owned: [UUID: [Space]] = [
+            one: [Space(name: "Personal", profileID: one), Space(name: "Reading", profileID: one)],
+            two: [Space(name: "School", profileID: two)],
+            three: [Space(name: "Dev", profileID: three)],
+        ]
+        let whole = Spaces.strip(profiles: [one, two, three]) { owned[$0] ?? [] }
+        assert("the strip is every profile's spaces end to end, in profile order",
+               whole.map(\.name) == ["Personal", "Reading", "School", "Dev"])
+        assert("a profile with no spaces at all simply takes up no room on it",
+               Spaces.strip(profiles: [one, UUID(), two]) { owned[$0] ?? [] }.map(\.name)
+                   == ["Personal", "Reading", "School"])
+        assert("and no profiles at all is an empty strip, not a crash",
+               Spaces.strip(profiles: [UUID]()) { owned[$0] ?? [] }.isEmpty)
+        let order = whole.map(\.id)
+        assert("the next space along is a step forwards, whichever profile owns it",
+               Spaces.direction(from: order[1], to: order[2], in: order) == 1)
+        assert("\u{2026}and the one before it a step back, across the same profile boundary",
+               Spaces.direction(from: order[2], to: order[1], in: order) == -1)
+        assert("two spaces of the same profile are ordered by the strip like any other pair",
+               Spaces.direction(from: order[0], to: order[1], in: order) == 1
+                   && Spaces.direction(from: order[1], to: order[0], in: order) == -1)
+        assert("the last profile's last space back round to the first is a step back",
+               Spaces.direction(from: order[3], to: order[0], in: order) == -1)
+        assert("a space deleted from under the window slides forwards rather than refusing",
+               Spaces.direction(from: UUID(), to: order[0], in: order) == 1
+                   && Spaces.direction(from: nil, to: order[0], in: order) == 1)
+
+        // …and which *tab* it lands on once it is showing. The strip as `switchTo` rebuilds
+        // it: the profile's favourites, then the Space's pinned rows, then its Today tabs.
+        let strip: [(url: String?, kind: TabKind)] = [
+            ("https://fav.example", .favourite),
+            ("https://pin.example", .pinned),
+            ("https://t1.example", .today),
+            ("https://t2.example", .today),
+        ]
+        assert("switching back lands on the tab the space was left on",
+               landing(on: strip, last: "https://t2.example") == 3)
+        assert("…even when that tab is a pinned row",
+               landing(on: strip, last: "https://pin.example") == 1)
+        assert("a space nobody has left yet lands on its first Today tab",
+               landing(on: strip, last: nil) == 2)
+        assert("a remembered page that is no longer open falls back the same way",
+               landing(on: strip, last: "https://gone.example") == 2)
+        assert("a space with only pinned rows lands on the first of them",
+               landing(on: Array(strip.prefix(2)), last: nil) == 1)
+        assert("a space with nothing but favourites lands on nothing: the pill goes empty",
+               landing(on: Array(strip.prefix(1)), last: nil) == nil)
+        assert("an empty space lands on nothing", landing(on: [], last: "https://t1.example") == nil)
+        assert("a blank tab has no url and is never landed on by name",
+               landing(on: [(nil, .today), ("https://t1.example", .today)], last: nil) == 0)
+
+        // The row itself, against a throwaway suite: the user's own defaults are never read.
+        let suite = "timo.check.spaces.\(ProcessInfo.processInfo.processIdentifier)"
+        if let scratch = UserDefaults(suiteName: suite) {
+            defer { UserDefaults.dropScratchSuite(suite) }
+            assert("a space nobody has left yet remembers nothing",
+                   lastTab(in: a.id, defaults: scratch) == nil)
+            rememberTab("https://t2.example", in: a.id, defaults: scratch)
+            rememberTab("https://other.example", in: b.id, defaults: scratch)
+            assert("leaving a space writes down the tab it was left on",
+                   lastTab(in: a.id, defaults: scratch) == "https://t2.example")
+            assert("each space remembers its own",
+                   lastTab(in: b.id, defaults: scratch) == "https://other.example")
+            rememberTab(nil, in: a.id, defaults: scratch)
+            assert("leaving a space on a blank tab forgets rather than writing a row that never matches",
+                   lastTab(in: a.id, defaults: scratch) == nil
+                       && lastTab(in: b.id, defaults: scratch) == "https://other.example")
+        } else {
+            assert("scratch defaults suite is available", false)
+        }
+
+        // Pinned rows stranded at profile level, merged into a Space that already exists.
+        assert("stranded rows go after the space's own, in their own order",
+               mergedPins([u("a")], [u("b"), u("c")]).map(\.lastPathComponent) == ["a", "b", "c"])
+        assert("a stranded row the space already pins is not pinned twice",
+               mergedPins([u("a"), u("b")], [u("b")]).map(\.lastPathComponent) == ["a", "b"])
+        assert("the same stranded row listed twice lands once",
+               mergedPins([], [u("a"), u("a")]).count == 1)
+        assert("a blank or non-web stranded row is not a page to pin",
+               mergedPins([], [URL(string: "about:blank")!, u("a")]).map(\.lastPathComponent) == ["a"])
+        assert("nothing stranded leaves the space's rows exactly as they are",
+               mergedPins([u("a"), u("b")], []).map(\.lastPathComponent) == ["a", "b"])
+
+        // Favourites migration: the union, in space order, deduped, capped.
+        assert("the profile's own favourites come first",
+               mergedFavourites(existing: [u("a")], perSpace: [[u("b")]]).map(\.lastPathComponent)
+                   == ["a", "b"])
+        assert("every space's grid is merged in, in space order",
+               mergedFavourites(existing: [], perSpace: [[u("a"), u("b")], [u("c")]])
+                   .map(\.lastPathComponent) == ["a", "b", "c"])
+        assert("a favourite in two spaces is kept once, at its first position",
+               mergedFavourites(existing: [], perSpace: [[u("a"), u("b")], [u("b"), u("c")]])
+                   .map(\.lastPathComponent) == ["a", "b", "c"])
+        assert("the merged grid keeps Arc's cap of twelve",
+               mergedFavourites(existing: (0..<9).map { u("e\($0)") },
+                                perSpace: [(0..<9).map { u("s\($0)") }]).count == favouritesCap)
+        assert("the cap keeps the profile's own favourites, not the spaces'",
+               mergedFavourites(existing: (0..<12).map { u("e\($0)") }, perSpace: [[u("s")]])
+                   .allSatisfy { $0.lastPathComponent.hasPrefix("e") })
+        assert("nothing to merge leaves the list alone",
+               mergedFavourites(existing: [u("a"), u("b")], perSpace: [[], []])
+                   .map(\.lastPathComponent) == ["a", "b"])
+        assert("an empty everything merges to nothing",
+               mergedFavourites(existing: [], perSpace: []).isEmpty)
+
+        // Moving a tab into a Space: appended, and never twice.
+        assert("a moved tab lands at the end of the target section",
+               appending(u("c"), to: [u("a"), u("b")]).map(\.lastPathComponent) == ["a", "b", "c"])
+        assert("moving a tab to a space it is already in changes nothing",
+               appending(u("a"), to: [u("a"), u("b")]).count == 2)
+        assert("a moved tab is the only thing in an empty space",
+               appending(u("a"), to: []).map(\.lastPathComponent) == ["a"])
+
+        // Reordering the footer dots.
+        assert("a dot dragged right lands after the dot it was dropped on",
+               reordered([1, 2, 3, 4], from: 0, to: 3) == [2, 3, 1, 4])
+        assert("a dot dragged left lands before it",
+               reordered([1, 2, 3, 4], from: 3, to: 1) == [1, 4, 2, 3])
+        assert("a dot dropped on itself does nothing", reordered([1, 2, 3], from: 1, to: 1) == [1, 2, 3])
+        assert("a dot dragged to the end goes to the end",
+               reordered([1, 2, 3], from: 0, to: 3) == [2, 3, 1])
+        assert("an out-of-range drag is refused rather than crashing",
+               reordered([1, 2, 3], from: 9, to: 0) == [1, 2, 3])
+
+        // The theme. What the editor's canvas, its "+"/"−" and its grain dial write down.
+        var themed = Space(name: "T", profileID: pid, colorHex: "#4CAF6E")
+        assert("a space that predates the gradient reads as the one colour it has",
+               themeColors(of: themed) == ["#4CAF6E"])
+        assert("a space with no colour at all has no stops to mix",
+               themeColors(of: Space(name: "T", profileID: pid)).isEmpty)
+        setThemeColors(["#4CAF6E", "#5A9BD5"], on: &themed)
+        assert("the list is what a space with several colours reads back",
+               themeColors(of: themed) == ["#4CAF6E", "#5A9BD5"])
+        assert("…and colorHex is kept as the first of them, for everything that knows one",
+               themed.colorHex == "#4CAF6E")
+        setThemeColors(["#4CAF6E", "#5A9BD5", "#E48FB1", "#E3C34A"], on: &themed)
+        assert("a fourth colour is refused rather than stored", themed.colors?.count == maxThemeColors)
+        setThemeColors([], on: &themed)
+        assert("clearing the colours clears both fields, not just the list",
+               themed.colors == nil && themed.colorHex == nil && themeColors(of: themed).isEmpty)
+
+        // The canvas is a wheel: angle is hue, distance from the centre is strength — black
+        assert("mid-grey reopens half-way out in its own range", themePoint(hex: "#808080").map { abs($0.x - 0.75) < 0.002 && abs($0.y - 0.5) < 0.002 } == true)
+        assert("invalid colours have no point", themePoint(hex: "sky") == nil)
+
+        // The grain dial: three quarters of a turn, clockwise from bottom-left, and turned
+        // by how far the finger sweeps rather than by where it lands.
+        assert("straight up is the middle of the sweep", dialAngle(0.5) == 0)
+        assert("the sweep's ends are a dead quarter apart at the bottom",
+               abs(dialAngle(1) - dialAngle(0) - dialSweep) < 0.001)
+        assert("a point straight up is at angle zero", dialRadians(dx: 0, dy: -1) == 0)
+        assert("…and one to the right is a quarter turn clockwise",
+               abs(dialRadians(dx: 1, dy: 0) - .pi / 2) < 0.001)
+        assert("a drawn angle and a measured one agree", [0, 0.25, 0.5, 0.75, 1].allSatisfy { v in
+            abs(dialRadians(dx: sin(dialAngle(v)), dy: -cos(dialAngle(v))) - dialAngle(v)) < 0.001
+        })
+        assert("a knob that has not been swept keeps its value",
+               dialTurn(from: 1, to: 1, value: 0.4) == 0.4)
+        assert("a sweep of the whole range turns the knob from one end to the other",
+               abs(dialTurn(from: dialAngle(0), to: dialAngle(0) + dialSweep / 2,
+                            value: 0) - 0.5) < 0.001)
+        assert("sweeping backwards turns it back",
+               abs(dialTurn(from: 0, to: -dialSweep / 4, value: 0.5) - 0.25) < 0.001)
+        assert("a sweep across the wrap takes the short way round, not the long one",
+               abs(dialTurn(from: 3.0, to: -3.0, value: 0.5) - (0.5 + (2 * .pi - 6) / dialSweep))
+                   < 0.001)
+        assert("sweeping past an end parks there rather than snapping to the other one",
+               dialTurn(from: 0, to: 3, value: 0.95) == 1 && dialTurn(from: 0, to: -3, value: 0.05) == 0)
+
+        // The swipe. A 300pt sidebar with three Spaces, standing in the middle one, unless
+        // an assertion says otherwise.
+        let w: CGFloat = 300
+        func swipe(_ steps: [(CGFloat, Swipe.Phase)], dt: Double = 1.0 / 60,
+                   count: Int = 3, index: Int = 1) -> (last: CGFloat?, commits: [Int]) {
+            var s = Swipe(), last: CGFloat?, commits: [Int] = []
+            for (dx, phase) in steps {
+                let r = s.feed(dx: dx, dt: dt, phase: phase, width: w, count: count, index: index)
+                last = r.offset
+                if let c = r.commit { commits.append(c) }
+            }
+            return (last, commits)
+        }
+        // Slow, so the flick rule never fires and the distance rule is what is being tested.
+        func slow(_ total: CGFloat, steps: Int = 20) -> [(CGFloat, Swipe.Phase)] {
+            [(0, .began)] + (0..<steps).map { _ in (total / CGFloat(steps), Swipe.Phase.changed) }
+                + [(0, .ended)]
+        }
+
+        assert("the strip tracks the fingers one for one",
+               swipe([(0, .began), (-30, .changed), (-30, .changed)]).last == -60)
+        assert("crossing the distance threshold stays under the fingers until release",
+               swipe([(0, .began), (-200, .changed)]).commits.isEmpty)
+        assert("a short slow drag springs back rather than switching",
+               swipe(slow(-w * 0.2, steps: 60), dt: 0.05).commits.isEmpty)
+        do {
+            var s = Swipe()
+            _ = s.feed(dx: 0, dt: 0, phase: .began, width: w, count: 2, index: 1, create: true)
+            let half = s.feed(dx: -w * 0.225, dt: 0.1, phase: .changed, width: w, count: 2, index: 1,
+                              create: true)
+            let ring = s.feed(dx: -w * 0.225, dt: 0.1, phase: .changed, width: w, count: 2, index: 1,
+                              create: true)
+            let solid = s.feed(dx: -w * 0.45, dt: 0.1, phase: .changed, width: w, count: 2, index: 1,
+                               create: true)
+            let released = s.feed(dx: 0, dt: 0.01, phase: .ended, width: w, count: 2, index: 1,
+                                  create: true)
+            let after = s.feed(dx: -w, dt: 0.1, phase: .momentum, width: w, count: 2, index: 1,
+                               create: true)
+            assert("a pull past the last space keeps the deliberate creation threshold",
+                   half.commit == nil && abs(half.pull - 0.5) < 0.001
+                       && abs(half.offset ?? 0) <= w * Swipe.bandCap)
+            assert("…a full ring is not yet a space: the circle still has to fill",
+                   ring.commit == nil && abs(ring.pull - 1) < 0.001)
+            assert("…a solid circle waits for release and ignores the momentum tail",
+                   solid.commit == nil && solid.pull == Swipe.pullFull && released.commit == 1 && after.commit == nil)
+            assert("…while the same pull with nothing to create only bands",
+                   Swipe.pull(-w * 0.5, width: w, count: 2, index: 1, create: false) == 0
+                       && Swipe.pull(-w * 0.5, width: w, count: 2, index: 0, create: true) == 0)
+        }
+        assert("past three tenths of the sidebar switches to the next space",
+               swipe(slow(-w * 0.4, steps: 60), dt: 0.05).commits == [1])
+        assert("dragging the other way goes to the previous space",
+               swipe(slow(w * 0.4, steps: 60), dt: 0.05).commits == [-1])
+        assert("a short fast flick commits on velocity alone",
+               swipe([(0, .began), (-20, .changed), (-20, .changed), (0, .ended)],
+                     dt: 1.0 / 120).commits == [1])
+        assert("a short flick back the way it came is a cancellation, not a commit",
+               swipe([(0, .began), (-60, .changed), (50, .changed), (0, .ended)],
+                     dt: 1.0 / 120).commits.isEmpty)
+        assert("the strip never travels further than one sidebar width",
+               swipe([(0, .began), (-2000, .changed)]).last == -w)
+
+        // Rubber band at the ends.
+        assert("the first space gives only a fraction of the travel rightwards",
+               swipe([(0, .began), (100, .changed)], index: 0).last == 30)
+        assert("and never past the cap",
+               swipe([(0, .began), (1000, .changed)], index: 0).last == w * Swipe.bandCap)
+        assert("the first space still tracks fully leftwards, where there is a space to go to",
+               swipe([(0, .began), (-100, .changed)], index: 0).last == -100)
+        assert("the last space rubber-bands leftwards",
+               swipe([(0, .began), (-100, .changed)], index: 2).last == -30)
+        assert("a rubber-banded gesture commits nothing, however far it went",
+               swipe(slow(1000, steps: 60), dt: 0.05, index: 0).commits.isEmpty)
+        assert("a lone space has nowhere to go and only ever bands",
+               swipe([(0, .began), (-500, .changed)], count: 1, index: 0).last == -w * Swipe.bandCap)
+
+        // Momentum, and one commit per gesture.
+        assert("momentum after the fingers leave moves nothing",
+               swipe([(0, .began), (-200, .changed), (0, .ended), (-400, .momentum)]).last == nil)
+        assert("a whole momentum tail switches space exactly once",
+               swipe([(0, .began), (-200, .changed), (0, .ended)]
+                       + Array(repeating: (-400, Swipe.Phase.momentum), count: 8),
+                     dt: 0.05).commits == [1])
+        var once = Swipe()
+        _ = once.feed(dx: 0, dt: 0, phase: .began, width: w, count: 3, index: 1)
+        assert("crossing the distance threshold keeps tracking",
+               once.feed(dx: -200, dt: 0.05, phase: .changed, width: w, count: 3, index: 1).commit == nil)
+        assert("fingers-up commits the destination exactly once",
+               once.feed(dx: 0, dt: 0, phase: .ended, width: w, count: 3, index: 1).commit == 1)
+        assert("a second fingers-up in the same gesture does not",
+               once.feed(dx: 0, dt: 0, phase: .ended, width: w, count: 3, index: 1).commit == nil)
+        assert("and the strip is not dragged any further either",
+               once.feed(dx: -99, dt: 0.05, phase: .changed, width: w, count: 3, index: 1).offset == nil)
+        assert("a new gesture re-arms it",
+               once.feed(dx: 0, dt: 0, phase: .began, width: w, count: 3, index: 1).offset == 0
+                   && once.armed)
+        assert("fingers up on an untouched strip springs back rather than committing",
+               swipe([(0, .began), (0, .ended)]).commits.isEmpty)
+        assert("travel is signed, so left then right cancels out",
+               swipe([(0, .began), (-30, .changed), (30, .changed)]).last == 0)
+        // The monitor only claims a gesture once it has a direction, which is several events
+        // after the `.began` that opened it — so the state machine is routinely handed a
+        // gesture that starts in the middle.
+        assert("a gesture that arrives without its beginning still tracks",
+               swipe([(-40, .changed), (-40, .changed), (-40, .changed)], dt: 0.05).last == -120)
+        assert("…and still commits on the same rule",
+               swipe([(-40, .changed), (-40, .changed), (-40, .changed), (0, .ended)],
+                     dt: 0.05).commits == [1])
+        // Coalesced events: a crawl's worth of travel delivered with no gap between samples,
+        // which without the floor reads as forty times the speed the fingers were going.
+        assert("a coalesced burst cannot fake a flick",
+               swipe([(0, .began), (-2, .changed), (-2, .changed), (0, .ended)],
+                     dt: 0.0001).commits.isEmpty)
+        assert("…while the same travel at a real frame rate is still just a crawl",
+               swipe([(0, .began), (-2, .changed), (-2, .changed), (0, .ended)],
+                     dt: 1.0 / 120).commits.isEmpty)
+
+        // A Space's tabs, kept alive behind the one being shown. See `Stash`.
+        func shown(_ rows: (String, TabKind)...) -> [(id: String, kind: TabKind)] {
+            rows.map { (id: $0.0, kind: $0.1) }
+        }
+        let open = shown(("fav", .favourite), ("pin", .pinned), ("t1", .today), ("t2", .today))
+        assert("leaving a Space puts its own tabs in the stash, in strip order",
+               Stash.leaving(open) == ["pin", "t1", "t2"])
+        assert("a favourite never enters a stash — the grid is the profile's, not the Space's",
+               !Stash.leaving(open).contains("fav"))
+        assert("coming back puts the same tabs back in the same order, behind the grid",
+               Stash.entering(shown(("fav", .favourite)), stashed: Stash.leaving(open))
+                   == open.map(\.id))
+        assert("a Space of nothing but favourites stashes nothing and comes back as itself",
+               Stash.leaving(shown(("fav", .favourite))).isEmpty
+                   && Stash.entering(shown(("fav", .favourite)), stashed: []) == ["fav"])
+
+        // The fingerprint: what says whether the stash still describes the Space on disk.
+        let folders = Data(#"{"entries":[]}"#.utf8)
+        func mark(_ today: [URL], _ pinned: [URL], _ shapes: [Data?] = [folders, nil]) -> String {
+            TabStore.fingerprint(tabURLs: today, pinnedTabURLs: pinned, shapes: shapes)
+        }
+        let asLeft = mark([u("t1"), u("t2")], [u("p1")])
+        assert("a Space nothing has touched fingerprints the same, so its stash comes back",
+               asLeft == mark([u("t1"), u("t2")], [u("p1")]))
+        assert("a page moved into the Space from another window drops the stash",
+               asLeft != mark([u("t1"), u("t2"), u("t3")], [u("p1")]))
+        assert("so does the same pages left in a different order",
+               asLeft != mark([u("t2"), u("t1")], [u("p1")]))
+        assert("a folder edited in the Library drops it too, with every url unchanged",
+               asLeft != mark([u("t1"), u("t2")], [u("p1")], [Data(#"{"e":1}"#.utf8), nil]))
+        assert("the two sections are not run together: pinning a tab is an edit",
+               mark([u("a")], []) != mark([], [u("a")]))
+        assert("a Space deleted from under the stash fingerprints as an empty one",
+               asLeft != mark([], [], [nil, nil]))
+
+        // And where Reveal lands once that switch has happened. A stash that failed its
+        // fingerprint was rebuilt from disk, so the tab the media tray named is gone.
+        assert("revealing a page a Space was keeping alive lands on that page",
+               TabStore.revealed("t1", strip: ["fav", "t1", "t2"], landing: "fav") == "t1")
+        assert("one torn down by a rebuild lands on the Space's landing row instead",
+               TabStore.revealed("t1", strip: ["fav", "t3"], landing: "t3") == "t3")
+        assert("and on nothing at all when the Space came back empty",
+               TabStore.revealed("t1", strip: [], landing: String?.none) == nil)
+
+        return out
+    }
+}

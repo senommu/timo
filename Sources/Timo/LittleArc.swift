@@ -1,0 +1,736 @@
+import AppKit
+import SwiftUI
+
+/// Little Timo (Arc's "Little Arc"): a link from another app opens in a small floating
+/// window with one page and one row of chrome, instead of landing as a tab in whatever
+/// window happened to be in front. The bet is that most links from Mail, Slack or Terminal
+/// are read once and closed — putting them in the sidebar makes the user tidy up after
+/// every message they read. ⌘W throws it away; "Open in ▸" is the one gesture that says "actually, keep this",
+/// and only then does it become a tab in a Space.
+///
+/// It is the same browser: the same profile, cookies, history and extensions. What it is
+/// not is a *window of the profile* — it restores no favourites, holds no Space, and is
+/// never written into the session (`TabStore.isLittle`), so closing it leaves nothing
+/// behind and quitting with three of them open does not bring three of them back.
+///
+/// ponytail: `TimoWindow` unchanged rather than a subclass — everything it does (holding
+/// the traffic lights on `Look.lightsCentre`, dragging by bare ground, Escape stopping a
+/// load) is exactly what this window wants, and Little Arc's own row is laid out to put
+/// its pill on that same line. A window is identified as a Little Arc by its store, not by
+/// its class.
+@MainActor enum LittleArc {
+
+    // MARK: - Routing
+
+    /// Where a url from another app goes.
+    enum Route: Equatable, Sendable {
+        case little
+        /// A tab in the window that is already open.
+        case tab
+        /// Nothing is open — the link is the reason to open a window at all.
+        case newWindow
+    }
+
+    /// The whole decision, as a pure function of the preference and whether there is an
+    /// ordinary window to add a tab to. `nonisolated` so `selfcheck --pure` can prove the
+    /// table without a window server.
+    ///
+    /// Little Arc does not care whether a window is open: it is a window of its own, and
+    /// Arc opens one either way. "Current Space" does — with nothing open there is no
+    /// current Space, and the link becomes the window's first tab.
+    nonisolated static func route(preferLittle: Bool, hasWindow: Bool) -> Route {
+        if preferLittle { return .little }
+        return hasWindow ? .tab : .newWindow
+    }
+
+    // MARK: - Opening
+
+    /// One url, one window. Called once per url, so three links arriving together are three
+    /// Little Arcs — which is what Arc does, and what "one page per window" means.
+    /// `url` is nil for a Little Arc opened with nothing in it — ⌘T from inside one, and
+    /// File ▸ New Little Arc Window (⌥⌘N), which come up empty with the search bar over the
+    /// page, the same as a new window does. `TabStore.init` is what opens that bar.
+    ///
+    /// ponytail: ⌥⌘N is an ordinary rebindable command, so it only fires while Timo is
+    /// frontmost. Arc's is system-wide. Ceiling: from another app you have to switch to Timo
+    /// first. Upgrade path is `RegisterEventHotKey` (Carbon, still supported, and the only
+    /// route that needs no permission at all) — deliberately not `CGEvent.tapCreate`, which
+    /// is a keylogger as far as the OS is concerned and costs the user an Accessibility or
+    /// Input Monitoring grant, which is far too much to ask for one shortcut.
+    ///
+    /// `isPrivate` is passed, never defaulted, by anything that floats a Little Arc off an
+    /// existing window — \u{2325}\u{2318}-click on a link or on a sidebar row. The window it
+    /// came out of may be a Private Window, and a Little Arc that quietly took the
+    /// persistent data store would write that page into history and keep its cookies: the
+    /// one thing that window exists not to do. Peek passes it for the same reason, and a
+    /// link from another app has no window to inherit from, so it takes the default.
+    @discardableResult
+    static func open(_ url: URL?, isPrivate: Bool = false, profileID: UUID? = nil) -> TabStore {
+        let id = profileID ?? ProfileManager.shared.active.id
+        return present(floatingStore(url, profileID: id, isPrivate: isPrivate))
+    }
+
+    /// Present a compact window for an external link or an explicit Little Timo action.
+    @discardableResult
+    private static func present(_ store: TabStore, focus: Bool = true) -> TabStore {
+        refreshDestination(for: store)
+        let window = TimoWindow(
+            contentRect: NSRect(x: 0, y: 0, width: Look.littleWidth, height: Look.littleHeight),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false)
+        window.title = WindowTitle.current(in: store)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        // Same trick as `Windows.open`: an empty compact toolbar gets AppKit's own idea of
+        // where the lights go near enough to `Look.lightsCentre` that the first frame does
+        // not jump before `centreTrafficLights` runs.
+        window.toolbar = NSToolbar(identifier: "TimoEmpty")
+        window.toolbarStyle = .unifiedCompact
+        window.tabbingMode = .disallowed
+        // A window made in code is `isReleasedWhenClosed` by default, which under ARC is an
+        // over-release: closing one crashed in `-[_NSWindowTransformAnimation dealloc]`,
+        // the close animation reaching a window that had already been freed. `SettingsWindow`
+        // turns it off for the same reason.
+        window.isReleasedWhenClosed = false
+        window.isOpaque = false
+        window.backgroundColor = NSColor.black.withAlphaComponent(0.001)
+        window.contentView = NSHostingView(rootView: LittleArcView()
+            .font(Look.text)
+            .spaceChrome(store)
+            .environmentObject(store)
+            .environmentObject(ProfileManager.shared))
+        // Centred, and cascading from there once there is more than one — deliberately no
+        // frame autosave: a Little Arc is not a window the user arranges, it is one that
+        // appears in the middle of the screen with the thing they clicked in it.
+        window.center()
+        // Two links from the same message must not land exactly on top of each other, and
+        // the tenth must not be off the bottom of the screen: the step is dropped as soon as
+        // the whole window would no longer fit, which starts the pile again from the centre.
+        // ponytail: not `cascadeTopLeft(from:)` — that puts the window *at* the point it is
+        // given, so handing it the last window's corner stacked the two exactly.
+        if let previous = windows.last, let screen = window.screen ?? NSScreen.main {
+            let step = Look.inset * 3
+            let next = NSPoint(x: previous.frame.minX + step, y: previous.frame.maxY - step)
+            let landing = NSRect(x: next.x, y: next.y - window.frame.height,
+                                 width: window.frame.width, height: window.frame.height)
+            if screen.visibleFrame.contains(landing) { window.setFrameTopLeftPoint(next) }
+        }
+
+        let delegate = Delegate(store)
+        keptDelegates.append(delegate)
+        window.delegate = delegate
+        store.window = window
+        store.applySpaceAppearance()
+        // `orderBack`, not merely `orderFront`, for the unfocused case: a window ordered to
+        // the front without the key still covers the page the user is reading, which is the
+        // whole of what they asked not to happen. It is a real window either way — in the
+        // Window menu, in Mission Control — just not one that arrived over anything.
+        if focus { window.makeKeyAndOrderFront(nil) } else { window.orderBack(nil) }
+        // The Window menu names what its toggle will do, and that just changed.
+        rebuild()
+        return store
+    }
+
+    // MARK: - One page, no furniture
+
+    /// The store behind a floating one-page window: no sidebar, no Space, nothing written
+    /// into the session. Shared with Peek, which is the same window with different chrome.
+    /// `url` is nil for one opened empty, and for one whose page is about to be `park`ed
+    /// back in from a snapshot.
+    ///
+    /// `isPrivate` is passed, never defaulted, by anything that floats over an existing
+    /// window: a Peek over a Private Window that quietly took the persistent data store
+    /// would write the peeked page into history and keep its cookies — the one thing that
+    /// window exists not to do. A Little Arc comes from another app, where there is no
+    /// window to inherit from, so it takes the default.
+    static func floatingStore(_ url: URL?, profileID: UUID, isPrivate: Bool = false) -> TabStore {
+        let store = TabStore(isPrivate: isPrivate, urls: url.map { [$0] } ?? [],
+                             profileID: profileID, isLittle: true)
+        // `WebCard` leaves its leading edge bare for a docked sidebar. There isn't one, so
+        // this is what gives the page the same gap on all four sides.
+        store.sidebarShown = false
+        return store
+    }
+
+    // MARK: - Which windows are ours
+
+    /// A Peek is built on the same one-page store, but it is not a Little Arc: its ⌘O means
+    /// "beside the tab I came from" rather than "hand this to a Space", and Window ▸ Hide
+    /// All Little Arc Windows has no business miniaturising something that is a child of the
+    /// window it floats over.
+    static var stores: [TabStore] { TabStore.all.filter { $0.isLittle && !Peek.owns($0) } }
+    static var windows: [NSWindow] { stores.compactMap(\.window) }
+
+    static func store(of window: NSWindow?) -> TabStore? {
+        guard let window else { return nil }
+        return stores.first { $0.window === window }
+    }
+
+    /// True while every Little Arc is up and on screen — which is what makes the menu item
+    /// say "Hide" rather than "Show". False with none open, so the item reads "Show".
+    static var allShowing: Bool {
+        let all = windows
+        return !all.isEmpty && all.allSatisfy { $0.isVisible && !$0.isMiniaturized }
+    }
+
+    /// Window ▸ Show / Hide All Little Arc Windows. Arc's item is a toggle, and so is this:
+    /// they come to the front together, or they all get out of the way together.
+    static func toggleAll() {
+        let all = windows
+        guard !all.isEmpty else { return }
+        if allShowing {
+            all.forEach { $0.miniaturize(nil) }
+            rebuild()
+        } else {
+            showAll()
+        }
+    }
+
+    /// The Dock's Show command always reveals; unlike the Window menu's toggle,
+    /// invoking it again must never minimize windows that are already visible.
+    static func showAll() {
+        let all = windows
+        guard !all.isEmpty else { return }
+        for window in all {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.orderFront(nil)
+        }
+        all.last?.makeKeyAndOrderFront(nil)
+        rebuild()
+    }
+
+    // MARK: - Open in ▸
+
+    /// The button's label, and the sentence VoiceOver reads off it: the Space this page
+    /// would land in, named. "Open in" bare is the answer for a profile with no Space to
+    /// name at all — `ensureSpaces` makes that unreachable in the app, and a button whose
+    /// label is a dangling "Open in " is not.
+    /// Pure, so the button, its ⌘O and the menu's tick cannot say different things.
+    nonisolated static func openInTitle(space name: String?) -> String {
+        let trimmed = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Open in" : "Open in " + trimmed
+    }
+
+    /// The whole label. A private Little Timo names the *window*, not a Space: Arc's
+    /// incognito has no Spaces, so there is nothing to choose between and nothing a Space's
+    /// name could honestly say. Naming one anyway was a lie the old button told — it read
+    /// "Open in Work" and the page then landed in a private window that has no Work.
+    /// Pure.
+    nonisolated static func openInTitle(space name: String?, isPrivate: Bool) -> String {
+        isPrivate ? "Open in Window" : openInTitle(space: name)
+    }
+
+    /// Whether a floating window's page may be handed to a given browser window. The two
+    /// kinds never mix: a page lifted out of a Private Window must not land somewhere that
+    /// writes it into history and keeps its cookies, and an ordinary page must not land in
+    /// a window that will throw it away when it closes. Pure.
+    nonisolated static func canHand(pageIsPrivate: Bool, windowIsPrivate: Bool) -> Bool {
+        pageIsPrivate == windowIsPrivate
+    }
+
+    /// What the hand-off announces. A private window has no Space to name and is not "the
+    /// browser window" either — it is the one window whose whole point is which window it
+    /// is. Pure.
+    nonisolated static func moved(to name: String?, isPrivate: Bool) -> String {
+        if isPrivate { return "Moved to the Private Window." }
+        return "Moved to " + (name ?? "the browser window") + "."
+    }
+
+    /// Which Space the button names, the menu ticks and ⌘O opens into: the one the browser
+    /// window is showing, else the one the profile was last left in, else its first — the
+    /// ladder `Spaces.pick` walks for a window that is being opened, because that is what
+    /// this page is about to become a tab in.
+    ///
+    /// `ids` is the profile's own order, which is the sidebar's, and this never re-orders
+    /// it: the menu reads like the Spaces menu rather than being shuffled around whichever
+    /// Space happens to be current. A Space that is no longer in the list — deleted while
+    /// the Little Arc stood open — is not an answer, so it falls through to one that is.
+    /// Pure.
+    nonisolated static func target(spaces ids: [UUID], showing: UUID?, last: UUID?) -> UUID? {
+        if let showing, ids.contains(showing) { return showing }
+        if let last, ids.contains(last) { return last }
+        return ids.first
+    }
+
+    /// The same, for a window that may be private. A private Little Timo has no Space to
+    /// land in whatever the profile holds — its target is a Private Window, and those are
+    /// spaceless — so the answer is nothing to name and nothing to choose. Pure.
+    nonisolated static func target(spaces ids: [UUID], showing: UUID?, last: UUID?,
+                                   isPrivate: Bool) -> UUID? {
+        isPrivate ? nil : target(spaces: ids, showing: showing, last: last)
+    }
+
+    /// `target`, against the profile's real Spaces — and against the right *kind* of
+    /// window: a private Little Timo is answered against the private windows, which have no
+    /// Spaces, so it comes back nil and never reads a Space list at all.
+    static func targetSpace(for store: TabStore) -> Space? {
+        guard !store.isPrivate else { return nil }
+        let spaces = ProfileManager.shared.ensureSpaces(for: store.profile)
+        let id = target(spaces: spaces.map(\.id),
+                        showing: Windows.current(in: store.profileID)?.currentSpaceID,
+                        last: TabStore.lastSpaceID(for: store.profileID),
+                        isPrivate: store.isPrivate)
+        return spaces.first { $0.id == id }
+    }
+
+    /// The toolbar label, ground, accents, and native light/dark appearance share one
+    /// destination snapshot. Refresh on focus and saved Space edits, never on hover.
+    static func refreshDestination(for store: TabStore) {
+        let destination = targetSpace(for: store)
+        if store.littleDestinationSpace != destination {
+            store.littleDestinationSpace = destination
+        }
+        store.applySpaceAppearance()
+    }
+
+    /// ⌘O and a click on the button's label: the Space the button is naming, or — for a
+    /// private one — the Private Window it names instead.
+    static func openInCurrentSpace(_ store: TabStore) {
+        move(store, to: targetSpace(for: store))
+    }
+
+    /// Hand the page over to an ordinary window and close the Little Arc. The tab arrives on
+    /// the same page with the same back/forward list and scroll offset — `park` + `resume`
+    /// is the same pair a Space switch goes through — rather than as a fresh load of the
+    /// url, which would lose wherever the user had clicked to.
+    ///
+    /// ponytail: the page is re-created in the target window rather than the live `Tab`
+    /// being moved between stores. Moving it would keep the WebContent process, but every
+    /// callback on that tab is bound to the store it was made in, so it is a rebind and a
+    /// hand-off either way. Ceiling: the page reloads from its interaction state, so an
+    /// unsubmitted form goes with it but a video restarts.
+    static func move(_ store: TabStore, to space: Space?) {
+        // Nothing to hand over yet — ⌘O pressed before the first navigation committed. The
+        // window stays, because closing it here would throw the link away.
+        guard let page = page(of: store) else { return }
+        // With no browser window the url goes into the one being opened for it, so it comes
+        // up on the page instead of behind the new-tab bar; an existing window gets a tab.
+        //
+        // The window has to be the same kind as this one — see `canHand`. A private page
+        // goes to a Private Window of the same profile and, if none is up, to a fresh one;
+        // it never falls through to an ordinary window, which would write the page into
+        // history and keep its cookies.
+        let isPrivate = store.isPrivate
+        let profile: Profile
+        if let space, !isPrivate {
+            let manager = ProfileManager.shared
+            guard let owner = manager.profiles.first(where: { $0.id == space.profileID }),
+                  manager.spaces(for: owner.id).contains(where: { $0.id == space.id }) else { return }
+            profile = owner
+        } else {
+            profile = store.profile
+        }
+        // The selected Space owns the destination's profile and website data, even when
+        // the floating page came from another profile.
+        let existing = Windows.current(in: profile.id, isPrivate: isPrivate)
+        let target = existing ?? Windows.open(isPrivate: isPrivate, urls: [page.url],
+                                              profile: profile, space: space)
+        // A Private Window holds no Space, and `switchTo` refuses on one — so it is not
+        // asked, rather than asked and quietly ignored.
+        if let space, !isPrivate, target.currentSpaceID != space.id { target.switchTo(space: space) }
+        let moved = existing == nil
+            ? (target.tabs.first { $0.currentURL == page.url } ?? target.newBlankTab())
+            : target.newBlankTab()
+        hand(page, into: moved, of: target, from: store,
+             saying: LittleArc.moved(to: space?.name, isPrivate: isPrivate))
+        store.window?.performClose(nil)
+    }
+
+    /// What a floating window is showing, as the pair `Tab.park` wants. Nil before the first
+    /// navigation committed. Peek asks the same question of its own store.
+    static func page(of store: TabStore) -> (url: URL, snapshot: Parked)? {
+        guard let tab = store.active, let url = tab.currentURL else { return nil }
+        return (url, tab.snapshot)
+    }
+
+    /// Put `page` into a tab of an ordinary window and go there. The two halves of the
+    /// hand-off that neither caller varies — Peek's ⌘O differs only in *where* the tab is
+    /// placed, which is why that is the caller's job and this is not.
+    static func hand(_ page: (url: URL, snapshot: Parked), into moved: Tab,
+                     of target: TabStore, from store: TabStore, saying: String) {
+        let snapshot = store.profileID == moved.profileID ? page.snapshot : page.snapshot.withoutInteractionState
+        moved.park(url: page.url, snapshot)
+        moved.resume()
+        target.current = moved.id
+        target.window?.makeKeyAndOrderFront(nil)
+        axAnnounce(saying)
+    }
+
+    /// ⌥⌘O and the button: the Spaces this page can be dropped into, the current one ticked.
+    /// ponytail: an NSMenu popped up by hand rather than a SwiftUI `Menu`, so the button and
+    /// the shortcut open exactly the same list — SwiftUI has no way to open a `Menu` from a
+    /// key press.
+    static func pickSpace(_ store: TabStore) {
+        // A private Little Timo has no Spaces to pick between, and its button draws no
+        // chevron. ⌥⌘O still reaches here, and the one thing there is to do is the thing
+        // ⌘O does — better than a menu with nothing in it, or a key that does nothing.
+        guard !store.isPrivate else { return openInCurrentSpace(store) }
+        guard let window = store.window else { return }
+        // Under the bar's trailing end, which is where the button is. In screen coordinates
+        // (`in: nil`) rather than the content view's: an NSHostingView is flipped and the
+        // same arithmetic would have put the menu at the other end of the window.
+        let frame = window.frame
+        let at = NSPoint(x: frame.maxX - Look.inset - menuWidth,
+                         y: frame.maxY - Look.littleTopInset - Look.pillHeight)
+        spaceMenu(store).popUp(positioning: nil, at: at, in: nil)
+    }
+
+    /// How far left of the window's trailing edge the menu is hung, so it drops under the
+    /// button rather than off the side of the screen. ponytail: a number, not the button's
+    /// measured frame — reading that back out of SwiftUI is an anchor preference and a
+    /// coordinate space for one popover position. AppKit clamps it to the screen anyway.
+    private static let menuWidth: CGFloat = 180
+
+    static func spaceMenu(_ store: TabStore) -> NSMenu {
+        // Titled, because an untitled NSMenu is one VoiceOver announces as "menu": this is
+        // the same sentence the button carries.
+        let menu = NSMenu(title: "Open in")
+        // Spaces only. There is no "Open in Window" row any more: a browser window is always
+        // in a Space, so "put this in a window" and "put this in a Space" are the same
+        // question, and the answer this window is offering is which Space. Include other
+        // profiles too, in the same order as the sidebar's Space strip.
+        let showing = targetSpace(for: store)?.id
+        let spaces = ProfileManager.shared.allSpaces
+        // Every row hands the page to an ordinary window, which is what this menu is for;
+        // a private store never gets here (`pickSpace` answers it before this is built).
+        for space in spaces {
+            let row = entry(space.name) { move(store, to: space) }
+            // The Space's own glyph, as the sidebar and the Spaces menu draw it. The
+            // description is what a screen reader reads, so the row is not "image, Work".
+            row.image = Spaces.iconImage(space.icon ?? "cloud", description: space.name)
+            row.state = space.id == showing ? .on : .off
+            menu.addItem(row)
+        }
+        return menu
+    }
+
+    /// NSMenuItem needs an ObjC target and does not retain it. Menu.swift's version of this
+    /// is private to that file, and one item type is not worth exporting.
+    private static func entry(_ title: String, _ run: @escaping () -> Void) -> NSMenuItem {
+        let act = MenuAction(run)
+        let item = NSMenuItem(title: title, action: #selector(MenuAction.fire), keyEquivalent: "")
+        item.target = act
+        item.representedObject = act // NSMenuItem.target is weak; the menu owns its action.
+        return item
+    }
+
+    private static var keptDelegates: [Delegate] = []
+
+    /// The closure behind one of those items.
+    @MainActor private final class MenuAction: NSObject {
+        let run: () -> Void
+        init(_ run: @escaping () -> Void) { self.run = run }
+        @objc func fire() { run() }
+    }
+
+    // MARK: - Keys
+
+    /// ⌘O and ⌥⌘O inside a Little Arc, taken before the global registry sees them: ⌘O is
+    /// Open File everywhere else in Timo, so this is a window-local override rather than two
+    /// more rebindable commands competing for the same key. ⌘W is not here — it is
+    /// `TabStore.closeOrArchive`, so the menu item and the key cannot disagree.
+    /// Returns true when the key was ours. Wired in main.swift, ahead of `Keybindings`.
+    /// The modifier test comes first: this runs on every key the app sees, and all but a
+    /// handful carry no ⌘ at all.
+    static func handleKey(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard event.type == .keyDown, mods.contains(.command),
+              event.charactersIgnoringModifiers?.lowercased() == "o",
+              let store = store(of: NSApp.keyWindow) else { return false }
+        switch mods {
+        case [.command]:            openInCurrentSpace(store)
+        case [.command, .option]:   pickSpace(store)
+        default:                    return false
+        }
+        return true
+    }
+
+    // MARK: - Window bookkeeping
+
+    /// Everything `Windows.WindowDelegate` does that applies here: take the page down,
+    /// forget the store, and keep the lights on the line through a resize. Nothing is
+    /// saved — a Little Arc is not in the session.
+    private final class Delegate: NSObject, NSWindowDelegate {
+        let store: TabStore
+        init(_ store: TabStore) { self.store = store }
+
+        @MainActor private func recentre() { (store.window as? TimoWindow)?.centreTrafficLights() }
+        func windowDidResize(_ n: Notification) { recentre() }
+        func windowDidEndLiveResize(_ n: Notification) { recentre() }
+        func windowDidBecomeKey(_ n: Notification) { recentre() }
+        func windowDidResignKey(_ n: Notification) { recentre() }
+        func windowWillClose(_ n: Notification) {
+            MainActor.assumeIsolated {
+                store.clearSuggestions()
+                store.palette = nil
+                store.tabs.forEach { $0.tearDown() }
+                Library.shared.forgetPrivateQuery(in: store)
+                TabStore.all.removeAll { $0 === store }
+                LittleArc.keptDelegates.removeAll { $0 === self }
+                rebuild()
+            }
+        }
+    }
+
+    // MARK: - check
+
+    /// The routing table and the bar's geometry, proved offline.
+    nonisolated static func check() -> [(String, Bool)] {
+        [
+            ("a link opens a Little Arc when that is the preference, window or no window",
+             route(preferLittle: true, hasWindow: true) == .little
+                && route(preferLittle: true, hasWindow: false) == .little),
+            ("\u{201C}Current Space\u{201D} with a window open adds a tab to it",
+             route(preferLittle: false, hasWindow: true) == .tab),
+            ("\u{201C}Current Space\u{201D} with nothing open makes the window it needs",
+             route(preferLittle: false, hasWindow: false) == .newWindow),
+            ("the preference is the only thing that can choose Little Arc",
+             route(preferLittle: false, hasWindow: true) != .little
+                && route(preferLittle: false, hasWindow: false) != .little),
+            ("Little Arc never falls back to a tab",
+             route(preferLittle: true, hasWindow: true) != .tab),
+            ("the window is Arc's size", Look.littleWidth == 1000 && Look.littleHeight == 700),
+            ("its bar puts the pill's centre on the traffic lights' line",
+             Look.littleTopInset + Look.pillHeight / 2 == Look.lightsCentre),
+            ("the pill is the sidebar's pill, at the sidebar's height",
+             Look.pillHeight == Look.rowHeight),
+        ] + openIn()
+    }
+
+    /// "Open in ⟨Space⟩": the label, and the rule that decides which Space it names.
+    nonisolated static func openIn() -> [(String, Bool)] {
+        let (work, personal, gone) = (UUID(), UUID(), UUID())
+        let both = [work, personal]
+        return [
+            ("the button names the Space the page would land in",
+             openInTitle(space: "Work") == "Open in Work"),
+            ("a Space named with spaces around it is still named cleanly",
+             openInTitle(space: "  Work  ") == "Open in Work"),
+            ("no Space to name leaves no dangling preposition",
+             openInTitle(space: nil) == "Open in"),
+            ("\u{2026}and neither does a Space whose name is blank",
+             openInTitle(space: "   ") == "Open in"),
+            ("the browser window's Space is the one offered",
+             target(spaces: both, showing: personal, last: work) == personal),
+            ("with no window open, the Space the profile was last left in",
+             target(spaces: both, showing: nil, last: personal) == personal),
+            ("with neither, the profile's first Space",
+             target(spaces: both, showing: nil, last: nil) == work),
+            ("a Space deleted while the Little Timo stood open is not offered",
+             target(spaces: both, showing: gone, last: personal) == personal),
+            ("\u{2026}and neither is a stale last-used one",
+             target(spaces: both, showing: nil, last: gone) == work),
+            ("a profile with no Spaces at all names none",
+             target(spaces: [], showing: work, last: personal) == nil),
+            ("the menu keeps the profile's own order, whichever Space is current",
+             target(spaces: both, showing: personal, last: nil) == personal
+                && both == [work, personal]),
+
+            // A private Little Timo. Arc's incognito holds no Space, so the whole of
+            // "which Space?" is the wrong question — and answering it anyway named one the
+            // page never reached.
+            ("a private Little Timo names no Space, whatever the profile holds",
+             target(spaces: both, showing: personal, last: work, isPrivate: true) == nil),
+            ("…and an ordinary one is unaffected by the same call",
+             target(spaces: both, showing: personal, last: work, isPrivate: false) == personal),
+            ("…so its button names the window instead",
+             openInTitle(space: nil, isPrivate: true) == "Open in Window"),
+            ("…and says so even if a Space name is handed to it anyway",
+             openInTitle(space: "Work", isPrivate: true) == "Open in Window"),
+            ("an ordinary one still names its Space",
+             openInTitle(space: "Work", isPrivate: false) == "Open in Work"),
+            ("a private page may be handed to a Private Window",
+             canHand(pageIsPrivate: true, windowIsPrivate: true)),
+            ("…and never to an ordinary one, which would write it into history",
+             !canHand(pageIsPrivate: true, windowIsPrivate: false)),
+            ("an ordinary page may be handed to an ordinary window",
+             canHand(pageIsPrivate: false, windowIsPrivate: false)),
+            ("…and never to a Private Window, which would throw it away",
+             !canHand(pageIsPrivate: false, windowIsPrivate: true)),
+            ("the hand-off names the Space it went to",
+             moved(to: "Work", isPrivate: false) == "Moved to Work."),
+            ("…the window when there is no Space to name",
+             moved(to: nil, isPrivate: false) == "Moved to the browser window."),
+            ("…and the Private Window by name, never a Space",
+             moved(to: "Work", isPrivate: true) == "Moved to the Private Window."),
+        ]
+    }
+}
+
+extension TabStore {
+    /// ⌘W and File ▸ Archive Tab. Arc archives the tab into the sidebar; a Little Arc has no
+    /// sidebar to archive into and no second tab to fall back on, so the window goes instead.
+    /// One definition, so the menu item and the key equivalent cannot disagree about it.
+    func closeOrArchive() {
+        // ⌘W with rows ticked archives all of them — the selection is what "the tab" means
+        // while it stands. See Selection.swift.
+        if !selection.isEmpty { archiveSelection(); return }
+        // Nothing showing — every tab archived or closed — and ⌘W again: the window is the
+        // only thing left to close, so it closes, as Arc's does. A Little Timo closes on
+        // the first ⌘W because its one tab is the window.
+        if isLittle || active == nil { window?.performClose(nil) } else { archiveWithToast() }
+    }
+}
+
+// MARK: - The window
+
+/// A Little Timo window: one themed toolbar above an edge-to-edge document.
+struct LittleArcView: View {
+    @EnvironmentObject var store: TabStore
+    @EnvironmentObject private var profiles: ProfileManager
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ZStack {
+            WindowGlass()
+            SpaceGround()
+            VStack(spacing: 0) {
+                LittleArcBar()
+                    .padding(.bottom, Look.littleTopInset)
+                WebCard(topGap: 0, edgeToEdge: true)
+            }
+            // Last, so ⌘L's bar composites over the bar as well as the page.
+            if let mode = store.palette {
+                PaletteView(mode: mode) { store.palette = nil }
+                    .transition(.opacity)
+            }
+        }
+        // `.fullSizeContentView` still leaves SwiftUI a titlebar-sized safe area, which
+        // would push the bar below the traffic lights instead of around them.
+        .ignoresSafeArea()
+        .animation(reduceMotion ? nil : Look.appear, value: store.palette == nil)
+        .onAppear { LittleArc.refreshDestination(for: store) }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            LittleArc.refreshDestination(for: store)
+        }
+        .onChange(of: profiles.spacesRevision) { LittleArc.refreshDestination(for: store) }
+        .onChange(of: profiles.profiles) { LittleArc.refreshDestination(for: store) }
+        .timoMotionPolicy()
+        .environmentObject(store.spaceGesture)
+        .background { WindowTitleSync() }
+    }
+}
+
+/// Little Arc's one row of chrome: traffic lights, a profile/address field, and
+/// "Open in ▸". Laid out so the pill's centre lands
+/// on `Look.lightsCentre` — the lights are the row, the same way they are in the sidebar.
+struct LittleArcBar: View {
+    @EnvironmentObject var store: TabStore
+
+    var body: some View {
+        HStack(spacing: Look.inset) {
+            Spacer().frame(width: 62)          // traffic lights
+            AddressPill(tab: store.active, showsProfile: true)
+            OpenInButton()
+                .layoutPriority(1)
+        }
+        .font(Look.icon)
+        .foregroundStyle(Look.inkSecondary)
+        .padding(.horizontal, Look.inset)
+        .padding(.top, Look.littleTopInset)
+        .frame(height: Look.littleTopInset + Look.pillHeight, alignment: .top)
+        // The bar is this window's title bar, the way the sidebar is the browser window's.
+        .background(WindowDragArea())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Little Timo")
+    }
+}
+
+/// Keep the host at the field's true center while reserving enough room on both
+/// sides for the wider of the profile badge and the live page actions.
+struct LittleArcAddressLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let side = max(sizes[0].width, sizes[2].width) + Look.pillGlyphGap
+        let minimum = side * 2 + Look.control
+        return CGSize(width: max(minimum, proposal.width ?? side * 2 + sizes[1].width),
+                      height: sizes.map(\.height).max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let leading = subviews[0].sizeThatFits(.unspecified)
+        let trailing = subviews[2].sizeThatFits(.unspecified)
+        let side = max(leading.width, trailing.width) + Look.pillGlyphGap
+        subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading,
+                          proposal: ProposedViewSize(leading))
+        subviews[1].place(at: CGPoint(x: bounds.midX, y: bounds.midY), anchor: .center,
+                          proposal: ProposedViewSize(width: max(0, bounds.width - side * 2), height: bounds.height))
+        subviews[2].place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing,
+                          proposal: ProposedViewSize(trailing))
+    }
+}
+
+/// "Open in ⟨Space⟩ ⌄": the one way a Little Arc's page becomes a tab you keep. The label
+/// names the Space the page would land in — the one the browser window is showing — and
+/// pressing it puts the tab there; the chevron opens the list of every saved Space,
+/// with that one ticked. ⌘O and ⌥⌘O are the same two things from the keyboard.
+///
+/// One pill with two halves: the label moves the page and the chevron chooses a Space.
+private struct OpenInButton: View {
+    @Environment(\.spaceChromeTheme) private var chromeTheme
+    @EnvironmentObject var store: TabStore
+    @State private var hovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var title: String {
+        LittleArc.openInTitle(space: store.littleDestinationSpace?.name, isPrivate: store.isPrivate)
+    }
+    private var named: String {
+        store.isPrivate ? "a Private Window" : (store.littleDestinationSpace?.name ?? "a Space")
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button { LittleArc.openInCurrentSpace(store) } label: {
+                HStack(spacing: Look.pillGlyphGap) {
+                    Text(title).font(Look.heading).lineLimit(1).truncationMode(.middle)
+                    Text("⌘O").font(Look.footnote.weight(.semibold))
+                        .padding(.horizontal, Look.captionGap)
+                        .padding(.vertical, 2)
+                        .background(.white.opacity(0.1), in: .rect(cornerRadius: 4))
+                        .accessibilityHidden(true)
+                }
+                    .padding(.leading, Look.rowInset)
+                    .padding(.trailing, store.isPrivate ? Look.rowInset : Look.captionGap)
+                    .frame(height: Look.pillHeight)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityHint("Moves this page into \(named).")
+            // No chevron on a private one: Arc's incognito has no Spaces, so there is
+            // nothing to choose and a menu with one row in it would be a lie about that.
+            if !store.isPrivate {
+                Rectangle().fill(.white.opacity(0.16)).frame(width: 1, height: Look.sectionGap)
+                    .accessibilityHidden(true)
+                Button { LittleArc.pickSpace(store) } label: {
+                    Image(systemName: "chevron.down").font(Look.caption)
+                        .padding(.leading, Look.captionGap)
+                        .padding(.trailing, Look.rowInset)
+                        .frame(height: Look.pillHeight)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Choose a Space")
+                .accessibilityHint("Lists every Space this page can be opened in.")
+            }
+        }
+        .foregroundStyle(.white)
+        .background {
+            chromeTheme.bubble.overlay(hovering ? Color.white.opacity(0.1) : .clear)
+        }
+        .clipShape(.rect(cornerRadius: Look.pillRadius))
+        .animation(reduceMotion ? nil : Look.quick, value: hovering)
+        .onHover { hovering = $0 }
+        .help(store.isPrivate
+              ? "\(title) (\u{2318}O)"
+              : "\(title) (\u{2318}O), or pick another Space (\u{2325}\u{2318}O)")
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
+        .accessibilityActions {
+            if !store.isPrivate {
+                Button("Choose a Space") { LittleArc.pickSpace(store) }
+            }
+        }
+    }
+}

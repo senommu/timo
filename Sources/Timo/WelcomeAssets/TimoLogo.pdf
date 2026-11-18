@@ -1,0 +1,46 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 620 582] /Resources << >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 309 >>
+stream
+q
+1 0 0 -1 -202 832 cm
+0.643137 0.658824 0.686275 rg
+264 590 m
+225 590 204 568 204 530 c
+204 389 353 252 512 252 c
+671 252 820 389 820 530 c
+820 568 799 590 760 590 c
+h
+436 622 m
+588 622 l
+639 622 666 665 666 724 c
+666 783 639 830 588 830 c
+436 830 l
+385 830 358 783 358 724 c
+358 665 385 622 436 622 c
+h
+f
+Q
+endstream
+endobj
+xref
+0 5
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000219 00000 n 
+trailer
+<< /Size 5 /Root 1 0 R >>
+startxref
+578
+%%EOF

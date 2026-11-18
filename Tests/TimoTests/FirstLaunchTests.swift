@@ -1,0 +1,74 @@
+import XCTest
+@testable import timo
+
+@MainActor final class FirstLaunchTests: XCTestCase {
+    func testAIIsOptInAndOnboardingExplainsItBeforeImport() {
+        TestEnvironment.prepare()
+        let previous = UserDefaults.timo.object(forKey: "appleAI")
+        defer {
+            if let previous { UserDefaults.timo.set(previous, forKey: "appleAI") }
+            else { UserDefaults.timo.removeObject(forKey: "appleAI") }
+        }
+        UserDefaults.timo.removeObject(forKey: "appleAI")
+        XCTAssertFalse(BrowserAI.enabled)
+        XCTAssertFalse(AppleAI.enabled)
+        for feature in AIFeature.allCases { XCTAssertFalse(BrowserAI.ready(for: feature)) }
+        XCTAssertFalse(AppleAI.ready)
+        let labels = WelcomeStep.allCases.map(\.label)
+        XCTAssertEqual(labels, ["Welcome", "Your tabs", "Your Spaces", "Search", "AI features", "Bring your browser", "Ready"])
+        AppleAI.enabled = true
+        XCTAssertTrue(BrowserAI.enabled, "An explicit existing opt-in must survive onboarding")
+    }
+    private func fixture() throws -> (UserDefaults, URL) {
+        let name = "timo-welcome-tests-\(UUID())"
+        let defaults = UserDefaults(suiteName: name)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock {
+            UserDefaults.dropScratchSuite(name)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return (defaults, directory)
+    }
+
+    func testActualLogoAndScreenshotsAreBundledAndReadable() {
+        let images = [WelcomeArtwork.icon, WelcomeArtwork.logo, WelcomeArtwork.search, WelcomeArtwork.spaces]
+            + Search.builtIn.map(WelcomeArtwork.engineIcon)
+        for image in images {
+            XCTAssertGreaterThan(image.size.width, 0)
+            XCTAssertGreaterThan(image.size.height, 0)
+            XCTAssertTrue(image.isValid)
+        }
+    }
+
+    func testFreshInstallationResumesUntilFinishedThenNeverRepeats() throws {
+        let (defaults, directory) = try fixture()
+        let first = FirstLaunchState(defaults: defaults)
+        XCTAssertTrue(first.prepare(directory: directory))
+        // Normal browser startup writes these while the welcome is still on screen.
+        try Data("[]".utf8).write(to: directory.appendingPathComponent("profiles.json"))
+        XCTAssertTrue(FirstLaunchState(defaults: defaults).prepare(directory: directory))
+        first.complete()
+        XCTAssertFalse(FirstLaunchState(defaults: defaults).prepare(directory: directory))
+    }
+
+    func testExistingInstallationSkipsWelcomeWithoutChangingBrowsingData() throws {
+        for filename in ["profiles.json", "timo.db", "session.json", "spaces.json"] {
+            let (defaults, directory) = try fixture()
+            let data = Data("existing browsing data".utf8)
+            let file = directory.appendingPathComponent(filename)
+            try data.write(to: file)
+            XCTAssertFalse(FirstLaunchState(defaults: defaults).prepare(directory: directory), filename)
+            XCTAssertEqual(try Data(contentsOf: file), data)
+        }
+    }
+
+    func testMissingDirectoryIsFreshButUnreadableStorageIsNot() throws {
+        let (defaults, directory) = try fixture()
+        XCTAssertTrue(FirstLaunchState(defaults: defaults).prepare(directory: directory.appendingPathComponent("new")))
+        let (otherDefaults, other) = try fixture()
+        let file = other.appendingPathComponent("not-a-directory")
+        try Data().write(to: file)
+        XCTAssertFalse(FirstLaunchState(defaults: otherDefaults).prepare(directory: file))
+    }
+}

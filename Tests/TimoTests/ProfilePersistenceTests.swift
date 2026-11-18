@@ -1,0 +1,341 @@
+import XCTest
+@testable import timo
+
+@MainActor final class ProfilePersistenceTests: XCTestCase {
+    private func manager() throws -> ProfileManager {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return ProfileManager(directory: directory, sandboxed: true)
+    }
+
+    private func blockList(_ manager: ProfileManager) throws -> URL {
+        let file = manager.directory.appendingPathComponent("profiles.json")
+        let backup = manager.directory.appendingPathComponent("profiles.backup")
+        try FileManager.default.moveItem(at: file, to: backup)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+        return backup
+    }
+
+    private func unblockList(_ manager: ProfileManager, backup: URL) throws {
+        let file = manager.directory.appendingPathComponent("profiles.json")
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.moveItem(at: backup, to: file)
+    }
+
+    func testFailedProfileEditsRemainVisibleAndRetrySavesTheLatestState() throws {
+        let manager = try manager()
+        let backup = try blockList(manager)
+        let committed = try Data(contentsOf: backup)
+        let profile = manager.create(name: "Draft")
+        manager.rename(profile.id, to: "Latest name")
+        manager.setColor("#123456", for: profile.id)
+        manager.active = profile
+        XCTAssertTrue(manager.hasUnsavedProfileChanges)
+        XCTAssertEqual(manager.saveFailures.count, 1)
+        XCTAssertEqual(manager.saveFailures.first?.canRetry, true)
+        XCTAssertNotNil(manager.saveFailures.first?.details)
+        manager.dismissSaveFailure(.profiles)
+        XCTAssertEqual(manager.saveFailures.count, 1)
+        XCTAssertFalse(manager.retryProfileSave())
+        XCTAssertTrue(manager.hasUnsavedProfileChanges)
+        XCTAssertEqual(try Data(contentsOf: backup), committed)
+
+        try unblockList(manager, backup: backup)
+        XCTAssertTrue(manager.retryProfileSave())
+        XCTAssertFalse(manager.hasUnsavedProfileChanges)
+        XCTAssertTrue(manager.saveFailures.isEmpty)
+        let reloaded = ProfileManager(directory: manager.directory, sandboxed: true)
+        XCTAssertEqual(reloaded.active.id, profile.id)
+        XCTAssertEqual(reloaded.active.name, "Latest name")
+        XCTAssertEqual(reloaded.active.colorHex, "#123456")
+    }
+
+    func testBothDeletionPathsRemoveOnlyTheDeletedProfilesPasswordPreferences() async throws {
+        TestEnvironment.prepare()
+        for asynchronous in [false, true] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let manager = ProfileManager(directory: directory, sandboxed: false)
+            let victim = manager.create(name: "Disposable"), survivor = manager.create(name: "Keep")
+            let keys = ["passwordsLastUsed", "passwordsNeverSaved"]
+            defer {
+                for base in keys { for profile in [victim, survivor] {
+                    UserDefaults.timo.removeObject(forKey: ProfileManager.defaultsKey(base, profile.id))
+                } }
+            }
+            for base in keys { for profile in [victim, survivor] {
+                UserDefaults.timo.set(["fixture"], forKey: ProfileManager.defaultsKey(base, profile.id))
+            } }
+            let deleted = if asynchronous { await manager.deleteAsync(victim.id) } else { manager.delete(victim.id) }
+            XCTAssertTrue(deleted)
+            for base in keys {
+                XCTAssertNil(UserDefaults.timo.object(forKey: ProfileManager.defaultsKey(base, victim.id)))
+                XCTAssertNotNil(UserDefaults.timo.object(forKey: ProfileManager.defaultsKey(base, survivor.id)))
+            }
+        }
+    }
+
+    func testFailedDeletionDoesNotBecomeAPendingDeleteOnRetry() throws {
+        let manager = try manager()
+        let victim = manager.create(name: "Keep me")
+        let database = ProfileManager.dbURL(for: victim.id, in: manager.directory)
+        try Data("keep database".utf8).write(to: database)
+        let backup = try blockList(manager)
+        XCTAssertFalse(manager.delete(victim.id))
+        XCTAssertFalse(manager.hasUnsavedProfileChanges)
+        XCTAssertFalse(manager.saveFailures.isEmpty)
+        XCTAssertEqual(manager.saveFailures.first?.canRetry, false)
+        try unblockList(manager, backup: backup)
+        XCTAssertTrue(manager.retryProfileSave())
+        XCTAssertTrue(manager.profiles.contains { $0.id == victim.id })
+        XCTAssertEqual(try Data(contentsOf: database), Data("keep database".utf8))
+        XCTAssertTrue(manager.delete(victim.id))
+        XCTAssertTrue(manager.saveFailures.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: database.path))
+    }
+
+    func testExplicitDeletionRemovesOnlyThatProfilesRecoveryCopies() throws {
+        let manager = try manager()
+        let victim = manager.create(name: "Delete recovered data")
+        let survivor = manager.active.id
+        let archive = manager.directory.appendingPathComponent("Session Recovery/launch")
+        try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
+        var removed: [URL] = []
+        for id in [victim.id, survivor] {
+            for primary in [ProfileManager.sessionURL(for: id, in: manager.directory),
+                            ProfileManager.spacesURL(for: id, in: manager.directory),
+                            Suspension.SpaceState.url(for: id, in: manager.directory)] {
+                for file in [primary, primary.appendingPathExtension("previous"),
+                             primary.appendingPathExtension("damaged-" + UUID().uuidString),
+                             archive.appendingPathComponent(primary.lastPathComponent),
+                             archive.appendingPathComponent(primary.lastPathComponent + ".previous")] {
+                    try Data("private profile history".utf8).write(to: file)
+                    if id == victim.id { removed.append(file) }
+                }
+            }
+        }
+        XCTAssertTrue(manager.delete(victim.id))
+        for file in removed { XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), file.path) }
+        let kept = ProfileManager.sessionURL(for: survivor, in: manager.directory).appendingPathExtension("previous")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: archive.appendingPathComponent(kept.lastPathComponent).path))
+    }
+
+    func testProfilePreferenceCleanupRemovesArchiveAndEverySpaceShapeOnlyForThatProfile() throws {
+        let domain = "timo.profile-cleanup.test.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { UserDefaults.dropScratchSuite(domain) }
+        for victim in [UUID(), ProfileManager.defaultID] {
+            let survivor = UUID()
+            let bases = ["archivedTabs", "pinShape", "todayShape", "pinShape.\(UUID())", "todayShape.\(UUID())"]
+            for base in bases {
+                for id in [victim, survivor] { defaults.set(Data("private titles".utf8), forKey: ProfileManager.defaultsKey(base, id)) }
+            }
+            ProfileManager.removeArchivedPreferences(for: victim, defaults: defaults)
+            for base in bases {
+                XCTAssertNil(defaults.object(forKey: ProfileManager.defaultsKey(base, victim)), base)
+                XCTAssertNotNil(defaults.object(forKey: ProfileManager.defaultsKey(base, survivor)), base)
+            }
+        }
+    }
+
+    func testUnreadableProfileListIsVisibleAndRetryCannotOverwriteIt() throws {
+        let manager = try manager()
+        let file = manager.directory.appendingPathComponent("profiles.json")
+        let damaged = Data("damaged profile list".utf8)
+        try damaged.write(to: file)
+        let reopened = ProfileManager(directory: manager.directory, sandboxed: true)
+        XCTAssertFalse(reopened.saveFailures.isEmpty)
+        XCTAssertEqual(reopened.saveFailures.first?.canRetry, false)
+        _ = reopened.create(name: "Uncommitted")
+        XCTAssertFalse(reopened.retryProfileSave())
+        XCTAssertEqual(try Data(contentsOf: file), damaged)
+    }
+
+    func testLaterSuccessfulEditClearsThePendingWarning() throws {
+        let manager = try manager()
+        let id = manager.active.id
+        let backup = try blockList(manager)
+        manager.rename(id, to: "Draft")
+        XCTAssertTrue(manager.hasUnsavedProfileChanges)
+        try unblockList(manager, backup: backup)
+        manager.rename(id, to: "Saved")
+        XCTAssertFalse(manager.hasUnsavedProfileChanges)
+        XCTAssertTrue(manager.saveFailures.isEmpty)
+        XCTAssertEqual(ProfileManager(directory: manager.directory, sandboxed: true).active.name, "Saved")
+    }
+
+    func testQuitRetriesAndRequiresExplicitDiscardOnlyWhileSaveStillFails() throws {
+        let manager = try manager()
+        var discardPrompts = 0
+        XCTAssertTrue(manager.prepareToQuit { discardPrompts += 1; return false })
+        XCTAssertEqual(discardPrompts, 0)
+        let backup = try blockList(manager)
+        manager.rename(manager.active.id, to: "Pending at quit")
+        XCTAssertFalse(manager.prepareToQuit { discardPrompts += 1; return false })
+        XCTAssertTrue(manager.hasUnsavedProfileChanges)
+        XCTAssertEqual(discardPrompts, 1)
+        XCTAssertTrue(manager.prepareToQuit { discardPrompts += 1; return true })
+        XCTAssertEqual(discardPrompts, 2)
+        try unblockList(manager, backup: backup)
+        XCTAssertTrue(manager.prepareToQuit { discardPrompts += 1; return false })
+        XCTAssertEqual(discardPrompts, 2)
+        XCTAssertFalse(manager.hasUnsavedProfileChanges)
+        XCTAssertEqual(ProfileManager(directory: manager.directory, sandboxed: true).active.name, "Pending at quit")
+    }
+
+    func testEncodingFailureIsVisibleAndPreservesTheLastSpacesSnapshot() throws {
+        let manager = try manager()
+        let profile = manager.active.id
+        let space = Space(name: "Saved", profileID: profile)
+        XCTAssertTrue(manager.saveSpaces([space], for: profile))
+        let file = ProfileManager.spacesURL(for: profile, in: manager.directory)
+        let committed = try Data(contentsOf: file)
+        var invalid = space
+        invalid.tint = .nan
+        XCTAssertFalse(manager.saveSpaces([invalid], for: profile))
+        XCTAssertFalse(manager.saveFailures.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: file), committed)
+        XCTAssertTrue(manager.saveSpaces([space], for: profile))
+        XCTAssertTrue(manager.saveFailures.isEmpty)
+    }
+
+    private func fileIdentity(_ url: URL) throws -> UInt64 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return try XCTUnwrap(attributes[.systemFileNumber] as? NSNumber).uint64Value
+    }
+
+    func testIdenticalSpacesSaveKeepsTheCommittedFile() throws {
+        let manager = try manager()
+        let profile = manager.active.id
+        let space = Space(name: "Unchanged", profileID: profile)
+        XCTAssertTrue(manager.saveSpaces([space], for: profile))
+        let file = ProfileManager.spacesURL(for: profile, in: manager.directory)
+        // Keep the old inode allocated, so an atomic rewrite cannot reuse its identity.
+        let retained = manager.directory.appendingPathComponent("retained-spaces.json")
+        try FileManager.default.linkItem(at: file, to: retained)
+        let identity = try fileIdentity(file)
+        let revision = manager.spacesRevision
+        XCTAssertTrue(manager.saveSpaces([space], for: profile))
+        XCTAssertEqual(try fileIdentity(file), identity, "An identical snapshot must not replace its committed file")
+        XCTAssertEqual(manager.spacesRevision, revision)
+        XCTAssertTrue(manager.saveFailures.isEmpty)
+
+        var edited = space
+        edited.name = "Changed"
+        XCTAssertTrue(manager.saveSpaces([edited], for: profile))
+        XCTAssertNotEqual(try fileIdentity(file), identity)
+        XCTAssertEqual(manager.spaces(for: profile), [edited])
+        XCTAssertEqual(try JSONDecoder().decode([Space].self, from: Data(contentsOf: retained)), [space])
+    }
+
+    func testUnchangedSpacesClearsAnEarlierEncodingFailureWithoutRewriting() throws {
+        let manager = try manager()
+        let profile = manager.active.id
+        let space = Space(name: "Saved", profileID: profile)
+        XCTAssertTrue(manager.saveSpaces([space], for: profile))
+        let file = ProfileManager.spacesURL(for: profile, in: manager.directory)
+        try FileManager.default.linkItem(at: file, to: manager.directory.appendingPathComponent("retained-spaces.json"))
+        let identity = try fileIdentity(file)
+        var invalid = space
+        invalid.tint = .nan
+        XCTAssertFalse(manager.saveSpaces([invalid], for: profile))
+        XCTAssertFalse(manager.saveFailures.isEmpty)
+        XCTAssertTrue(manager.saveSpaces([space], for: profile))
+        XCTAssertTrue(manager.saveFailures.isEmpty)
+        XCTAssertEqual(try fileIdentity(file), identity)
+    }
+
+    func testSpacesSaveRepairsMissingCorruptAndForeignCommittedMetadata() throws {
+        let manager = try manager()
+        let profile = manager.active.id
+        let file = ProfileManager.spacesURL(for: profile, in: manager.directory)
+        XCTAssertTrue(manager.saveSpaces([], for: profile), "An absent empty snapshot still needs a committed file")
+        XCTAssertEqual(try JSONDecoder().decode([Space].self, from: Data(contentsOf: file)), [])
+        try Data("corrupt".utf8).write(to: file)
+        XCTAssertTrue(manager.saveSpaces([], for: profile))
+        XCTAssertEqual(try JSONDecoder().decode([Space].self, from: Data(contentsOf: file)), [])
+        let own = Space(name: "Owned", profileID: profile)
+        let foreign = Space(name: "Foreign", profileID: UUID())
+        try JSONEncoder().encode([own, foreign]).write(to: file)
+        XCTAssertTrue(manager.saveSpaces([own], for: profile))
+        XCTAssertEqual(try JSONDecoder().decode([Space].self, from: Data(contentsOf: file)), [own])
+
+        let pageID = UUID()
+        let oldURL = URL(string: "https://old.example/")!
+        var reconciled = Space(name: "Edited legacy URLs", profileID: profile,
+                               tabURLs: [URL(string: "https://new.example/")!])
+        reconciled.layout = SpaceLayout(tabs: [.init(id: pageID, url: oldURL, kind: .today,
+                                                   title: "Old", customName: nil)],
+            pins: Pins(), today: Pins(entries: [.init(row: .tab(pageID.uuidString))]),
+            splits: [], selected: pageID)
+        try JSONEncoder().encode([reconciled]).write(to: file)
+        XCTAssertTrue(manager.saveSpaces([reconciled], for: profile))
+        let repaired = try XCTUnwrap(manager.spaces(for: profile).first)
+        XCTAssertTrue(try XCTUnwrap(repaired.layout).matches(repaired))
+        XCTAssertEqual(repaired.layout?.tabs.map(\.url), reconciled.tabURLs)
+    }
+
+    func testStoreDirectoryIsRecreatedAfterRuntimeDeletion() throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("timo-dir-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        XCTAssertEqual(Store.ensuring(scratch), scratch)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: scratch.path))
+        try FileManager.default.removeItem(at: scratch)
+        XCTAssertEqual(Store.ensuring(scratch), scratch)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: scratch.path), "A deleted data folder comes back on next use")
+    }
+
+    /// `saveSpaces` compares against the stat-stamped decode instead of re-reading the file.
+    /// A filtered decode or one an outside writer has superseded must not stand in for disk.
+    func testSpacesSaveUsesOnlyACurrentUnfilteredDecode() throws {
+        let manager = try manager()
+        let profile = manager.active.id
+        let file = ProfileManager.spacesURL(for: profile, in: manager.directory)
+        let own = Space(name: "Owned", profileID: profile)
+        XCTAssertTrue(manager.saveSpaces([own], for: profile))
+        // Linking changes ctime, so it comes before the decode the save is meant to reuse.
+        try FileManager.default.linkItem(at: file, to: manager.directory.appendingPathComponent("retained-spaces.json"))
+        XCTAssertEqual(manager.spaces(for: profile), [own])
+        let identity = try fileIdentity(file)
+        XCTAssertTrue(manager.saveSpaces([own], for: profile))
+        XCTAssertEqual(try fileIdentity(file), identity, "A current, complete decode proves the save is unchanged")
+
+        // Foreign rows decode to the same owned list, but the file still needs repair.
+        try JSONEncoder().encode([own, Space(name: "Foreign", profileID: UUID())]).write(to: file)
+        XCTAssertEqual(manager.spaces(for: profile), [own])
+        XCTAssertTrue(manager.saveSpaces([own], for: profile))
+        XCTAssertEqual(try JSONDecoder().decode([Space].self, from: Data(contentsOf: file)), [own])
+
+        // Another writer replaced the file after it was decoded: disk decides, not the cache.
+        XCTAssertEqual(manager.spaces(for: profile), [own])
+        var other = own
+        other.name = "Written elsewhere"
+        try JSONEncoder().encode([other]).write(to: file, options: .atomic)
+        XCTAssertTrue(manager.saveSpaces([own], for: profile))
+        XCTAssertEqual(try JSONDecoder().decode([Space].self, from: Data(contentsOf: file)), [own])
+        XCTAssertEqual(manager.spaces(for: profile), [own])
+    }
+
+    func testFailedSpacesSaveIsVisibleWithoutClearingAnUnsavedProfile() throws {
+        let manager = try manager()
+        let profile = manager.active.id
+        let file = ProfileManager.spacesURL(for: profile, in: manager.directory)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+        let space = Space(name: "Work", profileID: profile)
+        XCTAssertFalse(manager.saveSpaces([space], for: profile))
+        XCTAssertFalse(manager.saveFailures.isEmpty)
+        let backup = try blockList(manager)
+        manager.rename(profile, to: "Unsaved name")
+        XCTAssertEqual(manager.saveFailures.count, 2)
+        try FileManager.default.removeItem(at: file)
+        XCTAssertTrue(manager.saveSpaces([space], for: profile))
+        XCTAssertTrue(manager.hasUnsavedProfileChanges)
+        XCTAssertEqual(manager.saveFailures.count, 1)
+        try unblockList(manager, backup: backup)
+        XCTAssertTrue(manager.retryProfileSave())
+        XCTAssertTrue(manager.saveFailures.isEmpty)
+    }
+}

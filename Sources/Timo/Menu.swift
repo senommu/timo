@@ -1,0 +1,990 @@
+import AppKit
+import WebKit
+
+/// Leave website-priority keys in the responder chain while keeping explicit menu
+/// activation available. Validation must not disable an otherwise usable menu command.
+@MainActor final class ShortcutMenu: NSMenu {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let binding = Keybinding(event: event)
+        let window = event.window
+        if MainActor.assumeIsolated({
+            binding.map { Keybindings.keepsKeyForResponder($0, in: window ?? NSApp.keyWindow) } ?? false
+        }) { return false }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+/// Menu items whose action is just a closure. NSMenuItem needs an ObjC target, so this is
+/// the smallest thing that gives one; each item retains its own target.
+@MainActor private final class Act: NSObject, NSMenuItemValidation {
+    let run: () -> Void
+    /// Asked by `NSMenu.autoenablesItems`, which otherwise enables anything whose target
+    /// answers the action — that is every item here. Nil means "always live", which is what
+    /// nearly all of them want; `validated` sets it for the ones that do not.
+    var enabled: (() -> Bool)?
+    init(_ run: @escaping () -> Void) { self.run = run }
+    @objc func fire() {
+        // Spaces manages enabled states itself, so validation alone cannot protect the
+        // browser behind the welcome. Recheck when any closure-backed item executes.
+        guard !FirstLaunch.isPresenting else { return }
+        run()
+    }
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        // AppKit still offers key equivalents to the main menu while a modal session is up,
+        // and a closure-backed item answers its own action — so without this, ⌘W and ⌘T still
+        // fired behind the "Quit Timo?" card after the key monitor had stood down. See
+        // `Keybindings.runs`.
+        guard !FirstLaunch.isPresenting, Keybindings.runs(modal: NSApp.modalWindow != nil) else { return false }
+        return enabled?() ?? true
+    }
+}
+
+/// A live enabled-state for a closure-backed item: asked every time the menu opens, rather
+/// than frozen into `isEnabled` when the bar was built.
+@MainActor private func validated(_ entry: NSMenuItem,
+                                  _ enabled: @escaping @MainActor () -> Bool) -> NSMenuItem {
+    (entry.target as? Act)?.enabled = enabled
+    return entry
+}
+
+@MainActor private func item(_ title: String, _ key: String,
+                  _ mods: NSEvent.ModifierFlags = .command,
+                  _ run: @escaping () -> Void) -> NSMenuItem {
+    let act = Act(run)
+    let i = NSMenuItem(title: title, action: #selector(Act.fire), keyEquivalent: key)
+    i.target = act
+    i.representedObject = act
+    i.keyEquivalentModifierMask = mods
+    return i
+}
+
+/// Bindings come from the registry, and the same closure is handed to the event monitor,
+/// so a rebound key and the menu item can never disagree about what they run.
+@MainActor private func item(_ command: Command, _ run: @escaping @MainActor () -> Void) -> NSMenuItem {
+    Keybindings.actions[command] = run
+    let act = Act(run)
+    let binding = Keybindings.binding(for: command)
+    let entry = NSMenuItem(title: command.title, action: #selector(Act.fire),
+                           keyEquivalent: binding.menuKeyEquivalent)
+    entry.target = act
+    entry.representedObject = act
+    entry.keyEquivalentModifierMask = binding.menuModifierMask
+    return entry
+}
+
+@MainActor enum PagePrinting {
+    static func run(for web: WKWebView) {
+        guard let window = web.window else { return }
+        let op = operation(for: web, printInfo: .shared)
+        op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+    }
+
+    static func operation(for web: WKWebView, printInfo: NSPrintInfo) -> NSPrintOperation {
+        let operation = web.printOperation(with: printInfo)
+        // WebKit hands back a print view with no size; left alone it prints a blank sheet.
+        operation.view?.frame = web.bounds
+        return operation
+    }
+}
+
+/// File ▸ Print… prints the page, not the window. `printView:` down the responder chain
+/// reached whatever view was first responder — the sidebar's chrome, or the command bar's
+/// field — so this asks the active tab's web view for its own print operation instead.
+@MainActor private func printPage() {
+    guard let web = Windows.current?.active?.existingWeb else { return }
+    PagePrinting.run(for: web)
+}
+
+private extension NSMenuItem {
+    /// `performTextFinderAction:` asks the sender which action it is, and the answer is the
+    /// tag — so a standard find item needs one set inline.
+    func tagged(_ tag: Int) -> NSMenuItem {
+        self.tag = tag
+        return self
+    }
+}
+
+/// Archive ▸ Reopen Last Peek. Greyed out unless there is one to bring back, which is only
+/// true for the moment after a Peek is closed — the menu is rebuilt often enough that the
+/// item is honest about it. See `Peek.reopen`.
+@MainActor private func peekAgain() -> NSMenuItem {
+    let entry = item("Reopen Last Peek", "") { _ = Peek.reopen() }
+    entry.isEnabled = Peek.canReopen
+    return entry
+}
+
+private func menu(_ title: String, _ items: [NSMenuItem]) -> NSMenuItem {
+    let m = ShortcutMenu(title: title)
+    items.forEach(m.addItem)
+    let holder = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+    holder.submenu = m
+    return holder
+}
+
+/// An item AppKit already implements: it is dispatched down the responder chain, so it
+/// greys out on its own and works in a web view, a text field and the address bar alike.
+/// Deliberately outside the registry — nobody rebinds Copy, and forty spelling toggles in
+/// the Shortcuts pane would bury the shortcuts anybody actually looks for.
+///
+/// Keyless by construction. Everything with a chord goes through `Standard.item`, so the
+/// shortcuts a Mac app must honour are written down in exactly one place — see Standard.swift.
+private func standard(_ title: String, _ action: Selector) -> NSMenuItem {
+    NSMenuItem(title: title, action: action, keyEquivalent: "")
+}
+
+/// The window ⌘M would put in the Dock right now, or nil when there is none. The key window
+/// when it can go in the Dock, the window behind it when a Peek — borderless, key, and a
+/// child of that window — is in front, and the frontmost browser window when there is no key
+/// window at all. `performMiniaturize:` on a borderless window does nothing, which is what
+/// ⌘M did while a Peek was up. The rule itself is `Standard.minimizeTarget`, proved offline.
+///
+/// Not private: `Standard.installed` asks it what the menu item's enabled state should be,
+/// which is the one way to prove the item and the keystroke cannot drift apart.
+@MainActor func minimizeVictim() -> NSWindow? {
+    let key = NSApp.keyWindow
+    let browser = Windows.main?.window
+    switch Standard.minimizeTarget(hasKey: key != nil,
+                                   keyMiniaturizable: key?.styleMask.contains(.miniaturizable) ?? false,
+                                   keyHasParent: key?.parent != nil,
+                                   hasBrowser: browser != nil,
+                                   modal: NSApp.modalWindow != nil) {
+    case .key:     return key
+    case .parent:  return key?.parent
+    case .browser: return browser
+    case .none:    return nil
+    }
+}
+
+/// ⌘M, from wherever it was pressed — the keystroke through the monitor, and the Window
+/// menu's own item, which runs this rather than `performMiniaturize:` so the two can never
+/// disagree about which window is meant.
+@MainActor private func minimizeWindow() { minimizeVictim()?.performMiniaturize(nil) }
+
+/// ⌘W. Arc's rule inside a browser window — a Today tab is archived rather than destroyed,
+/// and a favourite or a pinned tab just loses its page — every Mac app's rule outside one: a
+/// window that holds no tabs closes — and Arc's rule with the Library up: it shuts the panel
+/// in front rather than a tab behind it. The ladder is `Windows.closeTarget`, proved offline.
+@MainActor private func closeTab() {
+    let key = NSApp.keyWindow
+    let store = Windows.current
+    switch Windows.closeTarget(hasKey: key != nil,
+                               keyHoldsTabs: key.map { k in
+                                   TabStore.all.contains { $0.window === k }
+                               } ?? false,
+                               keyIsAttached: key?.parent != nil || key?.sheetParent != nil,
+                               libraryOpen: store.map { $0.librarySwipeMonitor.intendsOpen(in: $0) } == true) {
+    case .tab:     store?.closeOrArchive()
+    case .window:  key?.performClose(nil)
+    case .library: store.map(Library.close)
+    }
+}
+
+/// The Find submenu's next/previous. AppKit dispatches `performTextFinderAction:` and asks
+/// the *sender* which action it is, so the tag is the whole difference between them. The
+/// key still comes from the registry, and the monitor sends the same selector at the
+/// responder chain with the same sender.
+@MainActor private func finderItem(_ command: Command, _ action: NSTextFinder.Action) -> NSMenuItem {
+    let selector = #selector(NSResponder.performTextFinderAction(_:))
+    let binding = Keybindings.binding(for: command)
+    let entry = NSMenuItem(title: command.title, action: selector,
+                           keyEquivalent: binding.menuKeyEquivalent)
+    entry.keyEquivalentModifierMask = binding.menuModifierMask
+    entry.tag = action.rawValue
+    Keybindings.actions[command] = { NSApp.sendAction(selector, to: nil, from: entry) }
+    return entry
+}
+
+@MainActor private func developItems() -> [NSMenuItem] {
+    let inspector = item(.showWebInspector) {
+        Inspector.show(Windows.current?.active?.existingWeb)
+    }
+    let console = item(.showJavaScriptConsole) {
+        Inspector.showConsole(Windows.current?.active?.existingWeb)
+    }
+    let developer = item(.toggleDeveloperMode) {
+        if let tab = Windows.current?.active { DeveloperMode.toggle(tab) }
+    }
+    // The SPI is the only way in from a menu item; without it, say so rather than
+    // offering a item that quietly does nothing.
+    if !Inspector.available || !Settings.inspectorEnabled {
+        for i in [inspector, console] {
+            i.isEnabled = false
+            i.toolTip = Settings.inspectorEnabled
+                ? "Unavailable on this macOS — use right-click → Inspect Element"
+                : "Turn on “Allow Web Inspector” first"
+        }
+    }
+
+    let agents = NSMenu(title: "User Agent")
+    for ua in Settings.userAgents {
+        let entry = item(ua.name, "") { Settings.userAgent = ua.value; rebuild() }
+        entry.state = Settings.userAgent == ua.value ? .on : .off
+        agents.addItem(entry)
+    }
+    let agentHolder = NSMenuItem(title: "User Agent", action: nil, keyEquivalent: "")
+    agentHolder.submenu = agents
+
+    let allow = item(.allowWebInspector) {
+        Settings.inspectorEnabled.toggle(); rebuild()
+    }
+    allow.state = Settings.inspectorEnabled ? .on : .off
+
+    return [
+        inspector,
+        console,
+        developer,
+        item(.viewSource) {
+            if let s = Windows.current { s.active?.viewSource(into: s) }
+        },
+        .separator(),
+        agentHolder,
+        .separator(),
+        allow,
+    ]
+}
+
+/// One-line text prompt. ponytail: an NSAlert with an accessory field, not a window — a
+/// name is one string and this is not the settings surface.
+/// Not private: the sidebar's "Rename Space…" is the same prompt, and two copies of an
+/// alert is exactly how two prompts drift apart.
+@MainActor func askForName(_ title: String, _ initial: String = "") -> String? {
+    let alert = NSAlert()
+    alert.messageText = title
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+    field.stringValue = initial
+    alert.accessoryView = field
+    alert.addButton(withTitle: "OK")
+    alert.addButton(withTitle: "Cancel")
+    guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+    let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+    return name.isEmpty ? nil : name
+}
+
+@MainActor private func readerTypefaceItem() -> NSMenuItem {
+    let entry = item(.readerSerif) {
+        Reader.setSerif(!Reader.serif, in: Windows.current?.active)
+        rebuild()
+    }
+    entry.state = Reader.serif ? .on : .off
+    return entry
+}
+
+@MainActor private func readerPreferencesItem() -> NSMenuItem {
+    let spacing = Reader.spacingChoices.map { title, value in
+        let entry = item(title, "") { Reader.setLineSpacing(value, in: Windows.current?.active); rebuild() }
+        entry.state = Reader.lineSpacing == value ? .on : .off
+        return entry
+    }
+    let widths = Reader.widthChoices.map { title, value in
+        let entry = item(title, "") { Reader.setReadingWidth(value, in: Windows.current?.active); rebuild() }
+        entry.state = Reader.readingWidth == value ? .on : .off
+        return entry
+    }
+    return menu("Reading Preferences", [menu("Line Spacing", spacing), menu("Reading Width", widths)])
+}
+
+/// Arc keeps passwords and per-site controls in Settings, not in the menu bar; Timo's live
+/// as submenus of the app menu so the bar stays Arc's ten menus wide.
+@MainActor private func passwordItems() -> [NSMenuItem] {
+    [
+
+        item(.fillPassword) {
+            (WebsitePopupWindow.tab(in: NSApp.keyWindow) ?? Windows.current?.active)?
+                .fillPassword(announcing: true)
+        },
+        item(.importPasswords) { PasswordImport.chooseAndImport() },
+        .separator(),
+        item("Export Passwords…", "") { Export.chooseAndExport(.passwords) },
+        item(.manageSavedPasswords) { SettingsWindow.show(tab: "passwords") },
+    ]
+}
+
+@MainActor private func siteItems() -> [NSMenuItem] {
+    let profileID = Windows.current?.profileID ?? ProfileManager.activeProfileID
+    let blocking = item(.blockAds) {
+        Blocker.setEnabled(!Blocker.enabled(for: profileID), for: profileID)
+        rebuild()
+    }
+    blocking.state = Blocker.enabled(for: profileID) ? .on : .off
+    let tidyDownloads = item("Tidy Download Filenames", "") {
+        TidyDownloads.enabled.toggle(); rebuild()
+    }
+    tidyDownloads.state = TidyDownloads.enabled ? .on : .off
+    let httpsOnly = item("HTTPS-Only Mode", "") { HTTPSOnly.enabled.toggle(); rebuild() }
+    httpsOnly.state = HTTPSOnly.enabled ? .on : .off
+    return [
+        httpsOnly,
+        item("Forget HTTPS-Only Exceptions…", "") {
+            let a = NSAlert()
+            a.messageText = "Forget every site you allowed to load without encryption?"
+            a.informativeText = "Those sites will be upgraded to https again, and will ask "
+                + "before ever loading in the clear."
+            a.addButton(withTitle: "Forget"); a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { HTTPSOnly.forgetAll() }
+        },
+        .separator(),
+        tidyDownloads,
+        blocking,
+        item(.addFilterList) { Blocker.chooseAndAddList() },
+        .separator(),
+        item(.forgetCertificateExceptions) {
+            let a = NSAlert()
+            a.messageText = "Forget every certificate you chose to trust anyway?"
+            a.informativeText = "Those sites will ask again the next time you visit them."
+            a.addButton(withTitle: "Forget"); a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { CertificateTrust.forgetAll() }
+        },
+        item(.resetMediaPermissions) {
+            let a = NSAlert()
+            a.messageText = "Forget camera and microphone permissions for every site?"
+            a.addButton(withTitle: "Reset"); a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { SitePermissions.resetAll() }
+        },
+    ]
+}
+
+@MainActor private func profileItems() -> [NSMenuItem] {
+    let manager = ProfileManager.shared
+    let incognito = Windows.current?.isPrivate == true
+    let switchers = manager.profiles.map { profile in
+        let entry = item(profile.name, "") {
+            _ = Windows.switchTo(profile: profile)
+            rebuild()          // switchTo does not rebuild, and every checkmark below moved
+        }
+        entry.state = !incognito && manager.active.id == profile.id ? .on : .off
+        return entry
+    }
+    // delete() refuses on the last profile; disable rather than let it fail in an alert.
+    let remove = item(.deleteProfile) {
+        let active = manager.active
+        let alert = NSAlert()
+        alert.messageText = "Delete the profile “\(active.name)”?"
+        alert.informativeText = "Its history, bookmarks, saved passwords, cookies and "
+            + "extensions are deleted with it. This cannot be undone."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete")
+        alert.buttons.last?.hasDestructiveAction = true
+        if alert.runModal() == .alertSecondButtonReturn {
+            Task { @MainActor in
+                if await manager.deleteAsync(active.id) {
+                    _ = Windows.switchTo(profile: manager.active)
+                    rebuild()
+                } else {
+                    Toasts.show("Couldn’t delete profile. Its data was kept.")
+                }
+            }
+        }
+    }
+    remove.isEnabled = manager.profiles.count > 1
+
+    var identities = switchers
+    if incognito {
+        let entry = NSMenuItem(title: Profile.incognito.name, action: nil, keyEquivalent: "")
+        entry.image = NSImage(systemSymbolName: "eyeglasses", accessibilityDescription: "Incognito")
+        entry.state = .on
+        identities.insert(contentsOf: [entry, .separator()], at: 0)
+    }
+    return identities + [
+        .separator(),
+        item(.newProfile) {
+            guard let name = askForName("Name the new profile") else { return }
+            _ = manager.create(name: name)
+            rebuild()
+        },
+        item(.renameProfile) {
+            guard let name = askForName("Rename profile", manager.active.name) else { return }
+            manager.rename(manager.active.id, to: name)
+            rebuild()
+        },
+        remove,
+    ]
+}
+
+/// ponytail: one in-flight tidy per app, cancelled by invoking it again — the model call
+/// runs ~12s, and a second one would only contend for the single session.
+@MainActor private var tidyTask: Task<Void, Never>?
+
+/// Tidy Tabs, from wherever it was asked for: the menu item, its shortcut, the sidebar's
+/// Tidy row and the command bar all land here, so all four cancel the same run and share one
+/// spinner.
+///
+/// Every exit says something. The old version had three silent ones — no plan, nothing
+/// moved, and cancelled — and "I pressed Tidy, waited thirty seconds and nothing happened"
+/// is what they add up to. Now the only quiet exit is a cancel, which the user asked for.
+@MainActor func startTidy() {
+    // Already running: this press is the cancel, and it is answered here rather than left to
+    // the task on its way out. `AppleAI.group` is not cancellation aware — `cancel()` only
+    // sets a flag the run reads once its await finally returns — so waiting for that task's
+    // own `ended` kept the spinner up for the rest of a twelve-second model call, and every
+    // press in the meantime landed back in this branch and was swallowed. `TidyProgress`
+    // bumps its stamp, so the cancelled run's late `ended` cannot put away the spinner of
+    // whatever is started next.
+    if let s = Windows.main, TidyProgress.shared.isRunning(s) {
+        tidyTask?.cancel()
+        tidyTask = nil                       // the next press starts a run, not another cancel
+        TidyProgress.shared.cancelled()
+        rebuild()                            // and Tidy is pressable again this instant
+        return
+    }
+    tidyTask?.cancel()
+    guard let s = Windows.main else { return }
+    // The deadline hand-back cancels the task as well as clearing the spinner: a model
+    // session that never returns must not leave the sidebar's Tidy disabled for the life of
+    // the window. `AppleAI` races its own 30s sleep inside every call, so this only ever
+    // fires for an await that has stopped answering altogether.
+    let preview = TidyPreview(store: s)
+    let stamp = TidyProgress.shared.began(s) { tidyTask?.cancel() }
+    tidyTask = Task { @MainActor [s] in
+        defer {
+            TidyProgress.shared.ended(stamp)
+            rebuild()                     // so Undo Tidy Tabs enables, and Tidy re-enables
+        }
+        let groups = await TidyTabs.plan(for: s)
+        // Cancelled is the one silent exit: the user asked for it, and the spinner going
+        // away is the answer.
+        guard !Task.isCancelled else { return }
+        var proposal = preview
+        proposal.groups = groups ?? []
+        proposal.finish(in: s)
+    }
+}
+
+@MainActor private func tidyItems() -> [NSMenuItem] {
+    // `Windows.main`, not `current`: every item here moves rows around a sidebar, and a
+    // Little Arc in front of the browser window has none. See LittleArc.swift.
+    let store = Windows.main
+    let tidy = item(.tidyTabs) { startTidy() }
+    // A second invocation while one is running cancels it — the sidebar's row says so by
+    // being a spinner — so the item stays live for as long as there is something to cancel.
+    tidy.isEnabled = store.map {
+        TidyTabs.shouldOffer($0) || TidyProgress.shared.isRunning($0)
+    } ?? false
+    let undo = item(.undoTidyTabs) {
+        guard let s = Windows.main else { return }
+        TidyTabs.undo(s)
+        rebuild()
+    }
+    undo.isEnabled = store.map(TidyTabs.canUndo) ?? false
+    let clear = item(.clearTabs) { clearTabs() }
+    clear.isEnabled = store.map { s in s.tabs.contains { $0.kind == .today } } ?? false
+    let favourite = item(.favouriteTab) {
+        guard let s = Windows.main, let c = s.current else { return }
+        s.toggleFavourite(c)
+    }
+    let pin = item(.pinTab) {
+        guard let s = Windows.main, let c = s.current else { return }
+        s.togglePinned(c)
+    }
+    // The titles say what the item will do to *this* tab, the way Arc's do.
+    if let t = store?.active {
+        favourite.title = t.kind == .favourite ? "Unfavourite Tab" : "Favourite Tab"
+        pin.title = t.kind == .pinned ? "Unpin Tab" : "Pin Tab"
+    }
+    favourite.isEnabled = store?.active != nil
+    pin.isEnabled = store?.active != nil
+    // Arc walks the sidebar with ⌥⌘↑/↓ and holds ⌃⇥ for the switcher: the MRU row in
+    // TabSwitcher.swift, which every further ⌃⇥ steps through until ⌃ comes up.
+    let navigation = [
+        item(.previousTab) { Windows.current?.cycle(-1) },
+        item(.nextTab) { Windows.current?.cycle(1) },
+        item(.tabSwitcher) { TabSwitching.shared.step(1) },
+        item(.tabSwitcherBackwards) { TabSwitching.shared.step(-1) },
+    ]
+    let selection = (1...9).map { n in
+        let command = n == 9 ? Command.selectLastTab : Command(rawValue: "selectTab\(n)")!
+        return item(command) {
+            guard let store = Windows.current else { return }
+            let tabs = store.accessibleTabs
+            let index = n == 9 ? tabs.count - 1 : n - 1
+            guard tabs.indices.contains(index) else { return }
+            let previousPage = store.activePageResponder
+            store.selection.clear()
+            store.current = tabs[index].id
+            store.focusPage(from: previousPage)
+            axAnnounce("\(tabs[index].title), tab \(index + 1) of \(tabs.count)")
+        }
+    }
+    let search = [
+        item(.commandPalette) { Windows.current?.openPalette(.all) },
+        item(.searchTabs) { Windows.current?.openPalette(.tabs) },
+    ]
+    // Split View. Arc keeps these in the Tabs menu, and their enabled state is what says
+    // whether there is a split to act on at all. `Windows.main` throughout, never
+    // `Windows.current`: a Little Arc has no sidebar and no strip to hold a split, and ⌃⇧=
+    // over one used to split the popup rather than the window behind it — which is also the
+    // window whose state greyed these items out.
+    let addSplit = item(.addSplit) { Windows.main?.addSplit() }
+    addSplit.isEnabled = store?.active != nil
+    let removeSplit = item(.removeSplit) { Windows.main?.removeSplitPane() }
+    let nextPane = item(.nextPane) { Windows.main?.focusNextPane() }
+    let separate = item("Separate All Tabs", "", []) {
+        guard let s = Windows.main, let split = s.activeSplit else { return }
+        s.separateSplit(split)
+    }
+    for entry in [removeSplit, nextPane, separate] {
+        entry.isEnabled = store?.activeSplit != nil
+    }
+    let split = [addSplit, removeSplit, nextPane, separate]
+    let organize = item("Organize Tabs…", "", []) {
+        guard let s = Windows.main else { return }
+        s.organizationSheet = true
+    }
+    organize.isEnabled = store.map { !$0.isPrivate && !$0.isLittle } ?? false
+    let undoOrganization = item("Undo Tab Organization", "", []) {
+        guard let s = Windows.main else { return }
+        let model = TabOrganization(store: s)
+        if !model.undo() { Toasts.show(model.message, in: s) }
+    }
+    undoOrganization.isEnabled = store.map(TabOrganization.hasUndo) ?? false
+    return [favourite, pin, .separator(), tidy, undo, clear, organize, undoOrganization, .separator()]
+        + split + [.separator()] + navigation + [menu("Select Tab", selection), .separator()] + search
+}
+
+// MARK: - File
+
+/// ⌘O. A local file opens in a tab of its own; `loadFileURL` is the only load a WKWebView
+/// will accept for a file url, and it needs the read access spelled out.
+@MainActor private func openFile() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.message = "Open a file in a new tab"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    let store = Windows.current ?? Windows.open()
+    store.newBlankTab(loading: url)
+}
+
+/// ⇧⌘S. ponytail: one format — a web archive, the same single file Safari's Save As
+/// defaults to, written by WebKit itself. A "Page Source"/"PDF" picker is three more code
+/// paths for a menu item nobody visits twice.
+@MainActor private func savePageAs() {
+    guard let tab = Windows.current?.active else { return }
+    PageSaving.save(tab)
+}
+
+@MainActor enum PageSaving {
+    static func save(_ tab: Tab) {
+        guard tab.easelID == nil, let url = tab.currentURL, let web = tab.existingWeb else { return }
+        let document = tab.readingDocumentGeneration
+        let panel = NSSavePanel()
+        let base = TidyTitles.title(for: tab)
+        panel.nameFieldStringValue = (base.isEmpty ? (url.host ?? "Page") : base) + ".webarchive"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url,
+              tab.existingWeb === web, tab.readingDocumentGeneration == document else { return }
+        web.createWebArchiveData { result in
+            guard case .success(let data) = result else { return }
+            try? data.write(to: destination)
+        }
+    }
+}
+
+/// File ▸ Share. ponytail: the system picker anchored to the window, not a submenu built
+/// from `NSSharingService.sharingServices(forItems:)` — that call is deprecated, and the
+/// picker is the one macOS keeps up to date with whatever the user has enabled.
+@MainActor private func sharePage() {
+    guard let url = Windows.current?.active?.currentURL,
+          let view = NSApp.keyWindow?.contentView else { return }
+    let picker = NSSharingServicePicker(items: [url])
+    picker.show(relativeTo: .zero, of: view, preferredEdge: .minY)
+}
+
+// MARK: - Archive
+
+/// Arc's Archive menu opens the Library at a section, and each row means a different one.
+@MainActor private func showLibrary(_ section: LibrarySection) {
+    guard let store = Windows.main else { return }
+    Library.open(section, in: store)
+}
+
+/// ⇧⌘L, which is a toggle in Arc: the keystroke that opened the Library closes it again.
+/// It reopens on whichever section was last looked at.
+@MainActor private func toggleLibrary() {
+    Library.toggle(Library.shared.section, in: Windows.main)
+}
+
+/// ⇧⌘C. Arc's, and the one browser shortcut everybody misses when it is missing.
+@MainActor private func copyPageURL() {
+    guard let store = Windows.current, let u = store.active?.currentURL else { return }
+    CleanLink.copy(u)
+    store.feedback.copied(u)
+    axAnnounce("Link copied.")
+    Toasts.show("Copied URL")
+}
+
+/// ⇧⌘K, and the sidebar's `Clear`: today's tabs go to the archive, not to the bin.
+/// Archiving every tab would leave the window with nothing showing, which is exactly what
+/// Arc does — the sidebar stays, the page area goes bare and the search bar is a keystroke
+/// away. Favourites and pinned tabs are untouched.
+@MainActor private func clearTabs() {
+    guard let s = Windows.main else { return }
+    let doomed = s.tabs.filter { $0.kind == .today }
+    guard !doomed.isEmpty else { return }
+    let count = s.archiveToday(doomed.map(\.id))
+    axAnnounce("Archived \(count) tab\(count == 1 ? "" : "s").")
+}
+
+/// The window a Space menu item acts on: the frontmost *ordinary* browser window. A Little
+/// Arc is in no Space and neither is a private window — Arc's incognito has none — and
+/// `Windows.main` in front of a private window handed back the private store, which built a
+/// full list of Spaces with no checkmark on any of them, every row of which did nothing when
+/// picked. Resolved when the item fires rather than captured, so a key equivalent never acts
+/// on the window it was built for after that window has closed.
+@MainActor private func spaceStore() -> TabStore? {
+    Windows.main.flatMap { $0.isPrivate ? nil : $0 }
+}
+
+@MainActor private func spaceItems() -> [NSMenuItem] {
+    let store = spaceStore()
+    // The strip, not the front window's profile: Arc's Spaces menu lists every profile's
+    // Spaces in one run, and picking one of another profile's moves that window there.
+    let spaces = store?.strip ?? []
+    // Arc's order: New Space, Manage Spaces…, the two arrows, then the Spaces themselves
+    // wearing ⌃1…⌃9 — the shortcut sits on the row it switches to, not on a hidden twin.
+    let switchers = spaces.enumerated().map { n, space in
+        let entry = item(space.name, "") { spaceStore()?.shown.selectSpace(space); rebuild() }
+        entry.state = store?.currentSpaceID == space.id ? .on : .off
+        if let command = Command(rawValue: "goToSpace\(n + 1)") {
+            let binding = Keybindings.binding(for: command)
+            entry.keyEquivalent = binding.menuKeyEquivalent
+            entry.keyEquivalentModifierMask = binding.menuModifierMask
+            Keybindings.actions[command] = { spaceStore()?.shown.switchTo(spaceNumber: n + 1); rebuild() }
+        }
+        return entry
+    }
+    let nav = [
+        item(.previousSpace) { spaceStore()?.shown.cycleSpace(-1); rebuild() },
+        item(.nextSpace) { spaceStore()?.shown.cycleSpace(1); rebuild() },
+    ]
+    for entry in nav { entry.isEnabled = spaces.count > 1 }
+    let new = item(.newSpace) {
+        // Arc's New Space appears first and is named in place — see `NewSpaceButton`.
+        _ = spaceStore()?.newSpace()
+        rebuild()
+    }
+    // Greyed rather than silently doing nothing, the way Little Arc's own items are: with
+    // no ordinary window in front there is no Space to make one beside.
+    new.isEnabled = store != nil
+    return [
+        new,
+        // Arc's "Manage Spaces…" is the Library's Spaces view, not a settings pane.
+        item("Manage Spaces…", "") { showLibrary(.spaces) },
+        .separator(),
+    ] + nav + [.separator()] + switchers + [
+        .separator(),
+        // Arc has no Profiles menu: a profile is a property of a Space, so this is where
+        // the switcher lives.
+        menu("Profiles", profileItems()),
+    ]
+}
+
+/// Arc's Window ▸ Show All Little Arc Windows: they all come to the front together, or they
+/// all get out of the way together. The title says which of the two it will do, so "Show"
+/// never hides — `toggleAll` rebuilds the menu, because its own title is what just changed.
+/// The windows themselves are in the list below it, because AppKit files every titled window
+/// into this menu on its own.
+/// ponytail: not greyed out with none open. NSMenu auto-enables any item whose target
+/// answers its action, so greying this would take a `validateMenuItem:` on Menu.swift's
+/// closure holder — for a row that already does nothing when there is nothing to show.
+@MainActor private func littleArcWindows() -> NSMenuItem {
+    let verb = LittleArc.allShowing ? "Hide" : "Show"
+    return item("\(verb) All Little Timo Windows", "") { LittleArc.toggleAll() }
+}
+
+/// Menus carry live state (checkmarks, the bookmarks and history lists), so they are
+/// rebuilt rather than mutated in place.
+@MainActor func rebuild() { NSApp.mainMenu = buildMenu() }
+
+@MainActor func buildMenu() -> NSMenu {
+    let root = ShortcutMenu()
+    let bookmarkProfileID = BookmarkManager.currentActionProfile
+    let makeDefaultApp = item(.makeDefaultBrowser) { URLHandling.makeDefaultBrowser() }
+    makeDefaultApp.isEnabled = !URLHandling.isDefaultBrowser
+    // macOS fills this in itself once it is `NSApp.servicesMenu`: what the Services submenu
+    // offers depends on what is selected and on what the user has enabled in Settings, and
+    // an app that never sets it is the one with a Services menu that is always empty.
+    let services = NSMenu(title: "Services")
+    let servicesHolder = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+    servicesHolder.submenu = services
+    root.addItem(menu("Timo", [
+        Standard.item("About Timo"),
+        // The loud check: it answers even when there is nothing to say, and it runs however
+        // recently the background one did. See Updater.swift.
+        item("Check for Updates…", "") { Updater.shared.check(silent: false) },
+        .separator(),
+        item(.settings) { SettingsWindow.show() },
+        .separator(),
+        // Arc keeps both of these in the app menu; Timo had them filed under Passwords and
+        // Sites, where nobody looking for them would think to open.
+        item(.importHistoryAndBookmarks) { BrowserImport.chooseAndImport() },
+        // Beside it rather than under Passwords: this is the item someone switching from Arc
+        // comes looking for, and it brings across everything the one above it does and more.
+        item(.importFromArc) { ArcImport.chooseAndImport() },
+        makeDefaultApp,
+        .separator(),
+        menu("Passwords", passwordItems()),
+        menu("Sites", siteItems()),
+        .separator(),
+        servicesHolder,
+        .separator(),
+        Standard.item("Hide Timo"),
+        Standard.item("Hide Others"),
+        Standard.item("Show All"),
+        .separator(),
+        Standard.item("Quit Timo"),
+    ]))
+    NSApp.servicesMenu = services
+    root.addItem(menu("File", [
+        // `.shown` throughout this menu: a command that makes or shows a tab brings the
+        // window it lands in forward, so the tab is not opened behind Settings. See
+        // `TabStore.shown`.
+        item(.newTab) { Windows.current?.shown.newTab(nil) },
+        item(.newWindow) { Windows.open() },
+        item(.newPrivateWindow) { Windows.open(isPrivate: true) },
+        validated(item(.newEasel) { EaselWindow.open(in: Windows.current, create: true) }) { EaselWindow.canOpen },
+        validated(item(.captureToEasel) { EaselWindow.capture(in: Windows.current) }) {
+            EaselWindow.canCapture(in: Windows.current)
+        },
+        // Arc's ⌥⌘N: a search that is not in any window yet. `open(nil)` is the whole of it
+        // — a Little Arc with no url comes up with its command bar over an empty page.
+        item(.newLittleArc) { LittleArc.open(nil) },
+        .separator(),
+        item(.openLocation) { Windows.current?.shown.openPalette(.address) },
+        item(.openFile) { openFile() },
+        .separator(),
+        // Arc's ⌘W: a Today tab is archived rather than destroyed, and a favourite or a
+        // pinned tab just loses its page and stays in the sidebar. Over Settings, History or
+        // Extensions it closes that window instead, and with the Library up it shuts the
+        // Library — see `closeTab`.
+        item(.closeTab) { closeTab() },
+        // ⇧⌘W used to be a targetless `performClose:`, dispatched down the responder chain
+        // — which a modal session does not stop, so it closed the window under the "Quit
+        // Timo?" card's scrim while the question was still standing on it. A closure-backed
+        // item is refused while a session is up (`Act.validateMenuItem`), and says here what
+        // the responder chain used to say for it: nothing to close, nothing to enable.
+        validated(item(.closeWindow) { NSApp.keyWindow?.performClose(nil) }) {
+            NSApp.keyWindow?.styleMask.contains(.closable) ?? false
+        },
+        .separator(),
+        validated(item(.capturePage) { PageCapture.start(Windows.current?.active) }) {
+            PageCapture.available(Windows.current?.active)
+        },
+        validated(item(.captureFullPage) { PageCapture.start(Windows.current?.active, fullPage: true) }) {
+            PageCapture.available(Windows.current?.active)
+        },
+        item(.savePageAs) { savePageAs() },
+        item(.printPage) { printPage() },
+        item(.sharePage) { sharePage() },
+    ]))
+    // Every one of these is a standard selector with no target, which is what carries ⌘Z,
+    // ⌘X, ⌘C, ⌘V and ⌘A down the responder chain into the address bar, a rename field and
+    // the page's own editing — WebKit implements them all, and only ever sees them because
+    // nothing here claims them first.
+    root.addItem(menu("Edit", [
+        Standard.item("Undo"),
+        Standard.item("Redo"),
+        .separator(),
+        Standard.item("Cut"),
+        Standard.item("Copy"),
+        Standard.item("Paste"),
+        Standard.item("Paste and Match Style"),
+        standard("Delete", #selector(NSText.delete(_:))),
+        Standard.item("Select All"),
+        .separator(),
+        menu("Find", [
+            item(.find) { Windows.current?.openFind() },
+            // Not `finderItem`: Timo's find bar is WebKit's search, not an NSTextFinder,
+            // so these run the bar's own next/previous — which is also what the ⌘G the
+            // event monitor sees runs. See Find.advance.
+            item(.findNext) { Find.advance(forward: true) },
+            item(.findPrevious) { Find.advance(forward: false) },
+            Standard.item("Use Selection for Find")
+                .tagged(NSTextFinder.Action.setSearchString.rawValue),
+        ]),
+        menu("Spelling and Grammar", [
+            Standard.item("Show Spelling and Grammar"),
+            Standard.item("Check Document Now"),
+            .separator(),
+            standard("Check Spelling While Typing", NSSelectorFromString("toggleContinuousSpellChecking:")),
+            standard("Check Grammar With Spelling", NSSelectorFromString("toggleGrammarChecking:")),
+            standard("Correct Spelling Automatically", NSSelectorFromString("toggleAutomaticSpellingCorrection:")),
+        ]),
+        menu("Substitutions", [
+            standard("Show Substitutions", NSSelectorFromString("orderFrontSubstitutionsPanel:")),
+            .separator(),
+            standard("Smart Copy/Paste", NSSelectorFromString("toggleSmartInsertDelete:")),
+            standard("Smart Quotes", NSSelectorFromString("toggleAutomaticQuoteSubstitution:")),
+            standard("Smart Dashes", NSSelectorFromString("toggleAutomaticDashSubstitution:")),
+            standard("Smart Links", NSSelectorFromString("toggleAutomaticLinkDetection:")),
+            standard("Data Detectors", NSSelectorFromString("toggleAutomaticDataDetection:")),
+            standard("Text Replacement", NSSelectorFromString("toggleAutomaticTextReplacement:")),
+        ]),
+        menu("Transformations", [
+            standard("Make Upper Case", NSSelectorFromString("uppercaseWord:")),
+            standard("Make Lower Case", NSSelectorFromString("lowercaseWord:")),
+            standard("Capitalize", NSSelectorFromString("capitalizeWord:")),
+        ]),
+        menu("Speech", [
+            standard("Start Speaking", NSSelectorFromString("startSpeaking:")),
+            standard("Stop Speaking", NSSelectorFromString("stopSpeaking:")),
+        ]),
+        .separator(),
+        Standard.item("Emoji & Symbols"),
+        standard("Start Dictation…", NSSelectorFromString("startDictation:")),
+    ]))
+    root.addItem(menu("View", [
+        item(.reload) { Windows.current?.active?.reload() },
+        item(.hardReload) { Windows.current?.active?.hardReload() },
+        item(.toggleSidebar) { Windows.current?.toggleSidebar() },
+        item(.nextFocusArea) {
+            guard let store = Windows.current, store.window === NSApp.keyWindow else { return }
+            store.focusNextArea()
+        },
+        item(.copyPageURL) { copyPageURL() },
+        .separator(),
+        item(.actualSize) { Windows.current?.active.map(Zoom.reset) },
+        item(.zoomIn) { Windows.current?.active.map(Zoom.zoomIn) },
+        item(.zoomOut) { Windows.current?.active.map(Zoom.zoomOut) },
+        .separator(),
+        item(.fullScreen) { NSApp.keyWindow?.toggleFullScreen(nil) },
+        .separator(),
+        item(.showReader) { Windows.current?.active.map(Reader.toggle) },
+        validated(item(.saveForOffline) {
+            if let store = Windows.current, let tab = store.active { Task { await ReadingQueueCapture.shared.save(tab: tab, in: store) } }
+        }) { ReadingQueueCapture.canSave(tab: Windows.current?.active, in: Windows.current) },
+        validated(item(.readingQueue) { Library.open(.readingQueue, in: Windows.current) }) { Windows.current.map { !$0.isPrivate } ?? false },
+        item(.pictureInPicture) { PictureInPicture.toggle(Windows.current?.active) },
+        item(.muteTab) { Windows.current?.active.map(TabAudio.toggleMute) },
+        item(.biggerReaderText) { Reader.adjustFontSize(1, in: Windows.current?.active) },
+        item(.smallerReaderText) { Reader.adjustFontSize(-1, in: Windows.current?.active) },
+        readerTypefaceItem(),
+        readerPreferencesItem(),
+        .separator(),
+        // Arc files its developer tools under View; a top-level Develop menu is Safari's.
+        menu("Developer", developItems()),
+    ]))
+    let spacesMenu = menu("Spaces", spaceItems())
+    // The one menu that greys its own items. `NSMenu.autoenablesItems` is on by default and
+    // re-enables anything whose target answers the action, which quietly undid every
+    // `isEnabled = false` here — so "Previous Space" looked live with one Space, and
+    // "New Space" looked live in front of a private window, which has none to make.
+    spacesMenu.submenu?.autoenablesItems = false
+    root.addItem(spacesMenu)
+    root.addItem(menu("Tabs", tidyItems()))
+    // Arc's Archive menu, in Arc's order — the recent-pages list it replaces now lives in
+    // the History window, where it can be searched instead of being the last 25 rows of a
+    // menu nobody can scroll.
+    root.addItem(menu("Archive", [
+        item(.back) { Windows.current?.active?.back() },
+        item(.forward) { Windows.current?.active?.forward() },
+        .separator(),
+        item(.viewArchive) { showLibrary(.archived) },
+        item(.viewHistory) { HistoryWindow.show() },
+        item(.showDownloads) { showLibrary(.downloads) },
+        .separator(),
+        item(.reopenClosedTab) {
+            if let closed = ClosedTabs.pop() { closed.reopen(in: Windows.main?.shown ?? Windows.open()) }
+        },
+        // Deliberately without a key equivalent: the shortcuts that would fit — ⌘Z, ⇧⌘T —
+        // already mean something the user would rather keep, and a page's own undo is not
+        // ours to take. Settings ▸ Shortcuts can bind one. See Peek.swift.
+        peekAgain(),
+        .separator(),
+        item("Export History (JSON)…", "") { Export.chooseAndExport(.historyJSON) },
+        item("Export History (CSV)…", "") { Export.chooseAndExport(.historyCSV) },
+        .separator(),
+        item(.clearArchive) {
+            guard let store = Windows.main else { return }
+            let archive = Archive.shared(for: store.profileID)
+            let a = NSAlert()
+            a.messageText = "Clear the archive?"
+            a.informativeText = "\(archive.entries.count) archived tab"
+                + (archive.entries.count == 1 ? "" : "s")
+                + " will be forgotten. The pages stay in your history."
+            a.addButton(withTitle: "Clear"); a.addButton(withTitle: "Cancel")
+            a.buttons.first?.hasDestructiveAction = true
+            if a.runModal() == .alertFirstButtonReturn { archive.clear() }
+        },
+        item(.clearHistory) {
+            let a = NSAlert()
+            a.messageText = "Clear all browsing history?"
+            a.informativeText = HistoryWindow.clearAllText
+            a.addButton(withTitle: "Clear"); a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn {
+                let history = Store.store(for: Windows.current?.profileID ?? ProfileManager.activeProfileID)
+                Task { _ = await HistoryWindow.clearAll(history) }
+            }
+        },
+        .separator(),
+        // Arc has no Bookmarks menu; what Timo imports from other browsers lives here.
+        menu("Bookmarks", [
+
+            item(.bookmarkPage) {
+                let profileID = Windows.current?.profileID ?? ProfileManager.activeProfileID
+                Windows.current?.active?.toggleBookmark(); rebuild()
+                BookmarkManager.refresh(profileID: profileID)
+            },
+            item("Manage Bookmarks…", "") { BookmarkManager.show(profileID: BookmarkManager.currentActionProfile) },
+            item("Import Bookmarks…", "") { BookmarkImport.chooseAndImport(profileID: BookmarkManager.currentActionProfile) },
+            item("Export Bookmarks…", "") { Export.chooseAndExport(.bookmarks, profileID: BookmarkManager.currentActionProfile) },
+            .separator(),
+        ] + Store.store(for: bookmarkProfileID).bookmarks(limit: 15).map { b in
+            item(b.title.isEmpty ? b.url : b.title, "") {
+                guard let url = URL(string: b.url) else { return }
+                let profileID = BookmarkManager.currentActionProfile
+                let target = BookmarkManager.browserWindow(for: profileID)
+                target?.shown.active?.navigate(to: url)
+            }
+        }),
+    ]))
+    let extensionHost = Windows.main?.extensions ?? ExtensionHost.shared
+    root.addItem(menu("Extensions", [
+        item("Manage Extensions…", "") { ExtensionManagement.show(for: extensionHost) },
+        validated(item("Install from Chrome Web Store…", "") { extensionHost.chooseStoreInstall(); rebuild() }) {
+            extensionHost.profileID != Profile.incognito.id
+        },
+        validated(item(.installExtension) { extensionHost.chooseAndInstall(); rebuild() }) {
+            extensionHost.profileID != Profile.incognito.id
+        },
+    ]))
+    // Standard, and standard is the point: ⌘M was dead until this menu existed, and the
+    // window list is AppKit's to fill in once it knows which menu is the Window menu.
+    let window = menu("Window", [
+        // Not a targetless `performMiniaturize:` item: that is dispatched down the responder
+        // chain, so with a Peek up — borderless, and so not miniaturisable — AppKit found
+        // nobody to answer it and greyed the item out, while ⌘M itself went through the
+        // monitor and worked. Mouse and VoiceOver users got a dead item for a keystroke that
+        // was alive. It runs the same ladder the keystroke does, and greys itself out only
+        // when that ladder has no window to give.
+        validated(item(.minimizeWindow) { minimizeWindow() }) { minimizeVictim() != nil },
+        Standard.item("Zoom"),
+        .separator(),
+        item(.showLibrary) { toggleLibrary() },
+        validated(item(.showEasels) { EaselWindow.open(in: Windows.current) }) { EaselWindow.canOpen },
+        .separator(),
+        littleArcWindows(),
+        Standard.item("Bring All to Front"),
+    ])
+    root.addItem(window)
+    NSApp.windowsMenu = window.submenu
+    // AppKit files a window into this menu as it is ordered front — and the menu is thrown
+    // away and rebuilt every time a checkmark moves, taking the list with it. Saying it
+    // again about every window is what keeps the list there; `changeWindowsItem` adds or
+    // updates, so repeating it cannot double anything up.
+    for w in NSApp.windows where !w.isExcludedFromWindowsMenu && !w.title.isEmpty {
+        NSApp.changeWindowsItem(w, title: w.title, filename: false)
+    }
+    let help = menu("Help", [
+        item("Report a Problem…", "") { IssueReportWindow.show() },
+        .separator(),
+        item(.timoHelp) {
+            if let u = URL(string: "https://github.com/senommu/timo") { NSWorkspace.shared.open(u) }
+        },
+        item(.keyboardShortcutsHelp) { SettingsWindow.show(tab: "shortcuts") },
+    ])
+    root.addItem(help)
+    NSApp.helpMenu = help.submenu
+    return root
+}

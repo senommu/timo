@@ -1,0 +1,65 @@
+import AppKit
+import XCTest
+import NativeTestHostBootstrap
+
+@MainActor final class NativeApplicationLoopSmokeTests: XCTestCase {
+    func testNativeHostBootstrapPrecedesAppKit() throws {
+        try assertNativeHostBootstrap()
+    }
+
+    private func assertNativeHostBootstrap() throws {
+        XCTAssertTrue(TimoNativeTestHostBootstrapRan(), "The test-only bootstrap object must be linked")
+        XCTAssertTrue(TimoNativeTestHostBootstrapWasEarly(), "The workaround must run before NSApplication is created")
+        XCTAssertTrue(TimoNativeTestHostBootstrapConfigured(), "Late or ineffective AppKit setup must fail clearly")
+        let arguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        let enabled = try XCTUnwrap(arguments["NSEventConcurrentProcessingEnabled"] as? Bool)
+        XCTAssertFalse(enabled, "Only this process's volatile argument domain configures the test host")
+    }
+
+    func testOwnedLoopAdmitsAsyncWorkAndStops() async throws {
+        try assertNativeHostBootstrap()
+        TestEnvironment.prepare()
+        guard ProcessInfo.processInfo.environment["TIMO_APPKIT_LOOP_SMOKE"] == "1" else {
+            throw XCTSkip("Requires a fresh selected process and the bounded owned driver")
+        }
+        for cycle in 1...2 {
+            let loop = try await NativeFixtureApplicationLoop.acquire()
+            var bodyError: (any Error)?
+            do {
+                try loop.verifyRunning()
+                try await Task.sleep(for: .milliseconds(50))
+                try loop.verifyRunning()
+            } catch { bodyError = error }
+            do { try await loop.close() }
+            catch {
+                if bodyError == nil { bodyError = error }
+                else { XCTFail("Native fixture AppKit loop also failed while joining smoke") }
+            }
+            if let bodyError { throw bodyError }
+            XCTAssertFalse(NSApplication.shared.isRunning)
+            print("AppKit loop smoke: cycle=\(cycle), completed=true")
+        }
+        try await exerciseDelayedHeartbeat()
+    }
+
+    private func exerciseDelayedHeartbeat() async throws {
+        let warmup = try await NativeFixtureApplicationLoop.acquire()
+        try await warmup.close()
+        XCTAssertTrue(NSRunningApplication.current.isFinishedLaunching)
+        let loop = try await NativeFixtureApplicationLoop.acquire(beforeHeartbeat: {
+            // Controlled executor admission delay, inside the unchanged 12s
+            // startup watchdog. The application has already finished launching.
+            try? await Task.sleep(for: .seconds(6))
+        })
+        var failure: (any Error)?
+        do { try loop.verifyRunning() } catch { failure = error }
+        do { try await loop.close() }
+        catch {
+            if failure == nil { failure = error }
+            else { XCTFail("Delayed heartbeat loop also failed while joining: \(error)") }
+        }
+        if let failure { throw failure }
+        XCTAssertFalse(NSApplication.shared.isRunning)
+        print("AppKit loop smoke: delayedHeartbeat=true, completed=true")
+    }
+}

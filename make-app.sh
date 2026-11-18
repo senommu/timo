@@ -1,0 +1,251 @@
+#!/bin/bash
+# Build Timo.app — a double-clickable bundle. The binary links only system frameworks
+# (AppKit + WebKit), with a signed XPC service for installing updates outside the sandbox.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+CONF="${1:-release}"
+APP="Timo.app"
+BIN=".build/$CONF/timo"
+SKIP_APP_BUILD=false
+case "${2:-}" in
+  "") ;;
+  --skip-app-build)
+    [ "$CONF" = debug ] || { echo '--skip-app-build is only supported for debug CI assembly' >&2; exit 1; }
+    SKIP_APP_BUILD=true ;;
+  *) echo "Unknown packaging option: $2" >&2; exit 1 ;;
+esac
+
+# Restricted iCloud grants are opt-in build inputs. Never attach invented grants
+# to the ordinary ad-hoc app: CloudKit can terminate such a process on first use.
+ENT="$(pwd)/Timo.entitlements"
+ICLOUD_BUILD_INPUTS=""
+if [ -n "${TIMO_ICLOUD_PROFILE:-}" ]; then
+  [ -n "${SIGN_ID:-}" ] && [ "$SIGN_ID" != - ] \
+    || { echo 'iCloud provisioning requires a real SIGN_ID' >&2; exit 1; }
+  [ -n "${TIMO_ICLOUD_CONTAINER:-}" ] \
+    || { echo 'TIMO_ICLOUD_CONTAINER must name the assigned CloudKit container' >&2; exit 1; }
+  [ -f "$TIMO_ICLOUD_PROFILE" ] \
+    || { echo 'TIMO_ICLOUD_PROFILE does not exist' >&2; exit 1; }
+  ICLOUD_BUILD_INPUTS="$(mktemp -d)"
+  trap 'rm -rf "$ICLOUD_BUILD_INPUTS"' EXIT
+  security cms -D -i "$TIMO_ICLOUD_PROFILE" -o "$ICLOUD_BUILD_INPUTS/profile.plist"
+  python3 scripts/icloud-entitlements.py "$ICLOUD_BUILD_INPUTS/profile.plist" "$ENT" \
+    "$ICLOUD_BUILD_INPUTS/Timo.entitlements" "$TIMO_ICLOUD_CONTAINER" "$SIGN_ID"
+  ENT="$ICLOUD_BUILD_INPUTS/Timo.entitlements"
+elif [ -n "${TIMO_ICLOUD_CONTAINER:-}" ]; then
+  echo 'TIMO_ICLOUD_CONTAINER requires TIMO_ICLOUD_PROFILE' >&2; exit 1
+fi
+
+VERSION="${TIMO_VERSION:-}"
+[ -z "$VERSION" ] && VERSION="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
+case "$VERSION" in [0-9]*) ;; *) VERSION="0.1.0" ;; esac
+BUILD="${TIMO_BUILD:-$(git rev-list --count HEAD 2>/dev/null || echo 1)}"
+
+# Local and prerelease bundles must never ask to take over the user's browser.
+DEFAULT_BROWSER_PROMPT=false
+if [ "$CONF" = release ] && [ -n "${SIGN_ID:-}" ] && [ "${SIGN_ID:-}" != - ] \
+   && [[ "$VERSION" != *-* ]]; then
+  DEFAULT_BROWSER_PROMPT=true
+fi
+
+echo ">> building ($CONF)..."
+# CI already built with its chosen SwiftPM engine. Re-entering the default
+# engine here can compile again and replace .build/debug with different products.
+if [ "$SKIP_APP_BUILD" = false ]; then swift build -c "$CONF"; fi
+[ -x "$BIN" ] || { echo "no binary at $BIN"; exit 1; }
+
+# Only shared debug CI assembly may reuse helper products. A trusted fingerprint
+# covers the compiler/SDK; content hashes cover sources, flags and this policy.
+# Release and ordinary local builds always compile, even if a CI stamp exists.
+build_helper() {
+  local output="$1"; shift
+  local stamp="$output.inputs.sha256" key="" input
+  if [ "$SKIP_APP_BUILD" = true ] && [ -n "${TIMO_CI_TOOLCHAIN_KEY:-}" ]; then
+    key=$({
+      printf '%s\0' "$TIMO_CI_TOOLCHAIN_KEY" "$@"
+      shasum -a 256 make-app.sh
+      for input in "$@"; do
+        if [ -f "$input" ]; then shasum -a 256 "$input"; fi
+      done
+    } | shasum -a 256 | cut -d ' ' -f 1)
+    if [ -f "$output" ] && [ -x "$output" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$key" ]; then
+      echo ">> reusing $(basename "$output") (matching inputs/toolchain)"
+      return
+    fi
+  fi
+  rm -f "$stamp"
+  xcrun swiftc "$@" -o "$output"
+  if [ -n "$key" ]; then printf '%s\n' "$key" > "$stamp"; fi
+}
+
+echo ">> building update installer..."
+INSTALLER_BIN=".build/$CONF/TimoUpdateInstaller"
+build_helper "$INSTALLER_BIN" -O Sources/Timo/BundleReplacement.swift Sources/Timo/UpdateVersion.swift Sources/Timo/UpdateInstaller.swift \
+  Sources/UpdateInstaller/UpdateInstallation.swift Sources/UpdateInstaller/InstallerService.swift Sources/UpdateInstaller/InstallerRelaunch.swift Sources/Timo/UpdateRelaunch.swift \
+  Sources/UpdateInstaller/main.swift
+
+echo ">> building icon persistence service..."
+ICON_SERVICE_BIN=".build/$CONF/TimoIconService"
+build_helper "$ICON_SERVICE_BIN" -swift-version 6 -O Sources/Timo/AppIconPersistence.swift Sources/IconService/main.swift
+
+echo ">> compiling app icon..."
+ICONOUT="$(mktemp -d)"
+# Committed renders keep builds working on hosts without the Icon Composer compiler.
+# Refresh all sources with scripts/compile-app-icons.sh; see AppIcons/README.md.
+if [ -f AppIcons/Prebuilt/Assets.car ] && [ -f AppIcons/Prebuilt/AppIcon.icns ]; then
+  cp AppIcons/Prebuilt/AppIcon.icns AppIcons/Prebuilt/Assets.car "$ICONOUT/"
+  echo ">> using pre-rendered Icon Composer assets (AppIcons/Prebuilt/)"
+elif scripts/compile-app-icons.sh "$ICONOUT" >/dev/null 2>&1 \
+     && [ -f "$ICONOUT/AppIcon.icns" ]; then
+  echo ">> rendered all app-icon finishes (Icon Composer)"
+else
+  echo "  WARN: no icon assets; the bundle will use the generic app icon"
+fi
+
+echo ">> assembling ${APP}..."
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+if [ -n "$ICLOUD_BUILD_INPUTS" ]; then
+  cp "$TIMO_ICLOUD_PROFILE" "$APP/Contents/embedded.provisionprofile"
+fi
+cp "$BIN" "$APP/Contents/MacOS/Timo"
+cp -R ".build/$CONF/Timo_timo.bundle" "$APP/Contents/Resources/"
+INSTALLER="$APP/Contents/XPCServices/io.github.senommu.timo.UpdateInstaller.xpc"
+mkdir -p "$INSTALLER/Contents/MacOS"
+cp installer/UpdateInstaller-Info.plist "$INSTALLER/Contents/Info.plist"
+cp "$INSTALLER_BIN" "$INSTALLER/Contents/MacOS/TimoUpdateInstaller"
+ICON_SERVICE="$APP/Contents/XPCServices/io.github.senommu.timo.IconService.xpc"
+mkdir -p "$ICON_SERVICE/Contents/MacOS"
+cp installer/IconService-Info.plist "$ICON_SERVICE/Contents/Info.plist"
+cp "$ICON_SERVICE_BIN" "$ICON_SERVICE/Contents/MacOS/TimoIconService"
+# The Icon Composer output. Assets.car carries the Tahoe icon the system shapes itself
+# (read via CFBundleIconName); the .icns is the compatibility plate. The .icns alone would
+# make Tahoe draw a second squircle under an already-rounded bitmap, so both ship.
+# The car holds the standard icon and all material variants — what Settings ▸ Icon's
+# app-icon picker reads by name. Nothing extra goes in the Info.plist for that: macOS has no
+# alternate-icon API (setAlternateIconName is UIKit's), so actool's partial plist adds only
+# the CFBundleIconFile/CFBundleIconName pair already written below, and Timo switches the
+# icon by assigning NSApp.applicationIconImage. See AppIcon.swift.
+if [ -f "$ICONOUT/AppIcon.icns" ]; then cp "$ICONOUT/AppIcon.icns" "$APP/Contents/Resources/"; fi
+if [ -f "$ICONOUT/Assets.car" ];   then cp "$ICONOUT/Assets.car"   "$APP/Contents/Resources/"; fi
+
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>               <string>Timo</string>
+  <key>CFBundleDisplayName</key>        <string>Timo</string>
+  <key>CFBundleExecutable</key>         <string>Timo</string>
+  <key>CFBundleIconFile</key>           <string>AppIcon</string>
+  <key>CFBundleIconName</key>           <string>AppIcon</string>
+  <key>CFBundleIdentifier</key>         <string>io.github.senommu.timo</string>
+  <key>CFBundlePackageType</key>        <string>APPL</string>
+  <key>CFBundleShortVersionString</key> <string>$VERSION</string>
+  <key>CFBundleVersion</key>            <string>$BUILD</string>
+  <key>TimoDefaultBrowserPromptEnabled</key> <$DEFAULT_BROWSER_PROMPT/>
+  <key>LSMinimumSystemVersion</key>     <string>26.0</string>
+  <key>NSHighResolutionCapable</key>    <true/>
+  <key>NSPrincipalClass</key>           <string>NSApplication</string>
+  <key>LSApplicationCategoryType</key>  <string>public.app-category.productivity</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>          <string>Web site URL</string>
+      <key>CFBundleTypeRole</key>         <string>Viewer</string>
+      <key>CFBundleURLSchemes</key>       <array><string>http</string><string>https</string></array>
+    </dict>
+  </array>
+  <!-- Finder ▸ Open With ▸ Timo. Every type here is one WebKit already draws, so claiming
+       it costs no code of ours; Files.swift keeps the same list. Alternate rank throughout:
+       Timo offers to open a PDF, it does not take it away from Preview. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>         <string>PDF Document</string>
+      <key>CFBundleTypeRole</key>         <string>Viewer</string>
+      <key>LSHandlerRank</key>            <string>Alternate</string>
+      <key>LSItemContentTypes</key>       <array><string>com.adobe.pdf</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>         <string>HTML Document</string>
+      <key>CFBundleTypeRole</key>         <string>Viewer</string>
+      <key>LSHandlerRank</key>            <string>Alternate</string>
+      <key>LSItemContentTypes</key>       <array><string>public.html</string><string>public.xhtml</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>         <string>Image</string>
+      <key>CFBundleTypeRole</key>         <string>Viewer</string>
+      <key>LSHandlerRank</key>            <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.png</string>
+        <string>public.jpeg</string>
+        <string>public.svg-image</string>
+        <string>com.compuserve.gif</string>
+        <string>org.webmproject.webp</string>
+      </array>
+    </dict>
+  </array>
+  <!-- Plain http to a hostname is refused by ATS without this, so HTTPS-only's "Load
+       Insecurely" and any page with HTTPS-only off would fail with -1022. Web content only:
+       Timo's own URLSession traffic keeps ATS. -->
+  <key>NSAppTransportSecurity</key>
+  <dict><key>NSAllowsArbitraryLoadsInWebContent</key> <true/></dict>
+  <key>NSCameraUsageDescription</key>     <string>Websites you visit can ask to use your camera.</string>
+  <key>NSMicrophoneUsageDescription</key> <string>Websites you visit can ask to use your microphone.</string>
+  <key>NSLocationUsageDescription</key> <string>Websites you visit can ask for your location.</string>
+  <key>NSLocationWhenInUseUsageDescription</key> <string>Websites you visit can ask for your location.</string>
+</dict>
+</plist>
+PLIST
+
+# The entitlements carry com.apple.security.app-sandbox, so signing is no longer cosmetic:
+# an unsigned bundle is an *unsandboxed* bundle, and it would write to a different data
+# directory than the sandboxed one. Fail loudly rather than shipping the wrong app.
+if [ -n "${SIGN_ID:-}" ]; then
+  # Sign inside out. The installer intentionally has no App Sandbox entitlement;
+  # signing it with the browser's entitlements would reproduce update quarantine.
+  codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$INSTALLER"
+  codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$ICON_SERVICE"
+  codesign --force --options runtime --timestamp --entitlements "$ENT" \
+    --sign "$SIGN_ID" "$APP"
+  echo "OK: signed with Developer ID ($SIGN_ID)"
+else
+  codesign --force --sign - "$INSTALLER"
+  codesign --force --sign - "$ICON_SERVICE"
+  codesign --force --entitlements "$ENT" --sign - "$APP"
+  echo "OK: signed (ad-hoc)"
+fi
+
+# Cheap proof the sandbox actually made it into the signature. codesign prints an
+# "Executable=..." banner before the plist, so this greps rather than parses.
+ENTS="$(codesign -d --entitlements - --xml "$APP" 2>&1)"
+echo "$ENTS" | grep -q "com.apple.security.app-sandbox" \
+  || { echo "FAIL: com.apple.security.app-sandbox is not in the signature"; exit 1; }
+# Recovery and cleanup belong to XPC too. Never silently reintroduce broad browser writes.
+echo "$ENTS" | grep -q "temporary-exception.files.absolute-path.read-only" \
+  || { echo "FAIL: read-only /Applications inspection is missing"; exit 1; }
+echo "$ENTS" | grep -q "temporary-exception.files.home-relative-path.read-only" \
+  || { echo "FAIL: read-only user Applications inspection is missing"; exit 1; }
+if echo "$ENTS" | grep -Eq 'temporary-exception.files.(absolute-path|home-relative-path).read-write'; then
+  echo "FAIL: browser has broad application-folder write access"; exit 1
+fi
+
+codesign --verify --deep --strict "$APP"
+INSTALLER_ENTS="$(codesign -d --entitlements - --xml "$INSTALLER" 2>&1)"
+if echo "$INSTALLER_ENTS" | grep -q "com.apple.security.app-sandbox"; then
+  echo "FAIL: update installer must run outside the browser sandbox"; exit 1
+fi
+
+ICON_SERVICE_ENTS="$(codesign -d --entitlements - --xml "$ICON_SERVICE" 2>&1)"
+if echo "$ICON_SERVICE_ENTS" | grep -q "com.apple.security.app-sandbox"; then
+  echo "FAIL: icon persistence service must run outside the browser sandbox"; exit 1
+fi
+
+# Deliberately no `lsregister -f`: it force-registers whatever bundle was just built under
+# the shared bundle id, so a build in a worktree would take over the user's http/https
+# default and run against their real container. Launch Services registers the bundle the
+# first time it is launched with `open`, which is how anyone actually runs it.
+echo "OK: built $APP (sandboxed) — open with: open $APP"

@@ -1,0 +1,190 @@
+import AppKit
+import XCTest
+@testable import timo
+
+@MainActor final class AppLifecycleTests: XCTestCase {
+    private func window() -> NSWindow {
+        TestEnvironment.prepare()
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                              styleMask: [.titled, .closable, .miniaturizable],
+                              backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.orderFront(nil)
+        addTeardownBlock { @MainActor in window.close() }
+        return window
+    }
+
+    private func minimize(_ window: NSWindow) async throws {
+        window.miniaturize(nil)
+        let deadline = Date.now.addingTimeInterval(3)
+        while !window.isMiniaturized && Date.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(window.isMiniaturized)
+    }
+
+    private func reopen(_ lifecycle: AppLifecycle, restoring window: NSWindow) async throws {
+        XCTAssertFalse(lifecycle.applicationShouldHandleReopen(NSApplication.shared,
+                                                              hasVisibleWindows: true))
+        let deadline = Date.now.addingTimeInterval(3)
+        while window.isMiniaturized && Date.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertFalse(window.isMiniaturized)
+        XCTAssertTrue(window.isVisible)
+    }
+
+    private func quitByCommandQ() async throws -> NSApplication.TerminateReply {
+        TestEnvironment.prepare()
+        let app = NSApplication.shared
+        weak var weakLifecycle: AppLifecycle?
+        let completed = XCTestExpectation(description: "quit persistence reply completed")
+        var accepted: Bool?
+        let lifecycle = AppLifecycle(terminationReply: { _, answer in
+            weakLifecycle?.endPersistenceExit()
+            accepted = answer
+            completed.fulfill()
+        })
+        weakLifecycle = lifecycle
+        let warning = Prefs.warnBeforeQuit
+        Prefs.warnBeforeQuit = true
+        defer { Prefs.warnBeforeQuit = warning }
+        // Cancel a warning if one appears, so the assertion can detect it without
+        // leaving a modal session running or changing the warning preference.
+        let timer = Timer(timeInterval: 0.01, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                if QuitDialog.isUp { app.stopModal() }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        defer { timer.invalidate() }
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+                                                  modifierFlags: .command,
+                                                  timestamp: ProcessInfo.processInfo.systemUptime,
+                                                  windowNumber: app.keyWindow?.windowNumber ?? 0,
+                                                  context: nil, characters: "q",
+                                                  charactersIgnoringModifiers: "q",
+                                                  isARepeat: false, keyCode: 12))
+        app.postEvent(event, atStart: true)
+        _ = app.nextEvent(matching: .keyDown, until: Date.now.addingTimeInterval(1),
+                          inMode: .default, dequeue: true)
+        XCTAssertEqual(app.currentEvent?.charactersIgnoringModifiers, "q")
+        let reply = lifecycle.applicationShouldTerminate(app)
+        XCTAssertTrue(Prefs.warnBeforeQuit)
+        if reply == .terminateLater {
+            await fulfillment(of: [completed], timeout: 10)
+            XCTAssertEqual(accepted, true)
+            XCTAssertFalse(lifecycle.persistenceExitInProgress)
+            XCTAssertFalse(Store.admissionPaused, "Quit fixture must join its asynchronous reply before returning")
+        }
+        return reply
+    }
+
+    func testCommandQQuitsImmediatelyAfterTheLastWindowCloses() async throws {
+        let closed = window()
+        closed.close()
+        let reply = try await quitByCommandQ()
+        XCTAssertEqual(reply, .terminateLater)
+        XCTAssertFalse(Store.admissionPaused, "Quit fixture must join its asynchronous reply before returning")
+    }
+
+    func testCommandQStillWarnsWithAnOpenWindow() async throws {
+        _ = window()
+        let reply = try await quitByCommandQ()
+        XCTAssertEqual(reply, .terminateCancel)
+    }
+
+    func testCommandQStillWarnsWithAMinimizedWindow() async throws {
+        let minimized = window()
+        try await minimize(minimized)
+        let reply = try await quitByCommandQ()
+        XCTAssertEqual(reply, .terminateCancel)
+    }
+
+    func testOffscreenPreviewHostDoesNotCauseAQuitWarning() async throws {
+        let host = window()
+        host.isExcludedFromWindowsMenu = true
+        host.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
+        let reply = try await quitByCommandQ()
+        XCTAssertEqual(reply, .terminateLater)
+    }
+
+    func testDockClickRestoresAMinimizedWindowDespiteTheVisibleWindowsFlag() async throws {
+        let lifecycle = AppLifecycle()
+        let window = window()
+        try await minimize(window)
+        try await reopen(lifecycle, restoring: window)
+    }
+
+    func testDockClickRestoresOnlyTheLastMinimizedWindowRatherThanTheLastCreated() async throws {
+        let lifecycle = AppLifecycle()
+        let first = window(), second = window()
+        try await minimize(second)
+        try await minimize(first)
+        try await reopen(lifecycle, restoring: first)
+        XCTAssertTrue(second.isMiniaturized)
+    }
+
+    func testDockClickLeavesMinimizedWindowsAloneWhileAnotherWindowIsOpen() async throws {
+        let lifecycle = AppLifecycle()
+        let minimized = window()
+        let visible = window()
+        try await minimize(minimized)
+        XCTAssertTrue(lifecycle.applicationShouldHandleReopen(NSApplication.shared,
+                                                             hasVisibleWindows: true))
+        XCTAssertTrue(minimized.isMiniaturized)
+        XCTAssertTrue(visible.isVisible)
+    }
+
+    func testFloatingPanelDoesNotPreventRestoringAMinimizedWindow() async throws {
+        let lifecycle = AppLifecycle()
+        let minimized = window()
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+                            styleMask: [.titled], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.orderFront(nil)
+        addTeardownBlock { @MainActor in panel.close() }
+        try await minimize(minimized)
+        try await reopen(lifecycle, restoring: minimized)
+    }
+
+    func testOffscreenPreviewHostDoesNotPreventRestoringAMinimizedWindow() async throws {
+        let lifecycle = AppLifecycle()
+        let minimized = window()
+        // Match the persistent renderer host created by Previews.webView(for:).
+        let host = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                            styleMask: [.borderless], backing: .buffered, defer: false)
+        host.isReleasedWhenClosed = false
+        host.isExcludedFromWindowsMenu = true
+        host.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
+        host.orderFront(nil)
+        addTeardownBlock { @MainActor in host.close() }
+        XCTAssertTrue(host.isVisible)
+        try await minimize(minimized)
+        try await reopen(lifecycle, restoring: minimized)
+    }
+
+    func testClosingTheLastMinimizedWindowRestoresThePreviousOne() async throws {
+        let lifecycle = AppLifecycle()
+        let first = window(), second = window()
+        try await minimize(first)
+        try await minimize(second)
+        second.close()
+        try await reopen(lifecycle, restoring: first)
+    }
+
+    func testMinimizingARestoredWindowMakesItTheMostRecentAgain() async throws {
+        let lifecycle = AppLifecycle()
+        let first = window(), second = window()
+        try await minimize(first)
+        try await minimize(second)
+        let restored = expectation(forNotification: NSWindow.didDeminiaturizeNotification,
+                                   object: first)
+        first.deminiaturize(nil)
+        await fulfillment(of: [restored], timeout: 3)
+        try await minimize(first)
+        try await reopen(lifecycle, restoring: first)
+        XCTAssertTrue(second.isMiniaturized)
+    }
+}

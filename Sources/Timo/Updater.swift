@@ -1,0 +1,1217 @@
+import AppKit
+
+/// Everything about an update that is a function of its inputs and nothing else: which tag
+/// is newer, which asset to fetch, when the next poll is due, and what a download has to
+/// prove before Timo will hand it to the user. No network, no bundle, no clock — so
+/// `selfcheck --pure` can drive all of it on a headless runner.
+enum Release {
+
+    // MARK: - Versions
+
+    /// A semver-ish tag: `1.2.3`, `v1.2.3`, `1.2.3-beta.2`, `1.2.3+7`. The numeric core is
+    /// the whole of the parse; anything else is `nil`, and a `nil` version is never newer
+    /// than anything. A tag nobody can read must not push an upgrade *or* a downgrade.
+    typealias Version = UpdateVersion
+
+    /// The only version question the app ever asks. Never true for equal versions, never
+    /// true downhill, never true for a tag that does not parse.
+    static func isNewer(_ tag: String, than current: String) -> Bool {
+        guard let a = Version(tag), let b = Version(current) else { return false }
+        return b < a
+    }
+
+    // MARK: - Assets
+
+    /// The `.zip`, and only the `.zip` — not the `.dmg`, which every release also ships.
+    /// A sandboxed process cannot mount a disk image at all: `hdiutil attach` comes back
+    /// "Device not configured", because DiskArbitration is not reachable from inside the
+    /// sandbox (measured, with a probe signed with Timo.entitlements). The zip is the one
+    /// asset Timo can open by itself, and opening it by itself is the whole feature. The
+    /// dmg stays on the release for people downloading it in a browser.
+    static func asset(_ assets: [(name: String, url: String)]) -> URL? {
+        trusted(assets.first { $0.name.lowercased().hasSuffix(".zip") }
+            .flatMap { URL(string: $0.url) })
+    }
+
+    // MARK: - When to look
+
+    /// Why a check is being considered. The menu always wins; the rest are rate-limited,
+    /// because the whole point of checking often is that checking is nearly free.
+    enum Reason { case launch, activation, timer, menu }
+
+    /// Coming back to the app is the moment an update is most welcome, so activation gets
+    /// the shortest floor.
+    static let activationFloor: TimeInterval = 5 * 60
+    static let period: TimeInterval = 30 * 60
+    /// After a network error or a rate-limit reply, back off until the next success. GitHub
+    /// gives an unauthenticated client 60 requests an hour and a 403 when it runs out;
+    /// hammering it after one is how a client stays locked out.
+    static let backoffPeriod: TimeInterval = 60 * 60
+
+    static func due(_ reason: Reason, last: Date?, backingOff: Bool, now: Date) -> Bool {
+        switch reason {
+        case .menu:   return true                    // the user asked; a floor would look broken
+        case .launch: return true
+        case .activation, .timer:
+            guard let last else { return true }
+            let floor = backingOff ? backoffPeriod
+                                   : (reason == .activation ? activationFloor : period)
+            return now.timeIntervalSince(last) >= floor
+        }
+    }
+
+    // MARK: - Where the new copy goes
+
+    /// The two folders a sandboxed Timo is allowed to write an app into, by entitlement.
+    /// Nothing else is reachable, and nothing else needs to be: an app belongs in one of
+    /// these, and a copy that is somewhere else is a copy that has not been installed yet.
+    static func applicationsFolders(home: String) -> [String] {
+        ["/Applications", home + "/Applications"]
+    }
+
+    /// Where an update to the bundle at `path` should be written, given the two folders and
+    /// the home directory. A copy already living in an Applications folder is replaced where
+    /// it stands, Vesta-style. A copy anywhere else — a build on the Desktop, an unzip in
+    /// Downloads, a bundle still on its mounted disk image — is *installed*: the new version
+    /// goes to /Applications and the old copy is left exactly where it was.
+    /// ponytail: no folder picker, no bookmark, no helper. Two entitlements cover every
+    /// place an app is actually kept, and there is nothing to ask.
+    static func destination(forBundleAt path: String, home: String) -> (path: String, moved: Bool) {
+        // Anywhere *under* an Applications folder counts as installed, not just directly in
+        // one: plenty of people keep `/Applications/Browsers/Timo.app`, and hoisting it to
+        // the top level would be Timo tidying up a filing system that was not its idea.
+        // A folder that merely ends in the word ("~/Old Applications") is not one of them,
+        // which is why this is a path prefix and not a `contains`.
+        for root in applicationsFolders(home: home) where path.hasPrefix(root + "/") {
+            return (path, false)
+        }
+        return ("/Applications/" + (path as NSString).lastPathComponent, true)
+    }
+
+    /// A bundle's `CFBundleShortVersionString`, read straight off disk. No launching, no
+    /// `Bundle(url:)` — this is asked about a copy of Timo that is not running and must not
+    /// be started just to be interrogated.
+    static func version(ofBundleAt url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist")),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dict = plist as? [String: Any] else { return nil }
+        return dict["CFBundleShortVersionString"] as? String
+    }
+
+    /// Keep an unreadable installed bundle distinct from an empty destination.
+    static func installedVersion(at url: URL) -> String? {
+        FileManager.default.fileExists(atPath: url.path)
+            ? (version(ofBundleAt: url) ?? "") : nil
+    }
+
+    // MARK: - What a check is allowed to say
+
+    /// The answer to a check. A *background* check may only ever put up the offer of a real
+    /// update: nobody opened a browser to be told it is up to date, and a browser that
+    /// reports on its own update server every half hour is a browser that talks too much.
+    /// A check the user pressed answers either way, because a button that does nothing
+    /// visible looks broken.
+    enum Answer: Equatable {
+        case offer(String)   // a newer tag — the only thing a launch may ever say
+        case upToDate
+        case unreachable
+        case nothing
+    }
+
+    /// Whether "nothing to offer" means this copy is *behind* rather than current. `offerable`
+    /// also refuses a tag that is genuinely newer than the running copy, when the bundle it
+    /// would be written over is not one this copy may overwrite — so somebody running 1.0.0
+    /// with 2.0.0 in /Applications was being told 1.0.0 was up to date, with 2.0.0 on the
+    /// releases page. Same inputs the offer was measured with, asked the other way round.
+    static func behind(tag: String?, running: String) -> Bool {
+        tag.map { isNewer($0, than: running) } ?? false
+    }
+
+    static func answer(newer: String?, manual: Bool, reachable: Bool) -> Answer {
+        guard reachable else { return manual ? .unreachable : .nothing }
+        if let newer { return .offer(newer) }
+        return manual ? .upToDate : .nothing
+    }
+
+    /// Whether this launch should install itself into `/Applications` and come back from
+    /// there. Silently and without asking: a copy running from a mounted disk image or out
+    /// of Downloads is a copy that was never installed, and "drag me to Applications" is not
+    /// a question anyone wants to be asked by a browser.
+    ///
+    /// Only a real signed release does this. An ad-hoc or locally-signed build stays exactly
+    /// where it was built — otherwise every `./make-app.sh` in a worktree would move itself
+    /// on top of the installed app — and so does an instance running on its own data
+    /// directory, which is by definition a test.
+    /// `installedVersion` is what is already at the destination: `nil` when nothing is
+    /// there, and the empty string when something is there whose version cannot be read.
+    /// Both of those are answered deliberately — an empty destination is installed into, and
+    /// one that cannot be read is left alone, because the one thing this must never do is
+    /// overwrite a Timo it does not understand.
+    static func shouldRelocate(bundlePath: String, home: String, official: Bool, isolated: Bool,
+                               runningVersion: String, installedVersion: String?) -> Bool {
+        guard official, !isolated else { return false }
+        guard destination(forBundleAt: bundlePath, home: home).moved else { return false }
+        // Nothing installed yet: this copy is the install.
+        guard let installedVersion else { return true }
+        // Something is. Only a *newer* copy may replace it — otherwise double-clicking an
+        // old release still sitting in ~/Downloads would quietly downgrade the installed
+        // Timo, move the good one aside as `.app.old`, and relaunch into the old one. The
+        // release left in Downloads is the one people forget about; it must not win.
+        return isNewer(runningVersion, than: installedVersion)
+    }
+
+    /// Whether a downloaded release may be written over whatever is at the destination — the
+    /// same rule `shouldRelocate` applies to a copy already on disk, asked of one that has
+    /// just come off the network. Both decide what may overwrite the installed Timo, so both
+    /// decide it the same way.
+    ///
+    /// It matters because the destination is not always the bundle this process runs out of:
+    /// an old copy in ~/Downloads checks for updates, is offered the tag *it* is behind, and
+    /// installs it over `/Applications/Timo.app` — which may already be newer than the tag
+    /// being fetched. `installedVersion` keeps `shouldRelocate`'s convention: `nil` when
+    /// nothing is there, `""` when something is there whose version cannot be read. An equal
+    /// version, an older one and an unreadable one are all left alone.
+    static func shouldInstall(tag: String, installedVersion: String?) -> Bool {
+        guard let installedVersion else { return true }
+        return isNewer(tag, than: installedVersion)
+    }
+
+    /// The tag a check may actually put on screen, or nil for "there is nothing to offer".
+    ///
+    /// An update has to clear *two* versions, not one: the copy that is running, and the copy
+    /// at the destination it would be written over. Almost always those are the same bundle
+    /// and the second question costs nothing — but not always, and the exception is the one
+    /// that bites. An old release still sitting in ~/Downloads runs 1.0.0 while
+    /// `/Applications/Timo.app` is already 2.0.0; tag 2.0.0 is newer than what is *running*,
+    /// so the offer went up, the whole zip came down, and only then did `shouldInstall` refuse
+    /// it — "Update failed", and the next tick offered exactly the same thing again. Asking
+    /// both questions before arming is that same decision, made before the download rather
+    /// than after it.
+    ///
+    /// `installed` keeps `shouldInstall`'s convention: nil when nothing is at the destination,
+    /// "" when something is there whose version cannot be read.
+    static func offerable(tag: String, running: String, installed: String?) -> String? {
+        guard isNewer(tag, than: running),
+              shouldInstall(tag: tag, installedVersion: installed) else { return nil }
+        return tag
+    }
+
+    // MARK: - What a download has to prove
+
+    /// The Developer ID team every Timo release is signed by. Pinned: this constant, and
+    /// nothing read off the network or off the running bundle, is what a download has to
+    /// match. See `Updater.verified`.
+    static let teamID = "T7X84HN3W3"
+
+    /// The requirement every downloaded bundle must satisfy, whoever is running. A constant
+    /// rather than a question about the running copy — see `requirement(forTeam:)`.
+    static var pinnedRequirement: String? { requirement(forTeam: teamID) }
+
+    /// GitHub's own hosts, over TLS, and nothing else. The release JSON arrives over a
+    /// verified connection, but the asset URL *inside* it is still a string that came off the
+    /// network — and one read back out of `UserDefaults` is a string that came off the
+    /// network a week ago. A downloader that follows it anywhere is a downloader that can be
+    /// pointed anywhere, so both go through here.
+    static func trusted(_ url: URL?) -> URL? {
+        guard let url, url.scheme == "https", let host = url.host()?.lowercased(),
+              host == "github.com" || host.hasSuffix(".github.com")
+                || host == "githubusercontent.com" || host.hasSuffix(".githubusercontent.com")
+        else { return nil }
+        return url
+    }
+
+    /// A release is a few tens of megabytes. Anything claiming to be hundreds is either not
+    /// a release or not worth filling a disk to find out.
+    static let maxAssetBytes: Int64 = 200 * 1024 * 1024
+
+    /// The designated requirement text for a team. `nil` for a missing or empty team, which
+    /// is the guard that matters: a `nil` requirement handed to `SecStaticCodeCheckValidity`
+    /// means "any signature that is internally consistent", and an ad-hoc bundle is
+    /// internally consistent. Callers pass `teamID` and refuse the download if this is nil —
+    /// they never build a requirement out of whatever the running copy happens to be signed
+    /// by, because a dev build signed by nobody would then accept a release signed by nobody.
+    static func requirement(forTeam team: String?) -> String? {
+        guard let team, !team.isEmpty else { return nil }
+        return "anchor apple generic and certificate leaf[subject.OU] = \"\(team)\""
+    }
+}
+
+// MARK: - check
+
+extension Release {
+    static func check() -> [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        func v(_ a: String, _ b: String) -> Bool { isNewer(a, than: b) }
+
+        out.append(("a higher patch is newer", v("0.1.1", "0.1.0")))
+        out.append(("a higher minor is newer", v("0.2.0", "0.1.9")))
+        out.append(("ten beats nine, it is not a string compare", v("0.10.0", "0.9.0")))
+        out.append(("a leading v is not part of the version", v("v1.0.0", "0.9.9")))
+        out.append(("...on either side", v("1.0.0", "v0.9.9")))
+        out.append(("the same version is not newer", !v("0.1.0", "0.1.0")))
+        out.append(("0.1 and 0.1.0 are the same version", !v("0.1", "0.1.0")))
+        out.append(("an older tag never downgrades", !v("0.1.0", "0.2.0")))
+        out.append(("build metadata does not make a version newer", !v("1.0.0+9", "1.0.0")))
+        out.append(("a pre-release is older than the release it leads to", !v("1.0.0-beta.1", "1.0.0")))
+        out.append(("...and the release is offered to someone on the beta", v("1.0.0", "1.0.0-beta.1")))
+        out.append(("beta.10 comes after beta.2", v("1.0.0-beta.10", "1.0.0-beta.2")))
+        out.append(("alpha comes before beta", v("1.0.0-beta", "1.0.0-alpha")))
+        out.append(("a malformed tag is not newer", !v("wat", "0.1.0")))
+        out.append(("...nor is an empty one", !v("", "0.1.0")))
+        out.append(("...nor one with a letter in the core", !v("1.2.x", "0.1.0")))
+        out.append(("an unreadable current version never triggers an update either",
+                    !v("9.9.9", "unknown")))
+
+        let dmg = "https://github.com/senommu/timo/releases/download/v1/Timo.dmg"
+        let zip = "https://github.com/senommu/timo/releases/download/v1/Timo.zip"
+        out.append(("the zip is the asset to fetch, because it is the one Timo can open",
+                    asset([("Timo.dmg", dmg), ("Timo.zip", zip)])?.absoluteString == zip))
+        out.append(("...whatever order the release lists them in",
+                    asset([("Timo.zip", zip), ("Timo.dmg", dmg)])?.absoluteString == zip))
+        out.append(("a dmg-only release cannot be installed from inside the sandbox",
+                    asset([("Timo.dmg", dmg)]) == nil))
+        out.append(("case does not matter", asset([("TIMO.ZIP", zip)])?.absoluteString == zip))
+        out.append(("a release with no bundle in it offers nothing",
+                    asset([("notes.txt", "https://github.com/senommu/timo/notes.txt")]) == nil))
+        out.append(("an asset whose url is not a url is not an asset",
+                    asset([("Timo.zip", "")]) == nil))
+
+        let now = Date(timeIntervalSince1970: 100_000)
+        func ago(_ s: TimeInterval) -> Date { now.addingTimeInterval(-s) }
+        out.append(("the first check happens at launch",
+                    due(.launch, last: nil, backingOff: false, now: now)))
+        out.append(("the menu always checks, however recently we looked",
+                    due(.menu, last: now, backingOff: false, now: now)))
+        out.append(("coming back to the app checks after five minutes",
+                    due(.activation, last: ago(301), backingOff: false, now: now)))
+        out.append(("...and not before",
+                    !due(.activation, last: ago(60), backingOff: false, now: now)))
+        out.append(("the timer checks every half hour",
+                    due(.timer, last: ago(1801), backingOff: false, now: now)))
+        out.append(("...and a minute-by-minute tick in between costs no request",
+                    !due(.timer, last: ago(600), backingOff: false, now: now)))
+        out.append(("after an error nothing asks again for an hour",
+                    !due(.activation, last: ago(1800), backingOff: true, now: now)))
+        out.append(("...and then it does",
+                    due(.activation, last: ago(3601), backingOff: true, now: now)))
+        out.append(("backing off never silences the menu",
+                    due(.menu, last: now, backingOff: true, now: now)))
+
+        let home = "/Users/ada"
+        func dest(_ p: String) -> (path: String, moved: Bool) {
+            destination(forBundleAt: p, home: home)
+        }
+        out.append(("an app in /Applications is replaced where it stands",
+                    dest("/Applications/Timo.app") == ("/Applications/Timo.app", false)))
+        out.append(("...and one in the user's own Applications folder too",
+                    dest("/Users/ada/Applications/Timo.app")
+                        == ("/Users/ada/Applications/Timo.app", false)))
+        out.append(("a build on the Desktop is installed rather than updated in place",
+                    dest("/Users/ada/Desktop/timo/Timo.app") == ("/Applications/Timo.app", true)))
+        out.append(("...and so is a copy still running off its disk image",
+                    dest("/Volumes/Timo/Timo.app") == ("/Applications/Timo.app", true)))
+        out.append(("a folder that merely ends in Applications is not one of them",
+                    dest("/Users/ada/Old Applications/Timo.app").moved))
+        out.append(("an app filed in a folder inside Applications is already installed",
+                    dest("/Applications/Browsers/Timo.app")
+                        == ("/Applications/Browsers/Timo.app", false)))
+
+        out.append(("an asset served from anywhere but GitHub is not an asset",
+                    asset([("Timo.zip", "https://evil.example.com/Timo.zip")]) == nil))
+        out.append(("...nor one served in the clear",
+                    asset([("Timo.zip", "http://github.com/Timo.zip")]) == nil))
+        out.append(("...nor one on a host that merely ends in the right letters",
+                    asset([("Timo.zip", "https://notgithub.com/Timo.zip")]) == nil))
+        out.append(("the redirect target GitHub actually uses is trusted",
+                    trusted(URL(string: "https://objects.githubusercontent.com/x")) != nil))
+        out.append(("a release is capped at something a release could be",
+                    maxAssetBytes > 50 * 1024 * 1024 && maxAssetBytes < 1024 * 1024 * 1024))
+
+        out.append(("a launch that finds an update says so",
+                    answer(newer: "v2", manual: false, reachable: true) == .offer("v2")))
+        out.append(("a launch that finds nothing says nothing at all",
+                    answer(newer: nil, manual: false, reachable: true) == .nothing))
+        out.append(("...and a launch that cannot reach GitHub says nothing either",
+                    answer(newer: nil, manual: false, reachable: false) == .nothing))
+        out.append(("pressing Check for Updates when there is none says so",
+                    answer(newer: nil, manual: true, reachable: true) == .upToDate))
+        out.append(("...and says so when GitHub cannot be reached",
+                    answer(newer: nil, manual: true, reachable: false) == .unreachable))
+        out.append(("pressing it when there IS one offers it, same as a launch",
+                    answer(newer: "v2", manual: true, reachable: true) == .offer("v2")))
+
+        // The whole answer, arming included: what a check says about a tag given the version
+        // running *and* the version at the destination it would be written over. The pair
+        // matters when they are different bundles — an old copy left in ~/Downloads, running
+        // 1.0.0, while /Applications is already on 2.0.0.
+        func says(_ tag: String, running: String, atDestination: String?, manual: Bool) -> Answer {
+            answer(newer: offerable(tag: tag, running: running, installed: atDestination),
+                   manual: manual, reachable: true)
+        }
+        out.append(("an old copy is not offered a release the installed Timo already has",
+                    says("v2.0.0", running: "1.0.0", atDestination: "2.0.0", manual: true)
+                        == .upToDate))
+        out.append(("...and is told it is behind rather than up to date, which would be a lie",
+                    behind(tag: "v2.0.0", running: "1.0.0")))
+        out.append(("a copy running the newest release really is up to date",
+                    !behind(tag: "v2.0.0", running: "2.0.0")))
+        out.append(("...as is one that was told about no tag at all",
+                    !behind(tag: nil, running: "1.0.0")))
+        out.append(("...and a background check does not even mention it",
+                    says("v2.0.0", running: "1.0.0", atDestination: "2.0.0", manual: false)
+                        == .nothing))
+        out.append(("a release newer than both the running copy and the installed one is offered",
+                    says("v3.0.0", running: "1.0.0", atDestination: "2.0.0", manual: false)
+                        == .offer("v3.0.0")))
+        out.append(("a destination whose version cannot be read is never offered over",
+                    says("v2.0.0", running: "1.0.0", atDestination: "", manual: true)
+                        == .upToDate))
+        out.append(("...while an empty destination is offered into",
+                    says("v2.0.0", running: "1.0.0", atDestination: nil, manual: false)
+                        == .offer("v2.0.0")))
+        out.append(("a release this copy is already running is not offered, wherever it lives",
+                    says("v2.0.0", running: "2.0.0", atDestination: nil, manual: true)
+                        == .upToDate))
+
+        func relocate(_ path: String, official: Bool = true, isolated: Bool = false,
+                      running: String = "1.0.0", installed: String? = nil) -> Bool {
+            shouldRelocate(bundlePath: path, home: home, official: official, isolated: isolated,
+                           runningVersion: running, installedVersion: installed)
+        }
+        out.append(("a release opened from its disk image installs itself",
+                    relocate("/Volumes/Timo/Timo.app")))
+        out.append(("...and one unzipped into Downloads does too",
+                    relocate("/Users/ada/Downloads/Timo.app")))
+        out.append(("an absent destination is installed into, whatever version is running",
+                    relocate("/Users/ada/Downloads/Timo.app", running: "0.9.0", installed: nil)))
+        out.append(("a newer release opened from Downloads replaces the installed one",
+                    relocate("/Users/ada/Downloads/Timo.app", running: "2.0.0", installed: "1.0.0")))
+        out.append(("an older release opened from Downloads never replaces a newer installed Timo",
+                    !relocate("/Users/ada/Downloads/Timo.app", running: "1.0.0", installed: "2.0.0")))
+        out.append(("...nor does one that is exactly the version already installed",
+                    !relocate("/Users/ada/Downloads/Timo.app", running: "2.0.0", installed: "2.0.0")))
+        out.append(("a destination whose version cannot be read is left alone",
+                    !relocate("/Users/ada/Downloads/Timo.app", running: "2.0.0", installed: "")))
+        // The same rule, asked of a download rather than of a copy on disk: the offer was
+        // measured against the running version, which is not always the installed one.
+        out.append(("a download installs into an empty destination",
+                    shouldInstall(tag: "v1.0.0", installedVersion: nil)))
+        out.append(("...and over an older installed Timo",
+                    shouldInstall(tag: "v2.0.0", installedVersion: "1.0.0")))
+        out.append(("a download never downgrades the installed Timo",
+                    !shouldInstall(tag: "v1.0.0", installedVersion: "2.0.0")))
+        out.append(("...nor reinstalls the version already there",
+                    !shouldInstall(tag: "v2.0.0", installedVersion: "2.0.0")))
+        out.append(("...nor overwrites a destination whose version cannot be read",
+                    !shouldInstall(tag: "v2.0.0", installedVersion: "")))
+        out.append(("one already in /Applications stays put", !relocate("/Applications/Timo.app")))
+        out.append(("...as does one in the user's own Applications folder",
+                    !relocate("/Users/ada/Applications/Timo.app")))
+        out.append(("...and one filed in a folder inside Applications",
+                    !relocate("/Applications/Browsers/Timo.app")))
+        out.append(("a build that is not a signed release never moves itself",
+                    !relocate("/Users/ada/Desktop/timo/Timo.app", official: false)))
+        out.append(("...and neither does a test instance on its own data directory",
+                    !relocate("/Users/ada/Desktop/timo/Timo.app", isolated: true)))
+
+        // The version read, against a real bundle on disk — the input `shouldRelocate`
+        // depends on, and the one part of it that is not arithmetic.
+        let fm = FileManager.default
+        let scratch = fm.temporaryDirectory.appendingPathComponent("timo-version-check-\(getpid())")
+        let bundle = scratch.appendingPathComponent("Timo.app")
+        try? fm.createDirectory(at: bundle.appendingPathComponent("Contents"),
+                                withIntermediateDirectories: true)
+        let plist: [String: Any] = ["CFBundleShortVersionString": "2.3.4", "CFBundleName": "Timo"]
+        if let data = try? PropertyListSerialization.data(fromPropertyList: plist,
+                                                          format: .xml, options: 0) {
+            try? data.write(to: bundle.appendingPathComponent("Contents/Info.plist"))
+        }
+        out.append(("an installed bundle's version is read off disk, without launching it",
+                    version(ofBundleAt: bundle) == "2.3.4"))
+        out.append(("a bundle that is not there has no version",
+                    version(ofBundleAt: scratch.appendingPathComponent("Nope.app")) == nil))
+        // ...and a bundle whose plist is unreadable, which `relocateIfNeeded` turns into ""
+        // so that the destination is left alone rather than overwritten.
+        let broken = scratch.appendingPathComponent("Broken.app")
+        try? fm.createDirectory(at: broken.appendingPathComponent("Contents"),
+                                withIntermediateDirectories: true)
+        try? Data("not a plist".utf8).write(to: broken.appendingPathComponent("Contents/Info.plist"))
+        out.append(("a bundle with an unreadable Info.plist has no version either",
+                    version(ofBundleAt: broken) == nil))
+        try? fm.removeItem(at: scratch)
+
+        out.append(("the requirement is pinned to one team, not to whoever is running",
+                    pinnedRequirement == requirement(forTeam: teamID) && pinnedRequirement != nil))
+        out.append(("a release must be signed by Timo's own team",
+                    requirement(forTeam: teamID)
+                        == "anchor apple generic and certificate leaf[subject.OU] = \"T7X84HN3W3\""))
+        out.append(("an ad-hoc build demands no Developer ID it does not have itself",
+                    requirement(forTeam: nil) == nil))
+        out.append(("...and an empty team is the same as none", requirement(forTeam: "") == nil))
+        return out
+    }
+}
+
+/// Timo's in-app updater: ask GitHub for the latest release, and if it is newer than the
+/// running bundle say so in a sticky toast the user can act on or dismiss. Modelled on
+/// Vesta's `Updater.swift`, and it ends the same way — a bundle swapped in place and a
+/// relaunch — but it gets there differently, because Timo is sandboxed.
+///
+/// Downloads and ZIP extraction stay inside the browser sandbox. Sandboxed writes carry
+/// quarantine, and the sandbox cannot remove it: installing from this process caused a
+/// fresh "downloaded from the Internet" confirmation after every update, even though the
+/// release was notarized. A bundled, signed XPC service now copies the release, verifies
+/// the final copy and its Gatekeeper assessment, removes quarantine, and atomically
+/// publishes it. The service runs as the same user, without the browser's sandbox.
+/// Timo and the service authenticate each other by Developer ID team and bundle ID.
+@MainActor final class Updater {
+    static let shared = Updater()
+    static let repo = "senommu/timo"
+    private static var launchedReplacement = false
+    private static let launchWorker = BackupWorker()
+
+    private let defaults: UserDefaults
+    private let fetchRelease: (URLRequest) async throws -> (Data, URLResponse)
+    private var requestGeneration: UInt = 0
+    private var channel: UpdateChannel {
+        UpdateChannel.stored(defaults.string(forKey: UpdateChannel.preferenceKey))
+    }
+
+    init(defaults: UserDefaults = .timo,
+         fetchRelease: @escaping (URLRequest) async throws -> (Data, URLResponse) = {
+             try await URLSession.shared.data(for: $0)
+         }) {
+        self.defaults = defaults
+        self.fetchRelease = fetchRelease
+    }
+
+    static var currentVersion: String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
+    }
+    /// Only a real `.app` can be replaced by a downloaded one; the bare binary out of
+    /// `.build` has no version to compare and nothing to install into, so it opens the page.
+    private static var isBundled: Bool { Bundle.main.bundleURL.pathExtension == "app" }
+
+    static var releasesPage: URL { URL(string: "https://github.com/\(repo)/releases")! }
+
+    /// Describe actual transport failures; a timeout or a server error does not prove
+    /// this Mac is offline. Local browsing never depends on a reachability preflight.
+    enum ConnectionIssue: Equatable, Sendable {
+        case offline, interrupted, timedOut
+
+        init?(_ error: Error) {
+            let error = error as NSError
+            guard error.domain == NSURLErrorDomain else { return nil }
+            switch error.code {
+            case NSURLErrorNotConnectedToInternet: self = .offline
+            case NSURLErrorNetworkConnectionLost: self = .interrupted
+            case NSURLErrorTimedOut: self = .timedOut
+            default: return nil
+            }
+        }
+
+        var checkMessage: String {
+            switch self {
+            case .offline: "You’re offline"
+            case .interrupted: "Network lost"
+            case .timedOut: "Timed out"
+            }
+        }
+
+        var downloadMessage: String {
+            switch self {
+            case .offline: "You’re offline"
+            case .interrupted: "Network lost"
+            case .timedOut: "Timed out"
+            }
+        }
+    }
+
+    enum Phase: Equatable {
+        case available(String)      // tag — press Update to fetch it
+        case downloading(Double)    // 0…1
+        case installing             // unpacking and swapping
+        case ready                  // the new copy is in place; only a relaunch is left
+        /// The payload is the tag that must never be offered again — a release this copy
+        /// has *decided* against, rather than one that merely had a bad network day. A
+        /// transient failure carries nil, so pressing Update again, or the next tick, may
+        /// retry it.
+        case failed(String?)
+        case downloadFailed(ConnectionIssue) // keeps the pending release for an explicit retry
+    }
+
+    /// Whether an offer of `tag` may be armed over whatever is already on screen. Pure, so
+    /// the rule that stopped a refused release re-arming itself every half hour is provable
+    /// without a network or a sidebar.
+    ///
+    /// Nothing may interrupt an update already in flight; a tag the user has been offered
+    /// and put away must not re-stick; and a tag that has been refused must not come back to
+    /// be refused again — which is what `.failed` carrying its tag is for. Before it did,
+    /// `fail()` moved the phase off `.available`, so the "already offered" test stopped
+    /// matching and every check re-armed the same doomed offer.
+    nonisolated static func mayArm(tag: String, over phase: Phase?, working: Bool) -> Bool {
+        guard !working else { return false }
+        switch phase {
+        case .none:                             return true
+        case .downloading, .installing, .ready: return false
+        case let .available(offered):           return offered != tag
+        case let .failed(refused):              return refused != tag
+        case .downloadFailed:                   return true
+        }
+    }
+
+    private(set) var phase: Phase?
+    private var pending: (tag: String, asset: URL, fallback: URL?)?
+    /// Where the new copy went — the same path, or /Applications when it was installed.
+    private var installed: URL?
+    private var working = false
+    private var download: UpdateDownload?
+    private var poll: Task<Void, Never>?
+    private var lastCheck: Date?
+    private var backingOff = false
+    /// One id for the whole update, so every phase rewrites the same pill in place rather
+    /// than sliding a new one up from the sidebar's edge five times.
+    private let toastID = UUID()
+
+    // MARK: - Polling
+
+    /// Called once from `main.swift`. A single minute-by-minute tick drives launch, timer
+    /// and backoff alike — `Release.due` decides whether a tick costs a request, and mostly
+    /// it costs a conditional one that comes back 304.
+    func begin() {
+        // Not installed yet — running off a mounted disk image, or out of Downloads, or
+        // wherever it was unzipped. Put it where apps live and come back from there, with no
+        // toast and no question: "drag me to Applications" is not something a browser should
+        // ever ask, and neither is "may I?". Only a real signed release does this; see
+        // `Release.shouldRelocate`. If it works this process is on its way out, so there is
+        // nothing else to start.
+        if relocateIfNeeded() { return }
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { Updater.shared.tick(.activation) }
+        }
+        poll?.cancel()
+        poll = Task { [weak self] in
+            // Not at launch: the first seconds belong to restoring windows and loading pages.
+            try? await Task.sleep(for: .seconds(5))
+            guard let self else { return }
+            tick(.launch)
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled else { return }
+                tick(.timer)
+            }
+        }
+    }
+
+    private func tick(_ reason: Release.Reason) {
+        guard Prefs.checkForUpdates,
+              Release.due(reason, last: lastCheck, backingOff: backingOff, now: Date())
+        else { return }
+        check(silent: true)
+    }
+
+    /// Drop the old channel's offer and invalidate replies already on the wire. An update
+    /// being installed keeps its transaction; the new selection applies to future checks.
+    func channelChanged() {
+        requestGeneration &+= 1
+        lastCheck = nil
+        backingOff = false
+        // An active transaction owns its captured asset, but a later retry must check
+        // the newly selected channel instead of downloading the old offer again.
+        pending = nil
+        guard !working, phase != .installing, phase != .ready else { return }
+        phase = nil
+        if let toast = Toasts.shared.queue.sticky, toast.id == toastID {
+            Toasts.shared.dismiss(toast)
+        }
+        if defaults.object(forKey: "checkForUpdates") as? Bool ?? true {
+            check(silent: true)
+        }
+    }
+
+    // MARK: - Check
+
+    /// `silent: false` is the menu item: it reports "up to date" rather than saying nothing,
+    /// and it checks however recently the timer did.
+    func check(silent: Bool) {
+        // A background check must not disturb a download in flight or a finished one waiting
+        // to be dragged. The menu still runs, so the user can see where things got to.
+        // Not while an install is in flight, and not while one is finished and waiting for
+        // its relaunch — for the menu as much as for the timer. A loud check used to be
+        // exempt, which meant Timo ▸ Check for Updates… during an install could re-arm the
+        // Update button behind it: press it and a second `unpackAndSwap` starts, deletes the
+        // `.old` the first one had just moved the running app into, and the only copy of the
+        // app is gone. `working` stays true from the first byte of the download until the
+        // swap has returned, so the two of them cannot overlap.
+        if working || phase == .installing || phase == .ready {
+            // Say where it got to rather than saying nothing; the phase toast is already up,
+            // so this is only for the case where the user dismissed it with the ×.
+            if !silent, let phase { set(phase) }
+            return
+        }
+        lastCheck = Date()
+        Task { await fetch(silent: silent) }
+    }
+
+    func fetch(silent: Bool) async {
+        let channel = self.channel
+        requestGeneration &+= 1
+        let generation = requestGeneration
+        guard let api = URL(string: "https://api.github.com/repos/\(Self.repo)/\(channel.apiPath)")
+        else { return }
+        var req = URLRequest(url: api)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        // Conditional, so half-hourly polling costs nothing: a 304 does not count against
+        // GitHub's 60-an-hour unauthenticated limit and carries no body to parse. The stored
+        // tag and asset are what make a 304 actionable across a relaunch — without them the
+        // "nothing changed" reply would answer a question we had forgotten the answer to.
+        if let etag = defaults.string(forKey: channel.cacheKey("etag")) {
+            req.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        }
+        if let since = defaults.string(forKey: channel.cacheKey("lastModified")) {
+            req.setValue(since, forHTTPHeaderField: "If-Modified-Since")
+        }
+        // URLSession's own cache would answer a 304 with the cached 200 and hide the cheap
+        // path from us; our two headers are the cache.
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+
+        do {
+            let (data, response) = try await fetchRelease(req)
+            guard self.channel == channel, generation == requestGeneration else { return }
+            guard let http = response as? HTTPURLResponse else { return failedCheck(silent) }
+            switch http.statusCode {
+            case 304:
+                backingOff = false
+                // Through `trusted` again: a url that has been sitting in defaults since a
+                // previous launch is still a url that came off the network.
+                present(tag: defaults.string(forKey: channel.cacheKey("tag")),
+                        asset: Release.trusted(defaults.string(forKey: channel.cacheKey("asset"))
+                            .flatMap(URL.init(string:))),
+                        fallback: Release.trusted(defaults.string(forKey: channel.cacheKey("fallbackAsset"))
+                            .flatMap(URL.init(string:))), silent: silent)
+            case 200:
+                let release = try channel.release(from: data)
+                let tag = release?.tag
+                let asset = Release.asset(release?.assets.map { ($0.name, $0.url) } ?? [])
+                let fallback = Release.asset(release?.assets.map { ($0.name, $0.browserURL ?? "") } ?? [])
+                // Only a decoded response may advance the conditional cache. Otherwise a
+                // later 304 could turn a malformed response into a stale update offer.
+                backingOff = false
+                remember(http, channel: channel)
+                defaults.set(tag, forKey: channel.cacheKey("tag"))
+                defaults.set(asset?.absoluteString, forKey: channel.cacheKey("asset"))
+                defaults.set(fallback?.absoluteString, forKey: channel.cacheKey("fallbackAsset"))
+                present(tag: tag, asset: asset, fallback: fallback, silent: silent)
+            default:
+                // 403 is the rate limit, 404 a repo with no release yet, 5xx a bad day.
+                backingOff = true
+                failedCheck(silent)
+            }
+        } catch {
+            guard self.channel == channel, generation == requestGeneration else { return }
+            backingOff = true
+            failedCheck(silent, error: error)
+        }
+    }
+
+    private func remember(_ http: HTTPURLResponse, channel: UpdateChannel) {
+        defaults.set(http.value(forHTTPHeaderField: "ETag"), forKey: channel.cacheKey("etag"))
+        defaults.set(http.value(forHTTPHeaderField: "Last-Modified"),
+                     forKey: channel.cacheKey("lastModified"))
+    }
+
+    /// A silent check that cannot reach GitHub says nothing at all — a browser that toasts
+    /// about its own update server every half hour on a bad connection is a broken browser.
+    private func failedCheck(_ silent: Bool, error: Error? = nil) {
+        guard Release.answer(newer: nil, manual: !silent, reachable: false) == .unreachable
+        else { return }
+        if let issue = error.flatMap(ConnectionIssue.init) {
+            Toasts.show(issue.checkMessage, action: ("Retry", { [weak self] in
+                self?.check(silent: false)
+            }), wraps: true)
+        } else {
+            Toasts.show("Couldn't check for updates",
+                        action: ("Open Releases", { NSWorkspace.shared.open(Self.releasesPage) }))
+        }
+    }
+
+    private func present(tag: String?, asset: URL?, fallback: URL?, silent: Bool) {
+        // The whole of the "when may this say anything" rule, in one pure call. A launch and
+        // a half-hourly tick may only ever offer a real update; "up to date" belongs to the
+        // person who pressed Check for Updates and to nobody else.
+        //
+        // What counts as "a real update" is measured against both the running copy and the
+        // one at the destination — see `Release.offerable`. Measuring it against the running
+        // copy alone armed offers that `install` would later refuse, which cost a whole zip
+        // per press and came back every half hour.
+        let newer = tag.flatMap {
+            Release.offerable(tag: $0, running: Self.currentVersion,
+                              installed: Self.destinationBundle.version)
+        }
+        switch Release.answer(newer: newer, manual: !silent, reachable: true) {
+        case .upToDate:
+            // "Nothing to offer" is not always "you are current": see `Release.behind`.
+            if let tag, Release.behind(tag: tag, running: Self.currentVersion) {
+                Toasts.show("Timo \(tag) is out, but this copy can't install it",
+                            action: ("Open Releases",
+                                     { NSWorkspace.shared.open(Self.releasesPage) }))
+            } else {
+                Toasts.show("Timo \(Self.currentVersion) is up to date")
+            }
+            return
+        case .nothing:
+            return
+        case .unreachable:
+            return failedCheck(silent)
+        case .offer:
+            break
+        }
+        guard let tag else { return }
+        // No bundle (the dev binary) or a release with nothing to install: the page is the
+        // honest answer, and only when the user asked.
+        guard Self.isBundled, let asset else {
+            if !silent { NSWorkspace.shared.open(Self.releasesPage) }
+            return
+        }
+        // An ad-hoc or locally-signed build can download a release perfectly well and then
+        // refuse it: `verified` pins Timo's Developer ID team, and this copy is not it. Say
+        // so up front rather than arming an Update button whose whole journey is a download
+        // followed by "Update failed".
+        guard Self.isOfficialBuild else {
+            if !silent {
+                Toasts.show("This copy isn't signed for updates",
+                            action: ("Releases", { NSWorkspace.shared.open(Self.releasesPage) }))
+            }
+            return
+        }
+        // Belt and braces with the guard in `check`: a reply that was already in flight when
+        // an install started must not put an Update button back on screen underneath it.
+        // Also the ×: a toast the user has put away must not come back every half hour for
+        // the same release, and neither must one this copy has already refused.
+        guard Self.mayArm(tag: tag, over: phase, working: working) else { return }
+        pending = (tag, asset, fallback)
+        set(.available(tag))
+    }
+
+
+    // MARK: - Download
+
+    func startDownload() {
+        guard !working else { return }
+        guard let (tag, asset, fallback) = pending else {
+            // A channel switch can retire an offer during an active download/install.
+            // The failed transaction's Retry then discovers the current channel afresh.
+            check(silent: false)
+            return
+        }
+        working = true
+        set(.downloading(0))
+        // The container's own tmp: nobody has to find this file, because nobody has to open
+        // it. It is unpacked, checked and deleted without ever being shown.
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Timo-update-\(UUID().uuidString).zip")
+        do {
+            download = try UpdateDownload.start(url: asset, fallbackURL: fallback, destination: dest,
+                maxBytes: Release.maxAssetBytes,
+                trusted: { Release.trusted($0) != nil },
+                progress: { bytes, expected in
+                    let fraction = expected > 0 ? min(1, Double(bytes) / Double(expected)) : 0
+                    Task { @MainActor in Updater.shared.downloaded(fraction: fraction) }
+                }, completion: { result in
+                    Task { @MainActor in
+                        Updater.shared.download = nil
+                        switch result {
+                        case .success(let file): Updater.shared.install(file, tag: tag)
+                        case .failure(let error):
+                            NSLog("[timo] update: download rejected: %@", String(describing: error))
+                            Updater.shared.downloadFailed(error)
+                        }
+                    }
+                })
+        } catch {
+            NSLog("[timo] update: could not start download: %@", String(describing: error))
+            downloadFailed(error)
+        }
+    }
+
+    /// A connection failure does not reject the release or discard its retry target.
+    func downloadFailed(_ error: Error) {
+        working = false
+        download = nil
+        if let issue = ConnectionIssue(error) {
+            set(.downloadFailed(issue))
+        } else {
+            fail()
+        }
+    }
+
+    private func downloaded(fraction: Double) {
+        guard working, case .downloading = phase else { return }
+        set(.downloading(fraction))
+    }
+
+    // MARK: - Install
+
+    private func install(_ zip: URL, tag: String) {
+        let (target, atDestination) = Self.destinationBundle
+        // Belt and braces with `Release.offerable`, which asked this same question before the
+        // offer was ever armed. It is asked again here because the destination is read off
+        // disk and a download takes minutes: another copy of Timo may have installed itself
+        // over it while this one was fetching. Refusing costs a discarded zip; not refusing
+        // would downgrade the installed Timo.
+        guard Release.shouldInstall(tag: tag, installedVersion: atDestination) else {
+            NSLog("[timo] update: %@ is not newer than what is at %@ — refusing to install it",
+                  tag, target.path)
+            try? FileManager.default.removeItem(at: zip)
+            pending = nil
+            // The tag goes with the failure: this is a decision, not a bad connection, and
+            // the next half-hourly check must not offer it all over again.
+            return fail(tag)
+        }
+        // `working` deliberately stays true across the swap — it is the flag every other
+        // entry point checks. Only the detached task below clears it, and only after
+        // `unpackAndSwap` has returned one way or the other.
+        download = nil
+        set(.installing)
+        Task.detached(priority: .userInitiated) {
+            let (ok, permanent) = Self.unpackAndSwap(zip: zip, target: target, tag: tag)
+            await MainActor.run {
+                Updater.shared.working = false
+                // The tag goes with the failure only when the release itself is the problem.
+                // A failed extraction or a failed rename is bad luck the next check may retry;
+                // a zip with no Timo in it, or one signed by somebody else, never gets better.
+                guard ok else { return Updater.shared.fail(permanent ? tag : nil) }
+                Updater.shared.pending = nil
+                Updater.shared.installed = target
+                Updater.shared.set(.ready)
+            }
+        }
+    }
+
+    /// The real home directory. `NSHomeDirectory()` is the container's, which has an
+    /// Applications folder of its own that nobody's apps are in.
+    nonisolated static var realHome: String {
+        getpwuid(getuid()).map { String(cString: $0.pointee.pw_dir) } ?? NSHomeDirectory()
+    }
+
+    /// The bundle an update would be written over, and the version already there, in
+    /// `shouldInstall`'s convention: `nil` for an empty destination, `""` for one whose
+    /// Info.plist could not be read. Not always the bundle this process runs out of, which is
+    /// the whole reason the offer, the install and `relocateIfNeeded` all ask.
+    nonisolated private static var destinationBundle: (url: URL, version: String?) {
+        let path = Release.destination(forBundleAt: Bundle.main.bundleURL.path,
+                                       home: realHome).path
+        let url = URL(fileURLWithPath: path)
+        let version = Release.installedVersion(at: url)
+        return (url, version)
+    }
+
+    /// Unpack the release and put it at `target`, replacing whatever is there.
+    ///
+    /// The ZIP is expanded inside the sandbox. The signed installer service prepares the
+    /// final copy outside the sandbox, then uses the same locked, crash-recoverable swap.
+    ///
+    /// `permanent` says which kind of failure it was: true when this *release* is the problem
+    /// — no Timo.app in the zip, or one signed by somebody who is not us — so the caller can
+    /// refuse the tag for good. Every other way out is a transient one (a failed extraction, a
+    /// rename the disk would not do), and the next check is welcome to try the same tag again.
+    nonisolated static func unpackAndSwap(zip: URL, target: URL, tag: String)
+        -> (ok: Bool, permanent: Bool) {
+        let fm = FileManager.default
+        let staged = fm.temporaryDirectory.appendingPathComponent("Timo-new-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: staged); try? fm.removeItem(at: zip) }
+        do {
+            try UpdateArchive.extract(zip: zip, to: staged)
+        } catch {
+            NSLog("[timo] update: archive rejected: %@", String(describing: error))
+            // Malformed or interrupted archives retain the existing retry policy.
+            return (false, false)
+        }
+        let incoming = staged.appendingPathComponent(target.lastPathComponent)
+        guard fm.fileExists(atPath: incoming.path) else {
+            NSLog("[timo] update: the release has no %@ in it", target.lastPathComponent)
+            return (false, true)
+        }
+        guard verified(incoming) else {
+            NSLog("[timo] update: the download is not signed by %@ — refusing it", Release.teamID)
+            return (false, true)
+        }
+
+        do {
+            try UpdateInstaller.install(source: incoming, target: target, tag: tag, keepPrevious: false)
+            return (true, false)
+        } catch {
+            NSLog("[timo] update: bundle replacement failed: %@", String(describing: error))
+            return (false, false)
+        }
+    }
+
+    /// Reconcile a transaction before any window opens. A replacement that crashed during
+    /// its previous launch is rolled back while its old bundle is still retained.
+    static func recoverAtLaunch() async {
+        guard isBundled else { return }
+        let target = Bundle.main.bundleURL
+        let launch: UpdateInstaller.Launch
+        do {
+            launch = try await launchWorker.run {
+                guard BundleReplacement.hasRecoveryWork(at: target) else { return .unchanged }
+                return try UpdateInstaller.beginLaunch(target: target)
+            }
+        } catch {
+            NSLog("[timo] pending update recovery helper unavailable: %@", error.localizedDescription)
+            exit(1)
+        }
+        switch launch {
+        case .unchanged:
+            break
+        case .waitingForHealth:
+            launchedReplacement = true
+        case .needsAttention:
+            NSLog("[timo] update: pending bundle transaction needs manual attention; refusing to launch an unconfirmed bundle")
+            exit(1)
+        case .rolledBack:
+            if ProcessInfo.processInfo.environment["TIMO_UPDATE_SUPERVISED"] == "1" {
+                // The unsandboxed worker independently verifies the restored bundle
+                // and reopens it with the isolated environment after this process exits.
+                exit(0)
+            }
+            if Store.overrideDirectory != nil {
+                // Released older helpers do not implement isolated relaunch scheduling.
+                // Retain isolation rather than falling back to sandboxed `open`, which
+                // drops the environment and could open the user's ordinary profile.
+                NSLog("[timo] previous bundle restored; reopen this isolated copy with TIMO_DATA_DIR")
+                exit(1)
+            }
+            do {
+                try await launchAfterExit(Bundle.main.bundleURL, recoverUnlaunched: false)
+                exit(0)
+            } catch {
+                NSLog("[timo] update: old bundle restored, but relaunch failed: %@",
+                      error.localizedDescription)
+                exit(1)
+            }
+        }
+    }
+
+    /// Called only by the process that observed a pending replacement at its own startup.
+    /// The old process may still be running from the same bundle path after the swap; it
+    /// must never mark the new copy healthy or delete its own backup on termination.
+    static func markHealthyLaunchAsync() async {
+        guard isBundled, launchedReplacement else { return }
+        let target = Bundle.main.bundleURL
+        do {
+            let healthy = try await launchWorker.run { try UpdateInstaller.markHealthy(target: target) }
+            guard healthy else {
+                NSLog("[timo] update: helper did not accept launch health confirmation")
+                return
+            }
+        } catch { NSLog("[timo] update: health confirmation failed: %@", error.localizedDescription) }
+    }
+
+    /// `refused` is the tag this copy has decided against and must never be offered again;
+    /// nil for a failure that was only bad luck — a dropped download, a zip that would not
+    /// unpack — which the next check is welcome to try again.
+    private func fail(_ refused: String? = nil) {
+        working = false
+        download = nil
+        set(.failed(refused))
+    }
+
+    /// Relaunch into the copy that was just put in place, then go.
+    ///
+    /// Not `openApplication(at:)`: when the new bundle sits at the *same path* this process
+    /// was launched from, LaunchServices sees a running instance of that application and
+    /// activates it instead of starting one — so the completion handler fires, this process
+    /// terminates, and there is no Timo left running at all. `createsNewApplicationInstance`
+    /// would avoid that but leaves two instances racing for the same windows file.
+    ///
+    /// XPC starts the unsandboxed supervisor before this browser exits. A direct child
+    /// inherits the browser sandbox and cannot perform recovery in Applications.
+    /// After recovery already restored an older bundle, a read-only open-after-exit
+    /// script remains compatible with older helpers lacking the new XPC protocol.
+    private static func launchAfterExit(_ target: URL, recoverUnlaunched: Bool = true) async throws {
+        let isolatedDirectory = Store.overrideDirectory
+        if recoverUnlaunched {
+            try await launchWorker.run {
+                try UpdateInstaller.scheduleRelaunch(target: target, isolatedDirectory: isolatedDirectory)
+            }
+            return
+        }
+        let script = UpdateRelaunch.script(parentPID: getpid(), target: target,
+                                          isolatedDirectory: isolatedDirectory)
+        try await launchWorker.run {
+            let helper = Process()
+            helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+            helper.arguments = ["-c", script]
+            try helper.run()
+        }
+    }
+
+    private var restarting = false
+    func restart() {
+        guard !restarting else { return }
+        restarting = true
+        let target = installed ?? Bundle.main.bundleURL
+        Task { [self] in
+            defer { restarting = false }
+            do {
+                try await Self.launchAfterExit(target)
+            } catch {
+                // The supervisor must accept the relaunch before this process quits.
+                // Preserve the installed update and keep the browser usable on failure.
+                NSLog("[timo] relaunch helper failed: \(error.localizedDescription)")
+                Toasts.stick("Update installed — quit and reopen Timo", id: toastID)
+                return
+            }
+            NSApp.terminate(nil)
+        }
+    }
+
+    // MARK: - The toast
+
+    private func set(_ p: Phase) {
+        phase = p
+        Toasts.stick(Self.text(for: p), id: toastID, action: Self.action(for: p))
+    }
+
+    /// What the pill says, as a function of the phase — so the wording is provable without
+    /// a sidebar to draw it in.
+    nonisolated static func text(for phase: Phase) -> String {
+        switch phase {
+        // The Update button makes the offer explicit. Keep the message short enough for
+        // its version, Update button and dismiss target to share the default-width row.
+        case let .available(tag):   return "Timo **\(tag)**"
+        case let .downloading(f):   return "Downloading… \(Int((f * 100).rounded()))%"
+        case .installing:           return "Installing…"
+        case .ready:                return "Restart to update"
+        case .failed:               return "Update failed"
+        case .downloadFailed(let issue): return issue.downloadMessage
+        }
+    }
+
+    static func action(for phase: Phase) -> (title: String, run: @MainActor () -> Void)? {
+        switch phase {
+        case .available:
+            return ("Update", { Updater.shared.startDownload() })
+        case .downloading, .installing:
+            return nil                                  // nothing to press while it works
+        case .ready:
+            return ("Restart", { Updater.shared.restart() })
+        case .failed(nil), .downloadFailed:
+            return ("Retry", { Updater.shared.startDownload() })
+        case .failed:
+            return ("Releases", { NSWorkspace.shared.open(Updater.releasesPage) })
+        }
+    }
+
+    // MARK: - Installing, and proving what was downloaded
+
+    /// Install this copy into `/Applications` and relaunch from there. Returns true when
+    /// that is under way and this process should do nothing else.
+    ///
+    /// The only toast this can produce is the one for a failure, because a failure is the
+    /// only outcome the user has to know about: a copy that cannot install itself will go on
+    /// running from wherever it is, and it will never be able to update itself from there.
+    private func relocateIfNeeded() -> Bool {
+        // Asked before anything is read off disk: a bare binary out of `.build` has no
+        // bundle to move and no destination worth stat-ing.
+        guard Self.isBundled else { return false }
+        let source = Bundle.main.bundleURL
+        // The same destination the offer and the install measure themselves against, read the
+        // same way: `nil` means nothing is there; `""` means something is there whose
+        // Info.plist could not be read, and `shouldRelocate` leaves it alone rather than
+        // guessing.
+        let (target, installed) = Self.destinationBundle
+        guard Release.shouldRelocate(bundlePath: source.path, home: Self.realHome,
+                                     official: Self.isOfficialBuild,
+                                     isolated: Store.overrideDirectory != nil,
+                                     runningVersion: Self.currentVersion,
+                                     installedVersion: installed)
+        else { return false }
+        Task.detached(priority: .userInitiated) {
+            let ok = Self.place(source, at: target)
+            await MainActor.run {
+                guard ok else {
+                    // Left where it is and still usable — just not updatable from there.
+                    Toasts.show("Couldn't move Timo to Applications")
+                    Updater.shared.begin()      // carry on as an ordinary launch
+                    return
+                }
+                Updater.shared.installed = target
+                Updater.shared.restart()
+            }
+        }
+        return true
+    }
+
+    /// Relocation uses the same staged verification and atomic swap as downloaded updates.
+    /// Its previous installed copy is retained after the new one reaches a healthy launch.
+    nonisolated private static func place(_ source: URL, at target: URL) -> Bool {
+        do {
+            let sourceVersion = Release.version(ofBundleAt: source) ?? ""
+            try UpdateInstaller.install(source: source, target: target,
+                                        tag: sourceVersion, keepPrevious: true)
+            return true
+        } catch {
+            NSLog("[timo] install: bundle replacement failed: %@", String(describing: error))
+            return false
+        }
+    }
+
+    /// The downloaded bundle must be signed by Timo's Developer ID team — `Release.teamID`,
+    /// a constant — and its signature must be intact.
+    ///
+    /// The team is pinned rather than compared against the running copy. An ad-hoc build has
+    /// no team, `SecCodeCopySigningInformation` can fail for reasons of its own, and either
+    /// way the answer would be `nil`; a `nil` requirement makes `SecStaticCodeCheckValidity`
+    /// accept *any* self-consistent signature, ad-hoc included. That is the whole check
+    /// turning itself off at exactly the moment it is needed. So: one team, always, and a
+    /// build that cannot name it refuses to install anything.
+    ///
+    /// The flags are what make this `codesign --verify --deep --strict --all-architectures`
+    /// rather than a glance at the top-level seal: `checkNestedCode` walks the frameworks and
+    /// helpers inside the bundle, `strictValidate` rejects the resource-envelope tricks that
+    /// let unsealed files ride along, and `checkAllArchitectures` checks every slice rather
+    /// than the one this Mac happens to run. Every file gets re-hashed, so a truncated or
+    /// edited download is refused here rather than launched.
+    nonisolated private static func verified(_ bundle: URL) -> Bool {
+        verifiedSignature(bundle, requirement: UpdateInstaller.requirement(identifier: "io.github.senommu.timo"))
+    }
+
+    /// The installer can displace a valid local Timo build as well as a release. Recovery
+    /// keeps that policy: validate its sealed Timo identity and recorded contents without
+    /// demanding a Developer ID from a previously accepted ad-hoc build.
+    nonisolated private static func verifiedPrevious(_ bundle: URL) -> Bool {
+        guard let version = Release.version(ofBundleAt: bundle), Release.Version(version) != nil else { return false }
+        return verifiedSignature(bundle, requirement: "identifier \"io.github.senommu.timo\"")
+    }
+
+    nonisolated private static func verifiedSignature(_ bundle: URL, requirement text: String) -> Bool {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(bundle as CFURL, [], &code) == errSecSuccess,
+              let code else { return false }
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess,
+              let requirement else { return false }
+        let flags = SecCSFlags(rawValue: kSecCSCheckNestedCode
+                               | kSecCSStrictValidate | kSecCSCheckAllArchitectures)
+        return SecStaticCodeCheckValidity(code, flags, requirement) == errSecSuccess
+    }
+
+    /// Whether this copy is signed by the team it will demand of its downloads. `verified`
+    /// pins that team regardless, so this is not what makes an update safe — it is what
+    /// stops a dev build offering one. Without it a locally-signed copy downloads a release
+    /// and then refuses it, and the user gets "Update failed" with no way to tell that the
+    /// release was fine and the running copy was the problem. See `present`.
+    nonisolated static var isOfficialBuild: Bool {
+        var me: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &me) == errSecSuccess,
+              let me else { return false }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(me, SecCSFlags(rawValue: kSecCSSigningInformation),
+                                            &info) == errSecSuccess,
+              let dict = info as? [String: Any] else { return false }
+        return dict[kSecCodeInfoTeamIdentifier as String] as? String == Release.teamID
+    }
+}

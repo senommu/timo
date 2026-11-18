@@ -1,0 +1,286 @@
+import AppKit
+import Darwin
+import SwiftUI
+import WebKit
+import ExtensionResourceBridge
+
+/// Arc's Developer Mode. On by itself for anything served from this machine, and a switch
+/// per site for everything else (Site Control Center, the command bar, ⌥⌘D). A tab in it
+/// gets a bar above the page with the full url and the tools a developer keeps reaching
+/// for, a striped toolbar joined to the page, and the Web Inspector — whatever the
+/// browser-wide "Allow Web Inspector" says.
+///
+/// ponytail: one `[host: Bool]` per profile, stored only where the answer differs from the
+/// automatic one, so turning it off for localhost:3000 is a row and turning it on for
+/// staging.example.com is a row, and the table stays empty for everyone else.
+@MainActor enum DeveloperMode {
+    /// Served from this machine: `localhost`, anything under it, and the loopback addresses.
+    /// Deliberately narrower than `HTTPSOnly.isLocal` — a router at 192.168.1.1 is on the
+    /// LAN, but it is not something you are developing.
+    nonisolated static func isLocal(_ url: URL?) -> Bool {
+        guard let h = url?.host()?.lowercased(), !h.isEmpty else { return false }
+        if h == "localhost" || h.hasSuffix(".localhost") { return true }
+        let host = h.hasPrefix("[") && h.hasSuffix("]") ? String(h.dropFirst().dropLast()) : h
+        if host == "0.0.0.0" { return true }
+        var v4 = in_addr()
+        if inet_pton(AF_INET, host, &v4) == 1 { return UInt32(bigEndian: v4.s_addr) >> 24 == 127 }
+        var v6 = in6_addr(), loopback = in6addr_loopback
+        return inet_pton(AF_INET6, host, &v6) == 1
+            && memcmp(&v6, &loopback, MemoryLayout<in6_addr>.size) == 0
+    }
+
+    static func securityIndicator(_ site: SiteControlModel) -> (glyph: String, label: String) {
+        (site.glyph, site.connection)
+    }
+
+    /// The developer bar's entry point, so the Tab → model mapping is testable.
+    @MainActor static func securityIndicator(_ tab: Tab) -> (glyph: String, label: String) {
+        securityIndicator(SiteControlModel(tab))
+    }
+
+    private static let base = "developerSites"
+    private static func key(_ profile: UUID) -> String { ProfileManager.defaultsKey(base, profile) }
+    private static var defaults: UserDefaults { .timo }
+    private static var privateSites: [String: Bool] = [:]
+
+    static func clearPrivateState() {
+        privateSites = [:]
+        defaults.removeObject(forKey: key(Profile.incognito.id))
+    }
+
+    private static func table(_ profile: UUID) -> [String: Bool] {
+        if profile == Profile.incognito.id { return privateSites }
+        return (defaults.dictionary(forKey: key(profile)) ?? [:]).compactMapValues { $0 as? Bool }
+    }
+
+    /// The answer for a url: what the user said about its host, else whether it is local.
+    nonisolated static func wants(_ url: URL?, said: [String: Bool]) -> Bool {
+        guard let url, let h = url.host()?.lowercased() else { return false }
+        return said[h] ?? isLocal(url)
+    }
+
+    static func wants(_ url: URL?, profile: UUID) -> Bool { wants(url, said: table(profile)) }
+
+    /// Remember the answer for this host; forget it when it is what the automatic one would
+    /// have said anyway.
+    nonisolated static func set(_ on: Bool, for url: URL, in table: inout [String: Bool]) {
+        guard let h = url.host()?.lowercased() else { return }
+        if on == isLocal(url) { table.removeValue(forKey: h) } else { table[h] = on }
+    }
+
+    static func set(_ on: Bool, for url: URL, profile: UUID) {
+        var t = table(profile)
+        set(on, for: url, in: &t)
+        if profile == Profile.incognito.id { privateSites = t }
+        else if t.isEmpty { defaults.removeObject(forKey: key(profile)) }
+        else { defaults.set(t, forKey: key(profile)) }
+    }
+
+    /// Read the answer for where the tab is and put it on the web view. Runs on attach, on
+    /// every commit and when the switch is flipped, so a suspended tab that comes back or a
+    /// page that navigates from localhost to a deployed site lands in the right mode.
+    static func apply(to tab: Tab) {
+        let on = wants(tab.currentURL, profile: tab.profileID)
+        if tab.developer != on { tab.developer = on }
+        let inspect = on || Settings.inspectorEnabled
+        guard let web = tab.existingWeb else { return }
+        web.isInspectable = inspect
+        // "Inspect Element" and the in-app inspector are gated on this preference, not on
+        // `isInspectable` — see Tab.configuration.
+        TimoSetBooleanPreference(web.configuration.preferences, NSSelectorFromString("_setDeveloperExtrasEnabled:"), inspect)
+    }
+
+    static func set(_ on: Bool, on tab: Tab) {
+        if let url = tab.currentURL { set(on, for: url, profile: tab.profileID) }
+        apply(to: tab)
+    }
+
+    static func toggle(_ tab: Tab) { set(!tab.developer, on: tab) }
+
+    /// Keep the port visible so two local servers are distinguishable in the sidebar.
+    nonisolated static func endpoint(_ url: URL?) -> String? {
+        guard let url, let host = url.host(), !host.isEmpty else { return nil }
+        let port = url.port ?? (url.scheme == "https" ? 443 : url.scheme == "http" ? 80 : nil)
+        let label = host.contains(":") ? "[\(host)]" : host
+        return port.map { "\(label):\($0)" } ?? label
+    }
+
+    /// The page, to the clipboard — Arc's "Capture" from the same bar.
+    static func capture(_ tab: Tab) {
+        Task {
+            guard let image = try? await tab.web.takeSnapshot(configuration: nil) else {
+                Toasts.show("Nothing to capture yet"); return
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([image])
+            Toasts.show("Page copied as an image")
+        }
+    }
+
+    static func check() -> [(String, Bool)] {
+        func u(_ s: String) -> URL { URL(string: s)! }
+        var t: [String: Bool] = [:]
+        var out: [(String, Bool)] = [
+            ("localhost is local", isLocal(u("http://localhost:3000/"))),
+            ("a .localhost subdomain is local", isLocal(u("http://api.localhost/"))),
+            ("loopback is local", isLocal(u("http://127.0.0.1:8080/")) && isLocal(u("http://[::1]/"))),
+            ("the LAN is not", !isLocal(u("http://192.168.1.1/"))),
+            ("a real site is not", !isLocal(u("https://example.com/"))),
+            ("local sites are on with nothing said", wants(u("http://localhost:3000/"), said: [:])),
+            ("others are off with nothing said", !wants(u("https://example.com/"), said: [:])),
+        ]
+        set(false, for: u("http://localhost:3000/"), in: &t)
+        out.append(("saying no to localhost is a row", t["localhost"] == false))
+        out.append(("…and is honoured", !wants(u("http://localhost:3000/a"), said: t)))
+        set(true, for: u("http://localhost:3000/"), in: &t)
+        out.append(("saying the automatic answer removes the row", t.isEmpty))
+        set(true, for: u("https://staging.example.com/x"), in: &t)
+        out.append(("saying yes to a real site is a row", t == ["staging.example.com": true]))
+        out.append(("…keyed by host, not page", wants(u("https://staging.example.com/y"), said: t)))
+        return out
+    }
+}
+
+/// Black fills the gaps between yellow dashes even on a light or tinted sidebar.
+struct DeveloperTabBorder: View {
+    var body: some View {
+        Canvas { context, size in
+            let outline = RoundedRectangle(cornerRadius: Look.pillRadius)
+                .inset(by: 0.75).path(in: CGRect(origin: .zero, size: size))
+            // Fit whole repeats to the actual inset path. A fixed [5, 4] leaves a
+            // partial repeat that joins its first dash at the upper-right seam.
+            let length = Self.perimeter(of: outline)
+            guard length > 0 else { return }
+            let repeatLength = length / max(1, (length / 9).rounded())
+            context.stroke(outline, with: .color(.black), lineWidth: 1.5)
+            context.stroke(outline, with: .color(Look.developerYellow),
+                style: StrokeStyle(lineWidth: 1.5,
+                    dash: [repeatLength * 5 / 9, repeatLength * 4 / 9]))
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private static func perimeter(of path: Path) -> CGFloat {
+        var length: CGFloat = 0
+        var current = CGPoint.zero, start = CGPoint.zero
+        func line(to point: CGPoint) {
+            length += hypot(point.x - current.x, point.y - current.y)
+            current = point
+        }
+        func curve(to end: CGPoint, control1: CGPoint, control2: CGPoint) {
+            let origin = current
+            // RoundedRectangle uses short cubic segments. Subdivision retains its
+            // native corner geometry while measuring well below a display pixel.
+            for step in 1...32 {
+                let t = CGFloat(step) / 32, u = 1 - t
+                line(to: CGPoint(
+                    x: u*u*u*origin.x + 3*u*u*t*control1.x + 3*u*t*t*control2.x + t*t*t*end.x,
+                    y: u*u*u*origin.y + 3*u*u*t*control1.y + 3*u*t*t*control2.y + t*t*t*end.y))
+            }
+        }
+        path.forEach { element in
+            switch element {
+            case .move(let point): current = point; start = point
+            case .line(let point): line(to: point)
+            case .curve(let end, let control1, let control2):
+                curve(to: end, control1: control1, control2: control2)
+            case .quadCurve(let end, let control):
+                curve(to: end,
+                    control1: CGPoint(x: current.x + (control.x - current.x) * 2 / 3,
+                                      y: current.y + (control.y - current.y) * 2 / 3),
+                    control2: CGPoint(x: end.x + (control.x - end.x) * 2 / 3,
+                                      y: end.y + (control.y - end.y) * 2 / 3))
+            case .closeSubpath: line(to: start)
+            }
+        }
+        return length
+    }
+}
+
+// MARK: - The bar
+
+/// The toolbar and page share the card's outer edges and clip. `WebCard` (or a split pane)
+/// owns their rounding and window inset; adding padding here would inset both a second time.
+struct DeveloperFrame<Content: View>: View {
+    @ObservedObject var tab: Tab
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if tab.developer { DeveloperBar(tab: tab) }
+            content()
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+/// Arc's dev toolbar: the lock, the whole url, then copy, capture, console, inspector, reload.
+private struct DeveloperBar: View {
+    @ObservedObject var tab: Tab
+
+    var body: some View {
+        let security = DeveloperMode.securityIndicator(tab)
+        HStack(spacing: Look.inset) {
+            Image(systemName: security.glyph)
+                .accessibilityLabel(security.label)
+                .help(security.label)
+            Text(tab.currentURL?.absoluteString ?? tab.address)
+                .font(Look.small.monospaced().weight(.medium))
+                .lineLimit(1).truncationMode(.middle)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            tool("link", "Copy URL") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(tab.currentURL?.absoluteString ?? "", forType: .string)
+                Toasts.show("URL copied")
+            }
+            divider
+            tool("camera", "Capture Page") { DeveloperMode.capture(tab) }
+            divider
+            if Inspector.available {
+                tool("terminal", "Console") { Inspector.showConsole(tab.web) }
+                tool("scope", "Web Inspector") { Inspector.show(tab.web) }
+            }
+            tool("arrow.clockwise", "Reload Ignoring Cache") { tab.web.reloadFromOrigin() }
+        }
+        .font(Look.caption.weight(.medium)).foregroundStyle(Color(white: 0.86))
+        .buttonStyle(CompactControlStyle(bar: true))
+        .foregroundStyle(Look.barText)
+        .padding(.horizontal, Look.rowTrailingInset).frame(height: Look.rowHeight)
+        .background {
+            Color(white: 0.18)
+                .overlay {
+                    Canvas { context, size in
+                        let stripe: CGFloat = 24
+                        for x in stride(from: -size.height, to: size.width, by: stripe * 2) {
+                            var path = Path()
+                            path.move(to: CGPoint(x: x, y: 0))
+                            path.addLine(to: CGPoint(x: x + stripe, y: 0))
+                            path.addLine(to: CGPoint(x: x + stripe + size.height, y: size.height))
+                            path.addLine(to: CGPoint(x: x + size.height, y: size.height))
+                            path.closeSubpath()
+                            context.fill(path, with: .color(.black.opacity(0.08)))
+                        }
+                    }
+                }
+                .clipped()
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(.white.opacity(0.08)).frame(height: 1)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .environment(\.colorScheme, .dark)
+        .accessibilityLabel("Developer Mode")
+    }
+
+    private var divider: some View { Divider().frame(height: 14).opacity(0.5) }
+
+    private func tool(_ glyph: String, _ name: String, _ run: @escaping () -> Void) -> some View {
+        Button(action: run) { Image(systemName: glyph) }
+            .help(name).accessibilityLabel(name)
+    }
+}

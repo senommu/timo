@@ -1,0 +1,447 @@
+import AppKit
+import SwiftUI
+import WebKit
+
+// MARK: - The search
+
+/// ⌘F, and everything it needs to say "3 of 12".
+///
+/// WebKit owns the search itself — `Tab.find` wraps `WKWebView.find`, which scrolls to a
+/// match and selects it — but it answers only "was there a match". Arc's bar says which
+/// match, out of how many, so the count is ours: one pass over the page's text nodes, and
+/// a position we walk ourselves as the user goes next and previous.
+///
+/// ponytail: a counting script rather than a second find engine. Ceiling: it counts inside
+/// the main frame's text nodes only, so text split across two elements ("<b>Git</b>Hub"),
+/// text inside an iframe, and text inside a shadow root are not counted the way WebKit
+/// finds them. Fixing that properly means reimplementing WebKit's own text iterator; the
+/// day the count is wrong often enough to matter, the fix is `_countStringMatches` SPI.
+@MainActor final class Find: ObservableObject {
+
+    /// What is typed in the bar. Survives closing it, so ⌘G can pick the search back up.
+    @Published var query = ""
+    @Published private(set) var focusRequest = 0
+
+    func requestFocus() { focusRequest &+= 1 }
+    /// Total matches on the page, 0 when there are none (or nothing typed).
+    @Published private(set) var count = 0
+    /// Which match is showing, 1-based. 0 means "none" — nothing typed, or no match.
+    @Published private(set) var index = 0
+
+    /// Typing "banana" starts six searches, and each one awaits WebKit twice. They can
+    /// finish in any order, so without this the count on screen is whichever search
+    /// happened to land last — "1 of 2", from the "b" nobody meant to search for. Every run
+    /// takes a ticket, and a run whose ticket has been superseded writes nothing.
+    private var generation = 0
+
+    #if DEBUG
+    // A scoped fixture can hold a real native result before the session consumes it.
+    // The default path still calls Tab.find directly.
+    var nativeSearchBoundary: (@MainActor (Tab, String, Bool) async -> Bool)?
+    #endif
+
+    // MARK: Sessions
+
+    /// One session per window: two windows each searching for something different is the
+    /// normal case, and a shared query would fight over the count.
+    static func session(for store: TabStore) -> Find { store.findSession }
+
+    /// The session of the window the keys are going to.
+    static var current: Find? { Windows.current.map(session(for:)) }
+
+    // MARK: Pure
+
+    /// The count, in the words the bar draws. Nothing typed says nothing — an empty field
+    /// with "No results" under it reads as a failure the user did not cause.
+    static func label(index: Int, count: Int, query: String) -> String {
+        guard !query.isEmpty else { return "" }
+        guard count > 0 else { return "No results" }
+        return "\(max(1, index)) of \(count)"
+    }
+
+    /// The same thing said out loud, since a count nobody can see is not a count.
+    static func spoken(index: Int, count: Int, query: String) -> String {
+        guard !query.isEmpty else { return "" }
+        guard count > 0 else { return "No results for \(query)" }
+        return "Match \(max(1, index)) of \(count)"
+    }
+
+    /// Where next (or previous) lands, wrapping the way WebKit's own search wraps. 0 in,
+    /// 0 out: with no matches there is nowhere to go.
+    static func step(index: Int, count: Int, forward: Bool) -> Int {
+        guard count > 0 else { return 0 }
+        guard index > 0 else { return forward ? 1 : count }
+        let next = forward ? index + 1 : index - 1
+        if next > count { return 1 }
+        if next < 1 { return count }
+        return next
+    }
+
+    /// The needle, as a JavaScript string literal. A page's find is the one place a user's
+    /// own typing is handed to `evaluateJavaScript`, so quoting it is not optional.
+    static func quote(_ text: String) -> String {
+        var out = "\""
+        for c in text.unicodeScalars {
+            switch c {
+            case "\"":  out += "\\\""
+            case "\\":  out += "\\\\"
+            case "\n":  out += "\\n"
+            case "\r":  out += "\\r"
+            case "\u{2028}": out += "\\u2028"
+            case "\u{2029}": out += "\\u2029"
+            default:    out.unicodeScalars.append(c)
+            }
+        }
+        return out + "\""
+    }
+
+    /// Counts the matches on the page **and** which one the selection is sitting on, in one
+    /// walk over the text nodes — so the two numbers can never disagree with each other.
+    /// Returns `[total, position]`, position being 1-based, or 0 when nothing is selected.
+    ///
+    /// Measuring rather than counting steps is the whole point: WebKit searches from the
+    /// current selection, and a reload, an Escape, or a click on the page drops that
+    /// selection. A position we incremented ourselves would then be confidently wrong.
+    static func measureScript(_ text: String) -> String {
+        """
+        (function (q) {
+          if (!q || !document.body) { return [0, 0]; }
+          var needle = q.toLowerCase();
+          var sel = window.getSelection();
+          var mark = (sel && sel.rangeCount) ? sel.getRangeAt(0) : null;
+          var walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+            acceptNode: function (n) {
+              var p = n.parentNode, tag = p ? p.nodeName : '';
+              if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') {
+                return NodeFilter.FILTER_REJECT;
+              }
+              return NodeFilter.FILTER_ACCEPT;
+            }
+          });
+          var node, total = 0, upTo = 0;
+          var here = mark ? document.createRange() : null;
+          while ((node = walk.nextNode())) {
+            var hay = node.nodeValue.toLowerCase(), at = 0;
+            while ((at = hay.indexOf(needle, at)) !== -1) {
+              total++;
+              if (mark) {
+                here.setStart(node, at);
+                here.setEnd(node, at);
+                // Every match that starts at or before the selection, the current one
+                // included: that count is the position of the current one.
+                if (here.compareBoundaryPoints(Range.START_TO_START, mark) <= 0) { upTo++; }
+              }
+              at += needle.length;
+            }
+          }
+          return [total, upTo];
+        })(\(quote(text)));
+        """
+    }
+
+    // MARK: Running a search
+
+    /// A fresh search: the query changed, so recount and land on the first match after the
+    /// caret. Anything else is a step through what was already counted.
+    func run(_ text: String, in tab: Tab, forward: Bool = true, fresh: Bool = false) async {
+        guard !Task.isCancelled else { return }
+        generation += 1
+        let ticket = generation
+        query = text
+        guard !text.isEmpty else {
+            count = 0
+            index = 0
+            clearHighlight(in: tab)
+            return
+        }
+        let web = tab.web, document = tab.readingDocumentGeneration
+        // Let a burst of typing supersede obsolete searches before entering WebKit.
+        // Stepping remains immediate, with no debounce timer or retained page task.
+        if fresh { await Task.yield() }
+        func current() -> Bool {
+            !Task.isCancelled && ticket == generation && tab.existingWeb === web
+                && tab.readingDocumentGeneration == document
+        }
+        guard current() else { return }
+        let hit: Bool
+        #if DEBUG
+        if let nativeSearchBoundary { hit = await nativeSearchBoundary(tab, text, forward) }
+        else { hit = await tab.find(text, forward: forward) }
+        #else
+        hit = await tab.find(text, forward: forward)
+        #endif
+        guard current() else { return }
+        guard hit else {
+            // WebKit found nothing, so whatever the counter said, there is nothing to be on.
+            count = 0
+            index = 0
+            return
+        }
+        let answer = await Self.measure(text, in: web)
+        guard current() else { return }
+        guard let measured = answer, measured.count > 0 else {
+            // A page the walker cannot read the way WebKit does — a PDF, a shadow root, an
+            // iframe — still has a highlighted match, so say so rather than "0 matches",
+            // and fall back to stepping the position ourselves.
+            count = max(count, 1)
+            index = fresh ? 1 : Self.step(index: index, count: count, forward: forward)
+            return
+        }
+        count = measured.count
+        index = max(1, measured.index)
+    }
+
+    /// `[total, position]` off the page, or nil when the page cannot answer.
+    static func measure(_ text: String, in web: WKWebView) async -> (count: Int, index: Int)? {
+        // The page's prototypes must never see text typed into the native Find bar.
+        return await withCheckedContinuation { continuation in
+            web.evaluateJavaScript(Self.measureScript(text), in: nil, in: .defaultClient) { result in
+                guard let pair = (try? result.get()) as? [Any], pair.count == 2 else {
+                    continuation.resume(returning: nil); return
+                }
+                func number(_ any: Any) -> Int? { (any as? Int) ?? (any as? NSNumber)?.intValue }
+                guard let total = number(pair[0]), let at = number(pair[1]) else {
+                    continuation.resume(returning: nil); return
+                }
+                continuation.resume(returning: (count: total, index: at))
+            }
+        }
+    }
+
+    /// Dismiss WebKit's find markers as well as its DOM selection. On newer WebKit,
+    /// clearing the selection alone leaves the active text-match marker painted.
+    func clearHighlight(in tab: Tab?) {
+        generation += 1
+        count = 0
+        index = 0
+        guard let web = tab?.existingWeb else { return }
+        let hideFindUI = NSSelectorFromString("_hideFindUI")
+        if web.responds(to: hideFindUI) { web.perform(hideFindUI) }
+        // The selected match may belong to a cross-origin child frame. Clear it through
+        // WebKit's editor, since JavaScript in the main frame cannot reach that selection.
+        let edit = NSSelectorFromString("_executeEditCommand:argument:completion:")
+        if web.responds(to: edit) {
+            typealias EditCommand = @convention(c) (AnyObject, Selector, NSString, NSString, AnyObject?) -> Void
+            let execute = unsafeBitCast(web.method(for: edit), to: EditCommand.self)
+            execute(web, edit, "Unselect", "", nil)
+        }
+        web.evaluateJavaScript(
+            "if (window.getSelection) { window.getSelection().removeAllRanges(); }")
+    }
+
+    /// ⌘G and ⇧⌘G, from the menu or the key. With the bar closed but a query remembered
+    /// they bring it back rather than doing nothing, which is what every other browser does.
+    static func advance(forward: Bool) {
+        guard let store = Windows.current, let tab = store.active else { return }
+        let session = session(for: store)
+        guard !session.query.isEmpty else {
+            store.openFind()
+            return
+        }
+        let text = session.query
+        if !store.findOpen { store.openFind() }
+        Task {
+            guard store.findOpen else { return }
+            await session.run(text, in: tab, forward: forward)
+        }
+    }
+
+    // MARK: Offline check
+
+    static func check() -> [(String, Bool)] {
+        let script = measureScript("a\"b")
+        return [
+            ("nothing typed says nothing", label(index: 0, count: 0, query: "") == ""),
+            ("a match reads as n of m", label(index: 3, count: 12, query: "q") == "3 of 12"),
+            ("the first match reads as 1 of m", label(index: 1, count: 12, query: "q") == "1 of 12"),
+            ("a single match still says one of one", label(index: 1, count: 1, query: "q") == "1 of 1"),
+            ("no matches says so, in words", label(index: 0, count: 0, query: "q") == "No results"),
+            ("a match with no position yet reads as the first one",
+             label(index: 0, count: 4, query: "q") == "1 of 4"),
+            ("the spoken count names the query when nothing matched",
+             spoken(index: 0, count: 0, query: "zebra") == "No results for zebra"),
+            ("the spoken count is the same count",
+             spoken(index: 2, count: 9, query: "q") == "Match 2 of 9"),
+
+            ("next moves forward", step(index: 1, count: 3, forward: true) == 2),
+            ("previous moves back", step(index: 2, count: 3, forward: false) == 1),
+            ("next off the end wraps to the first", step(index: 3, count: 3, forward: true) == 1),
+            ("previous off the start wraps to the last",
+             step(index: 1, count: 3, forward: false) == 3),
+            ("with no matches there is nowhere to step",
+             step(index: 0, count: 0, forward: true) == 0 && step(index: 0, count: 0, forward: false) == 0),
+            ("stepping forward from nowhere lands on the first match",
+             step(index: 0, count: 5, forward: true) == 1),
+            ("stepping back from nowhere lands on the last",
+             step(index: 0, count: 5, forward: false) == 5),
+            ("one match wraps onto itself",
+             step(index: 1, count: 1, forward: true) == 1 && step(index: 1, count: 1, forward: false) == 1),
+
+            ("a plain query quotes as itself", quote("cat") == "\"cat\""),
+            ("a quote in the query is escaped", quote("a\"b") == "\"a\\\"b\""),
+            ("a backslash in the query is escaped", quote("a\\b") == "\"a\\\\b\""),
+            ("a newline in the query is escaped", quote("a\nb") == "\"a\\nb\""),
+            ("the measuring script cannot be broken out of",
+             !script.contains("(\"a\"b\")") && script.contains("\"a\\\"b\"")),
+            ("the measuring script skips markup nodes", script.contains("SCRIPT")),
+            ("the measuring script asks for the total and the position together",
+             script.contains("return [total, upTo]")),
+            ("…and reads the position off the page's own selection",
+             script.contains("window.getSelection()")
+                && script.contains("compareBoundaryPoints")),
+        ]
+    }
+}
+
+// MARK: - The bar
+
+/// Arc's find bar: the field, the count beside it, previous and next, and a close button.
+/// It floats at the top-right of the page card; `store.findOpen` is what puts it there.
+///
+/// The field is `CommandField` — the same AppKit field the command bar uses — because
+/// Return, ⇧Return and Esc all have to be seen before the field editor decides what they
+/// mean, and because focus has to stay in the field while the page scrolls under it.
+struct FindBar: View {
+    @EnvironmentObject var store: TabStore
+    @ObservedObject var tab: Tab
+
+    /// The session belongs to the window, not to this view: it has to outlive the bar so
+    /// that ⌘F reopens on the same query and ⌘G works while the bar is closed. Resolving it
+    /// here and observing it below is what redraws the count as matches are stepped through.
+    var body: some View { FindBarBody(session: Find.session(for: store), tab: tab) }
+}
+
+private struct FindBarBody: View {
+    @Environment(\.spaceChromeTheme) private var chromeTheme
+    @EnvironmentObject var store: TabStore
+    @ObservedObject var session: Find
+    @ObservedObject var tab: Tab
+    @State private var text = ""
+    /// Held back one frame, exactly like the command bar's: an NSTextField can only take
+    /// first responder once it is in a window.
+    @State private var ready = false
+
+    var body: some View {
+        HStack(spacing: Look.inset) {
+            Image(systemName: "magnifyingglass").font(Look.caption).foregroundStyle(.secondary)
+            ZStack {
+                Color.clear
+                if ready {
+                    CommandField(text: $text, prompt: "Find on page", selectAll: true,
+                                 label: "Find on Page",
+                                 hint: "Return finds the next match, Shift-Return the previous "
+                                     + "one, Escape closes the bar.",
+                                 font: Look.Typography.secondary.native,
+                                 focusRequest: session.focusRequest,
+                                 onKey: key)
+                        .foregroundStyle(miss ? AnyShapeStyle(.red) : AnyShapeStyle(.primary))
+                }
+            }
+            .frame(width: Look.findFieldWidth, height: Look.control)
+            // "3 of 12". Fixed width so stepping through matches does not shuffle the
+            // buttons beside it a pixel at a time.
+            Text(Find.label(index: session.index, count: session.count, query: text))
+                .font(Look.caption).monospacedDigit()
+                .foregroundStyle(miss ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                .frame(width: Look.findCountWidth, alignment: .trailing)
+                .accessibilityHidden(true)
+            Button { search(forward: false) } label: { Image(systemName: "chevron.up") }
+                .help("Previous Match (\(Keybindings.binding(for: .findPrevious).display))")
+                .accessibilityLabel("Previous Match")
+                .disabled(session.count == 0)
+            Button { search(forward: true) } label: { Image(systemName: "chevron.down") }
+                .help("Next Match (\(Keybindings.binding(for: .findNext).display))")
+                .accessibilityLabel("Next Match")
+                .disabled(session.count == 0)
+            Button { close() } label: { Image(systemName: "xmark") }
+                .help("Close Find Bar").accessibilityLabel("Close Find Bar")
+        }
+        .buttonStyle(CompactControlStyle(bar: true)).font(Look.caption).foregroundStyle(Look.barText)
+        .padding(.horizontal, Look.rowTrailingInset).padding(.vertical, Look.rowPadding)
+        .background(chromeTheme.barFill, in: .rect(cornerRadius: Look.cardRadius))
+        .background(Look.barMaterial, in: .rect(cornerRadius: Look.cardRadius))
+        .hairline(radius: Look.cardRadius)
+        .shadow(color: Look.floatShadow, radius: Look.floatShadowRadius, y: Look.floatShadowY)
+        // This surface shares the command bar's dark fill in every Space appearance.
+        .environment(\.colorScheme, .dark)
+        // ⌘F over a bar that is already up re-searches what is in it, so the query the
+        // session remembers is what the field opens with — selected, ready to be replaced.
+        .onAppear {
+            text = session.query
+            ready = true
+        }
+        // Live, like every other find bar: each keystroke searches from the top again.
+        .onChange(of: text) { search(forward: true, fresh: true) }
+        .onExitCommand { close() }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Find on page")
+        .accessibilityValue(Find.spoken(index: session.index, count: session.count, query: text))
+        // Ahead of the page, behind a password prompt.
+        .accessibilitySortPriority(1)
+    }
+
+    /// Red text is not an answer for anyone who cannot see it, but it is the fastest one
+    /// for everybody else.
+    private var miss: Bool { !text.isEmpty && session.count == 0 }
+
+    private func key(_ k: CommandField.Key) -> Bool {
+        switch k {
+        case .enter:      search(forward: true)
+        case .shiftEnter: search(forward: false)
+        case .escape:     close()
+        // Typing is what changes the query; the arrows, Tab and ⌥⌘⌫ belong to the field.
+        case .up, .down, .tab, .commandEnter, .forget, .backspace, .dismissCompletion: return false
+        }
+        return true
+    }
+
+    /// Every keystroke starts the search again from the top of the page, which is what
+    /// makes ⌘F feel live; Return and the chevrons step through what it found.
+    private func search(forward: Bool, fresh: Bool = false) {
+        let query = text
+        Task {
+            guard store.findOpen else { return }
+            await session.run(query, in: tab, forward: forward, fresh: fresh)
+            guard fresh, store.findOpen else { return }
+            axAnnounce(Find.spoken(index: session.index, count: session.count, query: query))
+        }
+    }
+
+    /// Esc, and the × button: the bar goes, and so does the highlight it left on the page —
+    /// and the keyboard goes back to the page the bar was searching. See `TabStore.focusPage`.
+    private func close() {
+        store.findOpen = false
+        store.focusPage()
+    }
+}
+
+// MARK: - Opening it
+
+extension TabStore {
+    /// ⌘F, and ⌘G with nothing found yet.
+    ///
+    /// The Library stands beside the page rather than over it, so find-in-page is still the
+    /// answer whenever the keyboard is on the page — which is what makes ⌘F work with the
+    /// Library open at all. It means the Library's *own* field only when the keyboard is
+    /// already in the panel and that section has a field: on Spaces there is nothing to type
+    /// into, and sending ⌘F there would be a dead key.
+    func openFind() {
+        if librarySwipeMonitor.intendsOpen(in: self),
+           (!libraryOpen || !keyboardOnPage), Library.shared.section.searchable {
+            Library.focusSearch()
+            return
+        }
+        guard active?.easelID == nil else { return }
+        findOpen = true
+        Find.session(for: self).requestFocus()
+    }
+
+    /// Whether the first responder is the page rather than the chrome around it. Asked of
+    /// AppKit rather than tracked, because every field in the window can take the keyboard
+    /// and only one of them is the page.
+    var keyboardOnPage: Bool {
+        guard let web = active?.existingWeb, let responder = window?.firstResponder as? NSView
+        else { return false }
+        return responder === web || responder.isDescendant(of: web)
+    }
+}

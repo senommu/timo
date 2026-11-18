@@ -1,0 +1,600 @@
+# Development
+
+[Documentation index](README.md) · [Project README](../README.md)
+
+Use focused validation for the affected behavior. Documentation-only changes need link,
+command-reference, and diff checks; they do not need the full local application suite.
+Required PR CI still applies.
+
+## Setup and local builds
+
+Requires macOS 26 or later and Xcode 26 or later with its Swift toolchain. Location
+decisions use WebKit’s compatibility delegate on macOS 26; Xcode 27 builds also compile
+the public macOS 27 delegate, with runtime availability checked.
+Confirm the selected toolchain with `xcodebuild -version` and `swift --version`.
+
+```sh
+git clone https://github.com/senommu/timo.git
+cd timo
+./make-app.sh debug
+open Timo.app
+```
+
+For an optimized build, run `./make-app.sh` (release is the default). The script builds
+the executable, installer and icon XPC services, resources, and icon assets, then signs
+the app ad hoc unless `SIGN_ID` is set. It replaces the generated `Timo.app` in this
+checkout. No package dependency installation is required.
+
+To build only the executable:
+
+```sh
+swift build -c release
+./.build/release/timo selfcheck --pure
+```
+
+Use the assembled bundle for icons, sandbox/signing behavior, and native app checks.
+Local builds skip the startup default-browser prompt; **Make Timo Default…** remains
+available in Settings. Distribution instructions are in [Releasing](RELEASING.md).
+
+## Command line
+
+The executable is `.build/release/timo` after `swift build -c release`. These examples
+use `timo` as shorthand for that path.
+
+| Command | Result |
+| --- | --- |
+| `timo` | Open the browser, restoring the last session when enabled. |
+| `timo https://example.com` | Open a URL in the browser. |
+| `timo selfcheck --pure` | Run checks that need neither a keychain nor a window server. |
+| `timo selfcheck` | Run the full local checks, including keychain and WebKit checks. |
+| `timo browsercheck` | Run real WebKit checks inside a signed, isolated app bundle; use the smoke-test script below. |
+| `timo import passwords.csv` | Import a browser password CSV into the login keychain. |
+| `timo drmcheck` | Probe which encrypted-media key systems WebKit can initialize. |
+| `timo drmcheck <url>` | Check decoded playback progress and report whether modern media keys are attached. |
+
+`browsercheck-cleanup` unregisters the isolated store identified by a browser-check
+fixture. Use it only with that fixture’s recorded identity; do not point it at a regular
+profile. Password-import format, duplicate, and partial-failure rules are in [data
+imports](DATA-AND-PRIVACY.md#imports-and-exports).
+
+## iCloud development
+
+Optional iCloud development builds require matching Apple provisioning and an
+assigned CloudKit container. Ordinary ad-hoc builds intentionally keep sync
+unavailable. See [iCloud provisioning](ICLOUD-PROVISIONING.md) for the explicit
+profile/container inputs, encrypted schema, transfer limits, signed service evidence
+and unverified cross-Mac follow-up coverage. Missing second-Mac hardware is not a
+merge gate; local unit tests alone do not establish live service availability.
+
+## WebKit and protected media
+
+Timo uses the system WebKit engine rather than bundling Chromium. `drmcheck` tests the
+encrypted-media path available to the current macOS WebKit build. A successful
+key-system probe does **not** guarantee that a particular streaming service will play:
+the service, account, license exchange, and playback still need a real-site test.
+`drmcheck <url>` checks playback progress on a page you provide.
+
+## Testing
+
+The project has a Swift executable, native bridge targets, an XCTest target, and inline checks run
+through `selfcheck`. Use the [contributor guide](../CONTRIBUTING.md) to choose focused
+local validation. Required PR CI still applies before merging.
+
+### CI overview
+
+CI checks the diff and runs the website scene and CI routing regression tests
+in separate Linux jobs. The fixtures run alongside scope detection so app compilation
+can begin early; both jobs must pass the final gate. The root `.gitignore`, root Markdown files, Markdown under `docs/`,
+Markdown issue/PR templates, and website HTML, CSS, JavaScript, images, and fonts
+under `docs/` take this fast path and the final `checks` gate, without macOS builds
+or native tests. The routing classifier and its two regression scripts also use
+the fast path. Edits to `checks.yml` qualify only when the job inventory and all
+jobs except change detection and the final gate, plus workflow-wide settings, are unchanged; edits to native
+build/test jobs still require the full path. Changes combining only these files
+also take the fast path. Any other path (including nested `.gitignore` files),
+empty diffs, or missing comparison history requires the full path. The classifier
+is [`scripts/ci-change-scope.py`](../scripts/ci-change-scope.py). The same routing
+runs on PRs and pushes to `main`, so a website-only merge produces a passing required
+`checks` result while native jobs intentionally skip.
+
+For app changes, one debug build compiles the app and test bundle and assembles
+`Timo.app`. Four native runners and a separate packaging runner reuse a runtime-only
+artifact, verifying its revision, checkout path, and Swift toolchain before execution.
+Object files and compiler caches are excluded from that transfer. Native-specific
+source fixtures and shared runtime checks each run once; separate desktops keep packaging work away
+from native UI tests. The required `checks` gate requires every applicable required
+job to succeed. Worker navigator identity is blocking coverage in the normal
+native shards. Jobs intentionally skipped for fast-path changes are handled by
+the gate's fast path.
+
+Main requires GitHub Actions' `checks` status, including for administrators, but
+not an up-to-date branch, so one merge does not force every open PR to rerun.
+Every merge runs full CI on main, which is where a bad combination of two
+independently green PRs shows up; fix main forward before merging anything else.
+Update a PR only for conflicts or when main changed something it depends on.
+
+Use a small, focused CI preflight before spending time on the full suite for
+non-trivial changes. This is required while diagnosing or repairing CI failures
+or behavior that depends on the hosted runner. Select the affected tests and
+closely related fixtures, build once, and retain the same assertions, outcome
+deadlines, and native cleanup verification. For intermittent cases, choose the
+repetition count before starting and preserve every attempt and its diagnostics.
+Advance to the full suite after the preflight passes and earlier failures have
+been explained and repaired. Full required CI must still pass on the latest
+integrated PR commit before merging. Documentation-only and trivial changes
+can use their appropriate lightweight checks.
+
+Preserve failed attempts when assessing a change. An unchanged native assertion
+failure followed by a passing rerun is evidence of unresolved intermittency, not
+a repair. Separate pre-test runner outages from actual assertion failures. Compare
+the tested source tree, runner image, macOS/WebKit and toolchain when investigating
+branch/main differences; the branch name alone is not the cause.
+
+Only the build job restores the Swift debug cache; successful `main` builds save it.
+The cache is keyed by macOS architecture, Swift/Xcode/SDK versions, and package/source
+hashes (all files under `Sources/` and `Tests/`, including native bridges and resources).
+The v3 key also includes the timestamp, bundling and workflow policies; v2 caches remain a migration
+fallback. Content-matching timestamps for every regular input allow unchanged files to stay incremental, while
+SwiftPM still validates the build. CI skips IDE index generation and reuses debug XPC
+helpers only when their contents, flags, packaging policy and toolchain match; release
+and normal local packaging always compile them. Successful aggregate checks retain the two newest
+Swift debug caches. Superseded runs on the same branch or PR are cancelled. The release
+workflow builds and smoke-tests the optimized app separately; its products are never
+cached because they can contain the OAuth secret. The [November CI analysis](CI-PERFORMANCE.md)
+records measured bottlenecks, shard rebalancing and cache migration limits.
+
+### Native fixture execution
+
+Use the wrapper for full native validation on a logged-in macOS desktop:
+
+```sh
+python3 scripts/run-native-tests.py --jobs 1
+```
+
+CI runs four groups on separate macOS runners, keeping each test class together
+and each runner's UI tests sequential. `swift test list --skip-build` supplies the
+complete inventory; `scripts/native-test-shards.py` balances classes using advisory
+durations in `scripts/native-test-durations.json`, assigns new classes automatically,
+and verifies every selected required test completed. The worker navigator identity
+probe is included, and missing required identity coverage fails planning. Each group runs its own startup
+preflight and cleanup, and all four must pass the required `checks` gate.
+PR native shards cancel their remaining siblings after a failure to free runners;
+`main` runs retain every shard's outcome.
+The preflight's outer 90-second process limit includes SwiftPM planning before
+XCTest starts; the owned AppKit loop retains its separate 12-second lifecycle
+watchdogs. A slow CLI launch must not be mistaken for a failed native loop.
+Same-desktop `--parallel` execution remains unsupported because UI fixtures share
+focus and application state. Duration estimates affect balancing only, never coverage.
+
+The wrapper passes its arguments to the complete `swift test` command; focused runs
+can add `--filter 'PasswordAutofillTests|SavedReaderTests'`. After the test host exits,
+it starts the same test bundle in a fresh process to delete only the exact owned
+WebKit stores recorded by those fixtures and verifies their absence. Cleanup runs
+even when the primary tests fail, and a cleanup failure fails an otherwise passing
+run. An unverified cleanup keeps its private manifest and reports its path.
+The post-exit retirement phase has a 60-second budget for all owned IDs; its fresh
+driver has a 90-second ceiling. These bounds do not alter primary fixture deadlines.
+
+Direct `swift test` remains supported and performs the existing immediate cleanup.
+The wrapper defers destructive WebKit cleanup for shared-helper-owned normal profiles;
+it does not change test assertions, original fixture deadlines, or product behavior.
+
+### Client certificate fixture
+
+`swift test --jobs 1 --filter ClientCertificateTests` checks identity eligibility,
+selection, cancellation, and profile/private/session boundaries with generated
+identities imported into memory only. `python3 Tests/ClientCertificates/fixture.py`
+compiles the authentication core and tests a generated three-tier client chain
+against a local TLS server that trusts only its root. It needs no window server or
+user keychain changes and removes its generated keys and server on exit. Add
+`--rollover` to exercise a same-subject CA rollover with a partial local chain.
+`swift test --jobs 1 --filter ClientCertificateChallengeTests` needs a window server
+and checks the native chooser, cancellation, navigation, and tab closure using an
+injected provider of generated in-memory identities.
+
+### Extension desktop error compatibility
+
+Extensions that declare `nativeMessaging` can offer **Review Error-Only Mode…**
+in Manage Extensions → Compatibility. Installation approval leaves this mode off.
+The separate review persists only for that accepted installation in its profile;
+**Disable Error-Only Mode** revokes it. Removing the permission declaration clears
+approval, and adding it back requires a fresh review. A disabled extension stays disabled.
+
+This mode exposes WebKit’s real `runtime.sendNativeMessage` and `runtime.connectNative`
+APIs by granting the SDK permission before context loading. Both public native-message
+delegates permanently reject all applications and payloads. Timo registers no native
+host, starts no desktop app, and forwards no messages. Calls reject and ports disconnect
+with an unavailable error after a defined 100 ms delay. Pending delays are bounded at
+32 per context and 128 overall; overflow fails immediately, and unloading cancels pending
+work. This keeps sequential extension retries from starving the popup. Desktop-dependent
+features remain unavailable. Optional runtime access has its own revoke control; it does
+not revoke this separately reviewed compatibility choice.
+
+Changing this mode rebuilds the extension context using its accepted code and existing
+identity. Ordinary runtime grants follow the existing reload rules. A failed context load
+or metadata save retains the old accepted mode and attempts to restart it; a restart
+failure is shown in the manager. Old or unknown mode versions keep the APIs hidden.
+
+Reported WebKit context script diagnostics (domain `WKWebExtensionContextErrorDomain`,
+code7) stay visible in a separate Runtime diagnostics section. They do not label a loaded
+extension as a failed update. Metadata/activation failures, failed background-completion
+callbacks, unknown codes and other error domains still require attention. Copied diagnostics
+continue to export only allowlisted domain/code metadata, excluding the runtime message text.
+
+### Routine CI commands
+
+The MV3 navigator override is covered by the normal required native shards,
+including first-instruction classic/module identity, lifecycle, storage and ownership
+assertions. No advisory worker-UA job or current-failure classification exemption
+remains. Historical bare-engine failure fixtures are replayed only to preserve the
+original evidence; they do not permit a current test failure. See [worker navigator
+identity](EXTENSION-WORKER-IDENTITY.md) for the bootstrap and its scope.
+
+These commands cover the app checks used in CI. For routine changes, select only
+the checks relevant to the affected behavior:
+
+```sh
+swift build -c debug
+./.build/debug/timo selfcheck --pure
+scripts/check-webkit-startup.sh
+python3 scripts/run-native-tests.py --jobs 1
+scripts/check-app-icons.sh
+scripts/check-cloud-ai.sh
+bash scripts/test-cli-import.sh .build/debug/timo
+python3 scripts/test-ci-source-state.py
+python3 scripts/test-release-workflow.py
+python3 scripts/test-packaged-resources.py
+./make-app.sh debug
+python3 scripts/test-default-browser-prompt.py
+./scripts/test-build-dmg.sh
+bash scripts/test-update-installer.sh Timo.app --unsigned
+scripts/test-updater-recovery.sh
+python3 scripts/test-updater-transport.py
+scripts/test-updater-relaunch.sh
+```
+
+### Password fixtures
+
+For focused password validation on a logged-in macOS desktop:
+
+```sh
+TIMO_TEST_KEYCHAIN=1 swift test --filter Password
+python3 scripts/check-browser-smoke.py
+```
+
+The autofill fixtures exercise real WebKit documents, controlled input events, dynamic
+visibility, account continuity, embedded forms, stale chooser targets, and scoped
+Keychain reads. Additional fixtures cover save review, rejected submissions, generator
+options, Keychain failures and identity collisions, and clipboard ownership. The signed
+smoke also verifies fresh-process Keychain persistence and deletion. Keychain-dependent
+XCTest fixtures report a skip if storage is unavailable. See [Password manager](PASSWORD-MANAGER.md)
+for the precise boundaries and remaining real-site/device validation.
+
+### Website popup fixtures
+
+```sh
+swift test --filter 'WebsitePopup|SignInCompatibility|NavigationWebKit|LinkInteraction|LittleArcSpaceMenu|KeyboardAccessibility|PasswordChooser'
+```
+
+These local WebKit fixtures cover temporary dialog windows, opener messaging, blank
+popups written by their opener, cross-origin redirects, private cookies, manual cancel
+and retry, script close, nested lifetimes, ordinary blank-target tabs, password UI and
+text-entry shortcuts. They do not establish Google or Reddit service acceptance.
+
+### Specialist reliability fixtures
+
+For opt-in cold/warm startup, large-session restoration and parked/sleeping tab
+measurements, see [Startup performance](STARTUP-PERFORMANCE.md). Build first and
+reserve a quiet profiling window before collecting timings.
+
+For site-permission lifecycle fixtures and a fake display-capture check, see
+[Site permissions on macOS 26 and later](SITE-PERMISSIONS.md#validation-and-remaining-platform-coverage).
+
+For download interruption, resume, destination and process-restart fixtures, see
+[Download reliability on macOS 27](DOWNLOAD-RELIABILITY.md).
+
+For navigation identity, history, cancellation, form resubmission and local WebKit
+fixtures, see [Navigation correctness on macOS 27](NAVIGATION-RELIABILITY.md).
+
+`swift test` covers search typing and cancellation, link gestures and previews, Space
+switching and deletion, tab ordering, Battery Saver, media permission popups and grant
+lifetimes, requesting-frame ownership and synthetic capture revocation, Easels, page
+capture, and other browser UI behavior. Search fixtures include a large history
+database, keyboard selection, live history changes, and private windows.
+
+### Active tab close diagnostics
+
+The native tab-close regression mounts the full browser window, closes the active
+page, and verifies that its web view stays released while the neighbour and pruned
+Today outline reach their actual native presentation. Related regressions cover
+pinned-page unload, two- and three-pane split closure under normal and Battery
+Saver motion policies, and late resume callbacks on retired tabs. Split fixtures
+verify the actual surviving native owner after the handoff. The timing fixture is opt-in:
+
+```sh
+TIMO_UI_PERFORMANCE=1 python3 scripts/run-native-tests.py --jobs 1 --filter TabCloseLatencyTests
+```
+
+It records three closes each with 10, 40, and 300 tabs, reporting synchronous handler
+and first forced layout costs. These are main-thread work measurements, not displayed
+frame rates or machine-independent timing limits.
+
+### History performance budget
+
+The native History rendering performance budget is a separate, opt-in release benchmark
+on a quiet logged-in Mac. It retains its 100 ms limit; hosted debug CI cannot separate
+Timo work from window-server activation and timer scheduling. History correctness,
+profile isolation, search cancellation and input-thread search checks remain in the
+routine test suite.
+
+```sh
+TIMO_UI_PERFORMANCE=1 swift test -c release -Xswiftc -enable-testing --filter HistoryResponsivenessTests
+```
+
+Store, bookmark presentation/filtering, Library filtering, cancellation drain, and
+repeated session-write measurements also have an opt-in release fixture. It uses
+isolated synthetic profiles (10,000/240,000 visits and 1,000/10,000 displayed
+bookmarks) and prints measurements without machine-sensitive timing assertions:
+
+```sh
+TIMO_STORE_PERFORMANCE=1 swift test -c release -Xswiftc -enable-testing --filter StoreLatencyBenchmarks
+# Native search-field focus, including empty and superseded queries:
+TIMO_STORE_PERFORMANCE=1 swift test -c release -Xswiftc -enable-testing --filter BookmarkPresentationTests
+```
+
+The Library swipe fixture uses 300 tabs and 2,000 archived entries to report first-update
+and subsequent native layout costs, browser invalidations, and window visibility. Forced
+layout can run with an occluded test window; these numbers measure main-thread update
+work, not displayed frame rate. Set `TIMO_LIBRARY_PERF_TABS` to compare other sidebar sizes.
+
+```sh
+TIMO_UI_PERFORMANCE=1 swift test --filter LibrarySwipeTests.testPopulatedArchiveSwipeTiming
+# Small-sidebar Library and Space swipe comparisons:
+TIMO_UI_PERFORMANCE=1 TIMO_LIBRARY_PERF_TABS=10 swift test --filter 'LibrarySwipeTests.testPopulatedArchiveSwipeTiming|SidebarViewportPerformanceTests.testSpaceSwipeLayoutTiming'
+```
+
+`SidebarViewportPerformanceTests` also guards viewport-only row mounting, saved
+scroll offsets, access to the last row, and bounded production tab controls while scrolling.
+For a 300-tab vertical scroll comparison in both directions:
+
+```sh
+TIMO_UI_PERFORMANCE=1 swift test --filter SidebarViewportPerformanceTests.testPopulatedSidebarScrollTiming
+```
+
+This reports median, p95, and maximum forced layout cost. Layout work under 8.33 ms leaves CPU
+headroom for a 120 Hz display; these timings do not establish displayed frame rate.
+
+For the smaller sidebar path, the 22-tab retention fixture checks a seven-tab folder,
+hidden input anchors, row spacing, and control reuse while scrolling. The opt-in run
+also reports scroll layout timings:
+
+```sh
+TIMO_UI_PERFORMANCE=1 swift test --filter SidebarRowRetentionTests
+```
+
+Sidebars with at most 40 tabs and folders retain unlocked row controls between disclosure
+changes. Larger outlines keep viewport-only mounting. This fixture uses parked local pages;
+use the affected profile and active website as well when investigating reported stutter.
+The native-host regression
+`SpaceNativeRenderingTests.testFolderDisclosureDefersHiddenSpacePreparationAndDisposal`
+uses the reported 26-tab outline with adjacent Spaces. It checks that hidden preview
+hosting trees are retired and rebuilt after folder disclosure settles, rather than
+competing with the input or animation frames.
+
+Search opening and typing diagnostics use the production native browser window with
+20 and 300 parked tabs. They report forced opening layout, the largest 2 ms input
+heartbeat gap during opening, and worst native field-edit/layout cost, without a CI
+timing limit. Hidden adjacent Space preview preparation must stay paused until search
+closes and its dismissal fade finishes.
+
+Unchanged prepared sidebars survive search presentation, suggestion updates, and vertical
+scrolling. A claimed Space surface updates its outgoing native scroll viewport before
+travel; structural changes and folder-protection revocation still invalidate immediately.
+Hiding the sidebar suspends its gesture input and keeps valid hidden captures. Revealing
+it validates their geometry after travel; profile/window teardown releases them fully.
+The tab, folder, split and favourite row hierarchy observes `SidebarObservation`, which
+forwards structure, selection, rename and protection changes synchronously. General
+window visibility and search publications do not invalidate that entire hierarchy.
+`SidebarObservationTests` verifies both the publication boundary and mounted-view updates.
+`SpaceNativeRenderingTests` checks cache identity across search/scroll, the actual native
+scroll position, rapid profile reversals, and synchronous protection invalidation. Visible
+animation fixtures activate their test window and restore the prior activation policy.
+
+```sh
+TIMO_UI_PERFORMANCE=1 swift test --filter SearchPresentationPerformanceTests
+```
+
+`LiveSidebarResponsivenessTests` mounts the production browser host with three loaded
+WebKit documents, a selected page in the content card, and 47 archived entries in the
+closed Library. Its normal run serves a
+150-card HTML document over local HTTP and checks that folder disclosure, search edits,
+and tab selection preserve the page and its input. Timing runs compare 28- and 300-tab
+outlines through native scroll events and AppKit's normal display cycle, without forcing
+whole-window layout on each input. They check that events reach the intended list, keep
+vertical scrolling out of Space navigation, and report input admission separately from
+field readiness and main-thread display-callback gaps. To exercise a public website in
+the content card instead:
+
+```sh
+TIMO_UI_PERFORMANCE=1 TIMO_LIVE_SITE_URL=https://obsidian.md/ swift test --filter LiveSidebarResponsivenessTests
+```
+
+Only three pages are loaded; the remaining rows are suspended tabs. These timings measure
+native input and display-cycle availability, not compositor-presented frame rate or the
+cost of loading hundreds of websites. Verify frame presentation separately in the affected
+profile with its actual pages, using the target display refresh rate. A 60 Hz session
+cannot establish 120 FPS.
+Run timing diagnostics on an unlocked, otherwise idle desktop and keep the fixture
+visible. The fixture skips detected occlusion; also discard a run if the desktop locks
+or another workload interferes, even if AppKit still reports the window as visible.
+
+The native sidebar keeps each row in a stable hosting owner and attaches owners around
+the visible viewport. The normal resident range is 24 rows; canonical owner boundaries
+can require up to 40 controls. Active editors, menus, reordered owners and larger
+viewports can retain more. Scrolling does not walk detached cached control trees.
+Accessibility queries preserve the real controls and editor instead of expanding the
+entire outline. Set `TIMO_EXPERIMENT_NATIVE_ROW_BATCH_CACHE=0` or
+`TIMO_EXPERIMENT_THREE_RESIDENT_BATCHES=0` only for legacy comparisons.
+
+For presentation timing, launch the exact Release test app with
+`TIMO_DIAG_SCROLL_TRACE=1`, confirm its real website tabs and selected content, then run:
+
+```sh
+python3 scripts/record-ui-frames.py --pid PID --executable /absolute/path/to/timo --output /absolute/new/capture --seconds 60
+python3 scripts/analyze-ui-frames.py --run /absolute/new/capture --output /absolute/new/analysis --scroll-trace /absolute/path/to/timo-scroll-PID-UUID.json --expected-sidebar-rows 100
+```
+
+Start physical sidebar scrolling only after `RECORDING_STARTED`. The recorder saves the
+full raw trace, including after an early stop. Analysis requires exact process identity,
+input-clock alignment, foreground input, populated rows and movement. It reports every
+joined target context separately, including p50, average, p95, p99, maximum and censored
+tails. Compositor transactions alone do not prove changing pixels or a window's FPS.
+The trace arms on the first physical sidebar scroll; relaunch the same signed app after
+functional checks so those checks do not consume the measurement interval.
+
+The offline recorder and analysis checks are:
+
+```sh
+python3 scripts/test-ui-frame-recording.py
+python3 scripts/test-ui-frame-analysis.py
+python3 scripts/test-ui-scroll-trace-analysis.py
+```
+
+Folder-opening diagnostics report toggle time, opening/closing layout, run-loop gaps, and
+mounted native tab controls for 20/300-tab folders. `commit_*_ms` is the time between
+committed updates of the disclosure curve, the figure that has to fit one display frame;
+`swiftui_owner_frames` and `carrier_owner_frames` count the row owners SwiftUI placed
+again against those a native carrier moved. They also guard against repeated
+lock scans in an unprotected 3,000-tab strip and inactive-tab scans in the offscreen
+media layer:
+
+```sh
+TIMO_UI_PERFORMANCE=1 swift test --filter FolderOpeningPerformanceTests
+```
+
+Run comparisons on the same quiet logged-in Mac, with the same fixtures and build
+configuration. Coordinate with other profiling/build tasks before collecting
+timings; use `--skip-build` only after building the exact revision to measure.
+
+## Release and graphical smoke checks
+
+Before shipping, also check the release configuration:
+
+```sh
+swift build -c release
+./.build/release/timo selfcheck --pure
+./make-app.sh
+./scripts/test-build-dmg.sh
+```
+
+### Signed browser smoke
+
+On a logged-in macOS 26-or-later desktop, the smoke script creates a temporary signed
+app and isolated test profile, then runs real WebKit assertions:
+
+The smoke run also reports first-page setup and 100-tab session restoration timings. It
+checks that parked rows need no web views, selecting a row creates its page, and global
+settings and extension metadata queries keep background rows parked.
+
+```sh
+swift build
+python3 scripts/check-browser-smoke.py
+# Opt-in lifecycle measurement: 100 tab/window cycles, 25 suspend/resume cycles,
+# 200 parked rows, 30s settling before/after, and 60s idle sampling.
+python3 scripts/check-browser-smoke.py --lifecycle
+
+# Opt-in Find retention and preview timer diagnostics. Build before reserving a
+# quiet profiling window; the measurements then use the existing test executable.
+swift build --build-tests
+TIMO_LIFECYCLE_MEASURE=1 swift test --skip-build --filter 'LifecycleEfficiencyTests|PreviewLoadingPerformanceTests'
+```
+
+### Public media and full selfcheck
+
+For an opt-in network-dependent public streaming pass on a graphical test Mac:
+
+```sh
+python3 scripts/check-browser-smoke.py --public-media
+```
+
+This separately samples 90 seconds per clear/FairPlay Shaka demo asset, with
+pause/seek/resume and player unload/reload. It uses no service accounts and does not
+verify subscription playback, cross-network calls or system capture revocation. Exact
+outcomes and limits belong in [the compatibility log](REAL-SITE-COMPATIBILITY.md).
+
+The full `selfcheck` uses a keychain and a window server. Run it locally when those
+services are available:
+
+```sh
+./Timo.app/Contents/MacOS/Timo selfcheck
+```
+
+For updater transport, transaction, native recovery, and unchanged notarized-candidate
+checks, see [release validation](RELEASING.md#updater-and-distribution-validation).
+
+## Project structure
+
+| Path | Purpose |
+| --- | --- |
+| [`Sources/Timo/main.swift`](../Sources/Timo/main.swift) | CLI dispatch and application startup. |
+| [`Sources/Timo/AppLifecycle.swift`](../Sources/Timo/AppLifecycle.swift) | Application delegate, Dock actions, and window lifecycle. |
+| [`Sources/Timo/Engine.swift`](../Sources/Timo/Engine.swift) | Tabs, WebViews, navigation, and WebKit delegates. |
+| [`Sources/Timo/SharedTabs.swift`](../Sources/Timo/SharedTabs.swift) | Shared Space tabs and live-page ownership between windows. |
+| [`Sources/Timo/UI.swift`](../Sources/Timo/UI.swift) | Main browser window and SwiftUI controls. |
+| [`Sources/Timo/Profiles.swift`](../Sources/Timo/Profiles.swift) | Profile and Space state, paths, and isolation. |
+| [`Sources/Timo/Store.swift`](../Sources/Timo/Store.swift) | SQLite history and bookmarks. |
+| [`Sources/Timo/LibraryWindow.swift`](../Sources/Timo/LibraryWindow.swift) | Downloads, media, archives, Spaces, and Easels browsing. |
+| [`Sources/Timo/Easels.swift`](../Sources/Timo/Easels.swift), [`EaselWindow.swift`](../Sources/Timo/EaselWindow.swift) | Saved board data and the editing canvas. |
+| [`Sources/Timo/PageCapture.swift`](../Sources/Timo/PageCapture.swift) | Element and region selection, page snapshots, and capture outputs. |
+| [`Sources/Timo/BatterySaver.swift`](../Sources/Timo/BatterySaver.swift) | Battery-aware suspension and reduced preview/motion policy. |
+| [`Sources/Timo/AppIcon.swift`](../Sources/Timo/AppIcon.swift), [`AppIcons/`](../AppIcons/) | Dock icon selection and bundled Icon Composer assets. |
+| [`Sources/Timo/CloudAI.swift`](../Sources/Timo/CloudAI.swift), [`AIKeys.swift`](../Sources/Timo/AIKeys.swift) | Provider requests, privacy rules, and local API-key storage. |
+| [`Sources/Timo/Passwords.swift`](../Sources/Timo/Passwords.swift) | Keychain integration, autofill, and the selfcheck runner. |
+| [`Sources/Timo/Updater.swift`](../Sources/Timo/Updater.swift) | Release checks and authenticated XPC installation; the signed installer checks Gatekeeper and removes update quarantine before the locked, crash-recoverable swap. |
+| [`Tests/TimoTests/`](../Tests/TimoTests/) | XCTest browser and UI regressions. |
+| [`scripts/`](../scripts/) | Browser smoke, release-candidate, packaging, and integration checks. |
+
+Additional persistence areas include `Backup*`, `ReadingQueue*`, `SpaceTemplate*`, and
+`SiteBoost*` under `Sources/Timo`. The signed XPC entry points live under
+`Sources/UpdateInstaller` and `Sources/IconService`; `installer/` contains their plists
+and packaging support.
+
+The public website is maintained at the root of the separate
+[`website` branch](https://github.com/senommu/timo/tree/website) in this repository.
+Markdown topic guides, [audit evidence](README.md#reliability-and-validation), and
+historical [plans](superpowers/plans/) / [specifications](superpowers/specs/) stay
+on `main`. App [screenshot provenance](https://github.com/senommu/timo/blob/website/media/README.md)
+and public media live with the website source.
+
+### Website rendering checks
+
+Use a separate checkout of `website`, then run its checks from that checkout:
+
+```sh
+node tests/galaxy.test.cjs
+python3 tests/site-links.py
+```
+
+The optional `scripts/check-site-rendering.swift` probe lives on the website
+branch too. It targets the archived galaxy scene and needs a logged-in Mac;
+its frame-rate samples are diagnostics, not a fixed performance budget or
+validation of the current native browser. See [website maintenance](WEBSITE.md).
+
+## Contributing and review
+
+Start with the [contributor guide](../CONTRIBUTING.md) for a first change, issue
+reporting, and PR expectations.
+
+Follow [AGENTS.md](../AGENTS.md): work on an isolated `codex/` branch, preserve
+unrelated changes, run relevant checks, open a PR, obtain an independent review of its
+current head, address findings, and wait for required CI/approvals before
+squash-merging. Merging does not publish a release.
+
+When launching test apps, record each bundle path, PID, and process start time. Quit and
+verify exit of every owned instance before finishing or abandoning work. Revalidate
+identity before any targeted signal; leave the regular app and other tasks’ instances
+running.
+
+Report macOS, SDK, signing, fixture/account scope, and skips with validation. Historical
+audits are evidence for their stated revision and environment, not proof that current
+source passed the same checks.

@@ -1,0 +1,1997 @@
+import AppKit
+import Combine
+import SwiftUI
+
+// MARK: - Matching
+
+/// The command palette's matcher, and the offline checks that prove it.
+///
+/// Everything in this enum is a pure function of its arguments — no window server, no
+/// database, no network — so `timo selfcheck --pure` can assert the ranking on a headless
+/// box. The view below is the only part that touches the app.
+enum Palette {
+    /// Literal relevance tiers followed by the best fuzzy subsequence alignment.
+    static func score(_ query: String, _ target: String) -> Int? {
+        SearchMatch(query).score(target)
+    }
+
+    /// Filter to what matches, best first. Stable — equal scores keep their input order,
+    /// which is what makes the list predictable between keystrokes (and testable).
+    static func rank<T>(_ query: String, _ items: [T], key: (T) -> String) -> [T] {
+        let match = SearchMatch(query)
+        var hits: [(score: Int, order: Int, item: T)] = []
+        for (i, item) in items.enumerated() {
+            if let s = match.score(key(item)) { hits.append((s, i, item)) }
+        }
+        hits.sort { $0.score == $1.score ? $0.order < $1.order : $0.score > $1.score }
+        return hits.map(\.item)
+    }
+
+    /// Titles and addresses are independent fields; joining them loses exact titles
+    /// and can create a fuzzy match spanning unrelated row metadata.
+    static func rankPages<T>(_ query: String, _ items: [T],
+                             title: (T) -> String, url: (T) -> String) -> [T] {
+        let match = SearchMatch(query)
+        var hits: [(score: Int, order: Int, item: T)] = []
+        for (index, item) in items.enumerated() {
+            if let score = match.page(title: title(item), url: url(item)) {
+                hits.append((score, index, item))
+            }
+        }
+        hits.sort { $0.score == $1.score ? $0.order < $1.order : $0.score > $1.score }
+        return hits.map(\.item)
+    }
+
+    static func tabSourceAllowed(profileID: UUID, isPrivate: Bool, ownWindow: Bool,
+                                 sourceProfileID: UUID, sourcePrivate: Bool, sourceLittle: Bool) -> Bool {
+        ownWindow || (!isPrivate && !sourcePrivate && !sourceLittle && profileID == sourceProfileID)
+    }
+
+    /// Whether an open tab is a *strong* answer to the query — the kind that deserves to sit
+    /// above "Search Google". A fuzzy subsequence hit is not: typing "gpt" should search, not
+    /// switch to a tab whose title merely contains those letters somewhere. Strong means the
+    /// query is how the title, the host, or a word of the title begins (a word only once the
+    /// query is three characters, so a single letter does not claim every tab).
+    static func strong(_ query: String, title: String, url: String) -> Bool {
+        strongMatcher(query)(title, url)
+    }
+
+    /// `strong` with the query parsed once, for testing every open tab against it.
+    static func strongMatcher(_ query: String) -> (_ title: String, _ url: String) -> Bool {
+        // A page controls its title. It must never displace a destination the user typed,
+        // even when that title is an exact copy of the requested URL.
+        guard !Search.isExplicitNavigation(query), !Search.isJavaScriptURL(query) else { return { _, _ in false } }
+        let match = SearchMatch(query)
+        guard !match.query.isEmpty else { return { _, _ in false } }
+        let words = match.query.count >= 3
+        return { title, url in
+            guard let score = match.page(title: title, url: url, fuzzy: false) else { return false }
+            return score >= SearchMatch.prefixFloor || (words && score >= SearchMatch.wordFloor)
+        }
+    }
+
+    /// Visible tab metadata comes from the actual address, never from the page title.
+    /// Put the origin last so head truncation retains its domain when space is tight.
+    static func tabSubtitle(address: String, place: String) -> String {
+        var origin = address
+        if let parts = URLComponents(string: address), let scheme = parts.scheme,
+           let host = parts.host, !host.isEmpty {
+            var components = URLComponents()
+            components.scheme = scheme
+            components.host = host
+            components.port = parts.port
+            origin = components.url?.absoluteString ?? address
+        }
+        return [place, origin].filter { !$0.isEmpty }.joined(separator: " — ")
+    }
+
+    /// What to show while a query's results are still arriving. History and the engine
+    /// answer separately, in either order: each source keeps the last query's rows until its
+    /// own new ones are in, so neither half collapses and refills under the reader. Once
+    /// nothing is pending, exactly the live rows — even none.
+    static func heldResults<T, ID: Hashable>(live: [T], held: [T], historyPending: Bool,
+                                             enginePending: Bool, isCompletion: (T) -> Bool,
+                                             id: (T) -> ID) -> [T] {
+        let history = live.filter { !isCompletion($0) }
+        let completions = live.filter(isCompletion)
+        // A half that has answered — even with nothing — replaces its held rows.
+        let keptHistory = historyPending && history.isEmpty ? held.filter { !isCompletion($0) } : history
+        let ids = Set(keptHistory.map(id))
+        return keptHistory + (enginePending && completions.isEmpty
+            ? held.filter { isCompletion($0) && !ids.contains(id($0)) } : completions)
+    }
+
+    static func rowsHeight(_ count: Int) -> CGFloat {
+        let n = CGFloat(count)
+        return n * Look.barRowHeight + max(0, n - 1) * Look.barRowGap
+    }
+
+    /// How many result rows the bar may draw: what Search Settings asks for, but never more
+    /// than fit the window under `chrome` (field, divider, padding and the bar's insets), so
+    /// the list's last rows stay on screen and in reach of scrolling. Always at least one.
+    static func fittingRows(_ wanted: Int, windowHeight: CGFloat, chrome: CGFloat) -> Int {
+        let room = windowHeight - chrome - Look.inset * 2
+        // Before the first layout the height is unknown (infinite); nothing to cut yet.
+        let rows = ((room + Look.barRowGap) / (Look.barRowHeight + Look.barRowGap)).rounded(.down)
+        guard rows.isFinite else { return max(1, wanted) }
+        return max(1, min(wanted, Int(max(0, rows))))
+    }
+
+    /// The slot drawn as hovered. Results are rewritten in place under a still pointer, so
+    /// hover belongs to the slot, not to whichever result stood in it; a slot the list no
+    /// longer has is not lit.
+    static func litSlot(hover: Int?, rowCount: Int) -> Int? {
+        hover.flatMap { $0 < rowCount ? $0 : nil }
+    }
+
+    /// Whether an edit may complete inline: typing forward, or typing over the address ⌘L
+    /// opened with selected. A delete, a cut or a paste over the middle turns it off until
+    /// the next character.
+    static func typesForward(from old: String, to new: String, seeded: String?) -> Bool {
+        (new.count > old.count && new.hasPrefix(old))
+            || (seeded != nil && old == seeded && !new.isEmpty)
+    }
+
+    /// The addresses an inline completion may come from, best first: this query's history,
+    /// then rows still held from the last one, then the first-letter lookup history makes
+    /// for completion alone (history suggestions start at two characters), then open tabs.
+    static func completionSources(typed: String, history: [String], held: [String],
+                                  firstLetter: (query: String, urls: [String]),
+                                  tabs: [String]) -> [String] {
+        history + held + (firstLetter.query == typed ? firstLetter.urls : []) + tabs
+    }
+
+    /// The completion an edit leaves standing. Accepting one — → or End, ← or Home, or a
+    /// click, which commit the whole text to the query — keeps its origin while the query
+    /// still reads as that host, so Return opens `http://server/` rather than re-parsing
+    /// `server` as a search. The next edit that changes the text lets it go.
+    static func carriedCompletion(_ accepted: HostCompletion?, completion: HostCompletion?,
+                                  query: String) -> HostCompletion? {
+        let same = { (c: HostCompletion) in c.text.caseInsensitiveCompare(query) == .orderedSame }
+        if let completion, same(completion) { return completion }
+        if let accepted, same(accepted) { return accepted }
+        return nil
+    }
+
+    /// What the field shows (`text`) and where Return goes (`url`): the site's own origin,
+    /// so a port or a single-label intranet host survives what re-parsing the text would lose.
+    struct HostCompletion: Equatable {
+        let text: String
+        let url: URL
+    }
+
+    /// Inline completion: the first visited or open site whose host, without `www.`,
+    /// begins with what was typed — "d" becomes "deepseek.com", "loc" "localhost:3000".
+    /// Origins only, never paths, so Return lands on the site rather than one old page of
+    /// it. Nil for anything that is not the start of a host, or once it is typed in full.
+    static func completeHost(_ typed: String, urls: [String]) -> HostCompletion? {
+        let typed = typed.lowercased()
+        guard !typed.isEmpty, !typed.contains(where: \.isWhitespace) else { return nil }
+        for url in urls {
+            guard let parts = URLComponents(string: url), let scheme = parts.scheme,
+                  ["http", "https"].contains(scheme.lowercased()),
+                  let rawHost = parts.host?.lowercased(), !rawHost.isEmpty else { continue }
+            let host = rawHost.hasPrefix("www.") ? String(rawHost.dropFirst(4)) : rawHost
+            let text = host + (parts.port.map { ":\($0)" } ?? "")
+            guard text.count > typed.count, text.hasPrefix(typed) else { continue }
+            var origin = URLComponents()
+            origin.scheme = scheme
+            origin.host = rawHost
+            origin.port = parts.port
+            origin.path = "/"
+            if let destination = origin.url { return HostCompletion(text: text, url: destination) }
+        }
+        return nil
+    }
+
+    /// The bar before a character is typed (ref 2). Arc's ⌘T opens on this window's own
+    /// tabs, most recently used first — `TabSwitcher.recent`'s order, the one ⌃⇥ walks —
+    /// capped so the bar stays a glance, with one row under them to report a problem.
+    ///
+    /// Nothing else: no commands, no assistant, no completions, no Spaces. Those are all
+    /// answers to a query, and there is no query yet; a bar that opens on a wall of verbs
+    /// is a bar you have to read before you can type. Everything comes back with the first
+    /// character, where `arrange` below takes over.
+    static func empty<T>(tabs: [T], report: T, cap: Int = Look.barEmptyTabs) -> [T] {
+        Array(tabs.prefix(cap)) + [report]
+    }
+
+    /// The bar's row order once something is typed, in one place so it can be proved without
+    /// a window. The tabs that match lead — at most `leadingTabs`, so the typed row is never
+    /// pushed under the fold — then what was typed, what it completes to, the assistant two
+    /// rows under the typed one (ref 3), the rest of the matching tabs, the other places that
+    /// match, and commands as a tail.
+    ///
+    /// `rest` is the places that are neither open tabs nor completions: an archived tab to
+    /// restore, a Space to switch to. They sit above the commands because they are somewhere
+    /// to go, and below the tabs because a tab you already have open is the better answer.
+    static func arrange<T>(tabs: [T], typed: T, suggestions: [T], ai: T?, rest: [T] = [],
+                           commands: [T], leadingTabs: Int = 3) -> [T] {
+        var out = Array(tabs.prefix(leadingTabs))
+        let lead = out.count
+        out.append(typed)
+        out += suggestions
+        if let ai { out.insert(ai, at: min(lead + 2, out.count)) }
+        out += tabs.dropFirst(leadingTabs)
+        out += rest
+        out += commands
+        return out
+    }
+
+    /// Split already-ranked actions into the leading answer and the remaining tail.
+    /// Keeping this decision separate from row closures makes the capped layout testable.
+    static func commandSections<T>(_ query: String, commands: [T],
+                                   title: (T) -> String) -> (leading: [T], trailing: [T]) {
+        let match = SearchMatch(query)
+        guard match.query.count >= 3,
+              let index = commands.firstIndex(where: {
+                  (match.score(title($0), fuzzy: false) ?? 0) >= SearchMatch.wordFloor
+              }) else { return (leading: [], trailing: commands) }
+        var trailing = commands
+        let leading = trailing.remove(at: index)
+        return (leading: [leading], trailing: trailing)
+    }
+
+    /// How much of the actions catalogue this keystroke asks for.
+    enum ActionScope: Equatable {
+        /// No actions at all — an empty bar is its tabs, and the tab search is tabs only.
+        case none
+        /// Everything the query matches.
+        case matching
+    }
+
+    /// When the bar offers actions. From the first character on, every entry point searches
+    /// the whole catalogue — Timo used to hold actions back until three characters had been
+    /// typed, which meant the only way to find one was to already know its name.
+    ///
+    /// With nothing typed there are no actions at all, whichever key opened the bar: Arc's
+    /// bar at rest is the tabs you might switch to, and a list of verbs under an empty field
+    /// (or, in ⌘L's bar, under a url you are about to replace) is something to read before
+    /// you can type. `filtered` is ⇥ — Arc's actions filter — which is a request for the
+    /// catalogue itself, so an empty query there means "all of them", not "none".
+    static func actions(query: String, mode: PaletteMode, filtered: Bool = false) -> ActionScope {
+        if filtered { return .matching }
+        if mode == .tabs { return .none }
+        return query.trimmingCharacters(in: .whitespaces).isEmpty ? .none : .matching
+    }
+
+    /// ⌘T, ⌘L and ⌘⇧P over a bar that is already up close it (Arc v0.107): the same key that
+    /// opened it is the fastest way out, and reopening a bar that never went away is what
+    /// makes a browser feel stuck.
+    static func toggled(current: PaletteMode?, pressed: PaletteMode) -> PaletteMode? {
+        current == nil ? pressed : nil
+    }
+
+    /// Where Return loads, as Arc decides it. ⌘T's bar always makes a tab; ⌘L's replaces
+    /// the page it was opened on; ⌘Return makes a tab whichever opened it. With nothing open
+    /// there is nothing to replace, so a tab is made either way.
+    static func opensInNewTab(mode: PaletteMode, commandHeld: Bool, hasActiveTab: Bool) -> Bool {
+        commandHeld || mode == .newTab || !hasActiveTab
+    }
+
+    /// Selection after a result refresh. Query changes reset; later results retain selection.
+    static func selectedIndex(previous: Int, selectedID: String?, rowIDs: [String], reset: Bool) -> Int {
+        if reset { return 0 }
+        if let selectedID, let kept = rowIDs.firstIndex(of: selectedID) { return kept }
+        return min(previous, max(0, rowIDs.count - 1))
+    }
+
+    /// ⌘T at rest (#683): the tab in front leads the list, but Return on it does nothing, so
+    /// the row under it — the last tab looked at, ⌃⇥'s answer — starts selected.
+    static func restingIndex(rowIDs: [String], currentID: String?, previousIsTab: Bool) -> Int {
+        rowIDs.first == currentID && currentID != nil && previousIsTab ? 1 : 0
+    }
+
+    static func check() -> [(String, Bool)] {
+        // Force-unwrapped inside the assertions on purpose: a nil here is the failure the
+        // line above it already checks for, so it can only fire if the checks disagree.
+        let words = ["GitHub", "Gitlab", "git", "Hacker News"]
+        let none: [String] = []
+        let watched = MainActor.assumeIsolated { ChangeWatch.check() }
+        // The bar at rest. The order is `TabSwitcher.recent`'s — ⌃⇥'s own — so the list ⌘T
+        // opens on and the switcher's row can never disagree about which tab is "the last
+        // one". Six tabs, named, with a clock each; the third is the one in front.
+        let ids = (0..<6).map { _ in UUID() }
+        let named = ["one", "two", "three", "four", "five", "six"]
+        let clocks = [5.0, 9, 1, 7, 3, 8]
+        let stamped = zip(ids, clocks).map { ($0, Date(timeIntervalSince1970: $1)) }
+        let recent = TabSwitcher.recent(stamped, current: ids[2], limit: .max)
+            .compactMap { id in ids.firstIndex(of: id) }.map { named[$0] }
+        let atRest = empty(tabs: recent, report: "report")
+        return [
+            ("with nothing typed the bar is this window's tabs, the one in front first",
+             atRest.first == "three"),
+            ("…then the rest of them by when they were last looked at",
+             Array(atRest.dropLast()) == ["three", "two", "six", "four", "one"]),
+            ("…capped, so the bar opens as a glance rather than as the whole strip",
+             atRest.count == Look.barEmptyTabs + 1 && !atRest.contains("five")),
+            ("…and one row to report a problem, always last", atRest.last == "report"),
+            ("⌘T at rest selects the previous tab, not the one in front",
+             restingIndex(rowIDs: ["cur", "prev", "r"], currentID: "cur", previousIsTab: true) == 1),
+            ("…but not the report row when the front tab is the only one",
+             restingIndex(rowIDs: ["cur", "r"], currentID: "cur", previousIsTab: false) == 0),
+            ("…and nothing moves when no tab is in front",
+             restingIndex(rowIDs: ["prev", "r"], currentID: nil, previousIsTab: true) == 0),
+            ("a shorter list is not padded", empty(tabs: ["t1"], report: "r") == ["t1", "r"]),
+            ("…and a window with no tabs is that one row alone",
+             empty(tabs: none, report: "r") == ["r"]),
+            ("the cap is a cap, whatever it is set to",
+             empty(tabs: ["t1", "t2", "t3"], report: "r", cap: 2) == ["t1", "t2", "r"]),
+            // Where Return loads (§4 of the Arc spec): ⌘T makes a tab, ⌘L replaces the page.
+            ("⌘T's bar always opens in a new tab",
+             opensInNewTab(mode: .newTab, commandHeld: false, hasActiveTab: true)),
+            ("⌘L's bar replaces the page it was opened on",
+             !opensInNewTab(mode: .address, commandHeld: false, hasActiveTab: true)),
+            ("⌘Return opens in a new tab whichever way the bar was opened",
+             opensInNewTab(mode: .address, commandHeld: true, hasActiveTab: true)
+                && opensInNewTab(mode: .all, commandHeld: true, hasActiveTab: true)),
+            ("with nothing open there is nothing to replace, so a tab is made",
+             opensInNewTab(mode: .address, commandHeld: false, hasActiveTab: false)),
+            ("⌘⇧P's bar replaces the page too — it is the same bar",
+             !opensInNewTab(mode: .all, commandHeld: false, hasActiveTab: true)),
+            ("a title that begins with the query is a strong tab",
+             strong("git", title: "GitHub", url: "https://github.com")),
+            ("a host that begins with the query is a strong tab",
+             strong("you", title: "Never Gonna Give You Up", url: "https://www.youtube.com/watch")),
+            ("letters found somewhere in the title are not",
+             !strong("gpt", title: "Giant Purple Turtles", url: "https://example.com")),
+            ("a word of the title counts once the query has three letters",
+             strong("tur", title: "Giant Purple Turtles", url: "https://example.com")
+                && !strong("tu", title: "Giant Purple Turtles", url: "https://example.com")),
+            ("nothing typed makes nothing strong", !strong("", title: "GitHub", url: "https://github.com")),
+            ("no strong tab means the search leads and the tabs follow the completions",
+             arrange(tabs: ["t1", "t2"], typed: "q", suggestions: ["s1"], ai: nil, commands: none,
+                     leadingTabs: 0) == ["q", "s1", "t1", "t2"]),
+            ("a matching tab comes before what was typed",
+             arrange(tabs: ["t1"], typed: "q", suggestions: ["s1"], ai: nil, commands: none) == ["t1", "q", "s1"]),
+            ("at most three tabs lead; the rest follow the completions",
+             arrange(tabs: ["t1", "t2", "t3", "t4"], typed: "q", suggestions: ["s1"], ai: nil, commands: none)
+                == ["t1", "t2", "t3", "q", "s1", "t4"]),
+            ("the assistant sits two rows under what was typed",
+             arrange(tabs: ["t1"], typed: "q", suggestions: ["s1", "s2"], ai: "ai", commands: none)
+                == ["t1", "q", "s1", "ai", "s2"]),
+            ("…or right after it when there is nothing to complete to",
+             arrange(tabs: none, typed: "q", suggestions: none, ai: "ai", commands: none) == ["q", "ai"]),
+            ("commands are the tail",
+             arrange(tabs: ["t1"], typed: "q", suggestions: none, ai: nil, commands: ["c"]) == ["t1", "q", "c"]),
+            ("an archived tab or a Space follows the open tabs",
+             arrange(tabs: ["t1"], typed: "q", suggestions: none, ai: nil, rest: ["archived"],
+                     commands: none) == ["t1", "q", "archived"]),
+            ("…and still comes before the commands",
+             arrange(tabs: none, typed: "q", suggestions: none, ai: nil, rest: ["space"],
+                     commands: ["c"]) == ["q", "space", "c"]),
+            ("…and after every matching tab, not just the leading three",
+             arrange(tabs: ["t1", "t2", "t3", "t4"], typed: "q", suggestions: none, ai: nil,
+                     rest: ["archived"], commands: ["c"])
+                == ["t1", "t2", "t3", "q", "t4", "archived", "c"]),
+            ("…and under the completions and the assistant, which answer what was typed",
+             arrange(tabs: none, typed: "q", suggestions: ["s1"], ai: "ai", rest: ["space"],
+                     commands: none) == ["q", "s1", "ai", "space"]),
+
+            // Actions are always in reach (Arc) from the first character, not held back
+            // until three — and never under an empty field, where the bar is its tabs.
+            ("nothing typed offers no actions: ⌘⇧P's bar at rest is tabs, not verbs",
+             actions(query: "", mode: .all) == .none),
+            ("one character searches the whole catalogue",
+             actions(query: "r", mode: .all) == .matching),
+            ("…in ⌘L's bar too", actions(query: "r", mode: .address) == .matching),
+            ("…and in ⌘T's", actions(query: "r", mode: .newTab) == .matching),
+            ("…and ⌘L's bar stays out of the way while it is still showing an address",
+             actions(query: "", mode: .address) == .none),
+            ("whitespace is not a query", actions(query: "   ", mode: .all) == .none),
+            ("the tab search is tabs and nothing else",
+             actions(query: "reload", mode: .tabs) == .none),
+            // ⇥ is Arc's actions filter, and asks for the catalogue rather than the top of
+            // it — whatever opened the bar, and whatever is in the field. (The field is
+            // emptied on the way in: see the `.tab` case. ⌘L's bar is never empty, and its
+            // prefilled url ranked against the catalogue matches no action at all.)
+            ("⇥ hands the bar to the catalogue whichever key opened it",
+             actions(query: "", mode: .address, filtered: true) == .matching
+                && actions(query: "", mode: .all, filtered: true) == .matching
+                && actions(query: "", mode: .newTab, filtered: true) == .matching),
+            ("…and keeps filtering to them once something is typed at the scope",
+             actions(query: "re", mode: .address, filtered: true) == .matching),
+            ("…even in the tab search", actions(query: "", mode: .tabs, filtered: true) == .matching),
+
+            ("⌘T over a closed bar opens it", toggled(current: nil, pressed: .newTab) == .newTab),
+            ("⌘T over an open bar closes it",
+             toggled(current: .newTab, pressed: .newTab) == nil),
+            ("⌘L over a bar ⌘T opened closes it too — it is the same bar",
+             toggled(current: .newTab, pressed: .address) == nil),
+        ] + watched + [
+            ("query characters match in order", score("gh", "GitHub") != nil),
+            ("the same characters out of order do not match", score("hg", "GitHub") == nil),
+            ("matched characters may be scattered", score("gtb", "GitHub") != nil),
+            ("a query longer than the target never matches", score("github!", "GitHub") == nil),
+            ("no match returns nothing, not a zero score", score("zzz", "GitHub") == nil),
+            ("a partly-matching query still returns nothing", score("gitx", "GitHub") == nil),
+
+            ("matching is case-insensitive", score("GH", "github") == score("gh", "GitHub")),
+            ("case does not change the ranking",
+             score("git", "Git") == score("GIT", "git")),
+
+            ("a prefix match beats the same match mid-word",
+             score("doc", "docs.rs")! > score("doc", "mydocs.rs")!),
+            ("a word-start match beats the same match mid-word",
+             score("doc", "my-docs")! > score("doc", "mydocs")!),
+            ("contiguous characters beat scattered ones",
+             score("abc", "abcxx")! > score("abc", "axbxc")!),
+            ("on a tie the shorter target wins",
+             score("ab", "ab")! > score("ab", "abab")!),
+
+            ("an empty query matches everything", score("", "anything") == 0),
+            ("an empty query scores every target the same",
+             score("", "a") == score("", "a much longer target")),
+            ("an empty query keeps the input order",
+             rank("", words, key: { $0 }) == words),
+
+            ("rank drops the targets that do not match",
+             rank("git", words, key: { $0 }) == ["git", "GitHub", "Gitlab"]),
+            ("rank on no match returns an empty list",
+             rank("zzz", words, key: { $0 }).isEmpty),
+            ("rank puts the best match first",
+             rank("hn", words, key: { $0 }).first == "Hacker News"),
+        ] + PaletteCommand.check()
+    }
+}
+
+/// Re-runs the bar's list when a tab it is showing changes under it — a title arriving, a
+/// favicon landing, a page finishing. `TabStore` publishes its *list* of tabs and nothing
+/// about the tabs themselves, so a bar that only snapshotted on open kept drawing "New Tab"
+/// and a globe for a page that had long since said who it was.
+///
+/// The bump happens inside `objectWillChange`, before the tab's own value changes; that is
+/// fine, because SwiftUI runs `onChange` on its next pass, after the write has landed.
+/// ponytail: one revision counter, not per-field subscriptions. A tab's progress fires this
+/// too, and the refresh it triggers is a rank over a few dozen titles — nothing to save.
+@MainActor final class ChangeWatch: ObservableObject {
+    @Published private(set) var revision = 0
+    private var subscriptions: [AnyCancellable] = []
+
+    /// Replace what is being watched. Anything watched before is dropped.
+    func watch<O: ObservableObject>(_ objects: [O])
+    where O.ObjectWillChangePublisher == ObservableObjectPublisher {
+        subscriptions = objects.map { o in
+            o.objectWillChange.sink { [weak self] _ in self?.revision += 1 }
+        }
+    }
+
+    /// A stand-in for a Tab, which needs WebKit: the same shape as far as the watch can see.
+    private final class Probe: ObservableObject { @Published var value = 0 }
+
+    static func check() -> [(String, Bool)] {
+        let watch = ChangeWatch()
+        let a = Probe(), b = Probe()
+        watch.watch([a])
+        a.value = 1
+        let bumped = watch.revision == 1
+        b.value = 1
+        let unwatchedIgnored = watch.revision == 1
+        watch.watch([b])
+        a.value = 2
+        let dropped = watch.revision == 1
+        b.value = 2
+        let rewatched = watch.revision == 2
+        return [
+            ("a change on a watched tab bumps the revision", bumped),
+            ("a tab that is not watched does not", unwatchedIgnored),
+            ("watching a new set drops the old one", dropped),
+            ("…and follows the new one", rewatched),
+        ]
+    }
+}
+
+// MARK: - Overlay
+
+/// There is one bar, not three. ⌘L, ⌘T and the address pill open `.address`, ⌘⇧P opens
+/// `.all` and ⌘⇧A `.tabs` — and all of them are the same search bar with the same prompt.
+/// The mode is only a starting filter: `.tabs` lists open tabs and nothing else, which is
+/// the "search tabs" gesture Arc and Safari both have. A separate overlay for that would be
+/// the same hundred lines with one line deleted.
+enum PaletteMode {
+    case all, tabs, address, newTab
+
+    @MainActor func usesSidebarAddress(in store: TabStore) -> Bool {
+        self == .address && store.sidebarShown && !store.libraryOpen && !store.isLittle
+    }
+
+    /// What VoiceOver calls the bar. Never drawn — the prompt below is what is drawn.
+    var title: String {
+        switch self {
+        case .tabs: "Search Tabs"
+        case .all, .address, .newTab: "Search or Enter URL"
+        }
+    }
+    /// One prompt for every entry point: whatever opened this, it searches or navigates.
+    var prompt: String { "Search or Enter URL…" }
+}
+
+
+/// A native scrim anchor exposes its actual compositor opacity, including the
+/// enclosing search fade, for presentation diagnostics.
+private struct PaletteScrimSurface: NSViewRepresentable {
+    let opacity: Double
+    let gesture: SpaceGesture
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        view.setAccessibilityElement(false)
+        gesture.paletteScrimView = view
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        gesture.paletteScrimView = view
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.layer?.backgroundColor = NSColor.black.withAlphaComponent(opacity).cgColor
+        CATransaction.commit()
+    }
+}
+
+// MARK: - The bar
+
+/// One line of the command bar. `icon` is drawn only when `image` (a favicon) is missing,
+/// and `trailing` is the "what Return does here" label on the right — "Switch to Tab",
+/// "Ask Claude", "Open". Both are what make a row readable without reading it.
+///
+/// `detail` is matched against and spoken, but never drawn: Arc's rows are a title and a
+/// verb. `subtitle` draws a tab's actual origin and window, or a history item's host.
+struct PaletteRow: Identifiable {
+    let id: String
+    let icon: String
+    var image: NSImage? = nil
+    let title: String
+    var detail: String = ""
+    /// Actual address for matching; descriptive labels are never search fields.
+    var matchURL: String = ""
+    var subtitle: String = ""
+    var trailing: String = ""
+    /// Draw `icon` inside a filled square rather than bare. Arc marks the one row in the bar
+    /// that is not a place — Report a Problem — this way: a chip where a favicon would be,
+    /// so it reads as a button in a list of pages.
+    var chip: Bool = false
+    /// The keystroke that does this without opening the bar at all, drawn down the right of
+    /// an action row the way Arc's are. Empty for everything else.
+    var shortcut: String = ""
+    /// The page a row is allowed to forget: a history suggestion, which grows an × on hover
+    /// and answers ⌥⌘⌫. Nil everywhere else — a tab is not a suggestion, an engine's
+    /// completion is not ours to delete, and a bookmark was put there on purpose.
+    /// A url rather than a closure: forgetting is one call on one store, and the view is
+    /// already the thing that has to redraw afterwards.
+    var forget: String? = nil
+    /// What VoiceOver calls this row, since the icon says it to everyone else.
+    let kind: String
+    /// `target` makes — or finds — the tab this row should load into, and is only called by
+    /// the rows that load something. Passed in rather than captured so ⌘Return can hand the
+    /// same row a fresh tab: a row's closure is built when the list is, which is before the
+    /// user has pressed anything.
+    let run: @MainActor (_ target: () -> Tab) -> Void
+}
+
+/// The command bar's text field.
+///
+/// ponytail: AppKit rather than SwiftUI's `TextField`, for the two things this field has to
+/// do that SwiftUI has no API for. It opens with the current address *selected*, so typing
+/// replaces it and ⌘L behaves like every other browser's location bar; and it sees Return,
+/// Shift-Return, Tab and the arrows before the field editor decides what they mean, rather
+/// than racing `onKeyPress` against it. Ceiling: a plain single-line NSTextField — no
+/// attributed text, no emoji picker. Inline completion is the selected tail of its string.
+///
+/// Internal, not private: the find bar needs the same three things (selected on open, Return
+/// and Shift-Return seen first, focus that stays put), only smaller.
+struct CommandField: NSViewRepresentable {
+    enum Key {
+        case up, down, enter, shiftEnter, commandEnter, tab, escape, forget, backspace
+        /// A delete removed only the highlighted inline completion; what was typed is unchanged.
+        case dismissCompletion
+    }
+
+    @Binding var text: String
+    let prompt: String
+    /// Select everything once the field takes focus, rather than parking the caret at the end.
+    let selectAll: Bool
+    let label: String
+    let hint: String
+    /// The bar's size by default; the find bar asks for its own, smaller one.
+    var font: NSFont = Look.Typography.input.native
+    /// Native fields need explicit ink when a surface uses a custom text strength.
+    var textColor: NSColor? = nil
+    /// A new request refocuses an already-mounted field without reselecting on every edit.
+    var focusRequest = 0
+    /// A retiring overlay can still be mounted during its dismissal transition.
+    var canFocus: () -> Bool = { true }
+    /// What `text` completes to. The field shows it with the untyped tail selected, so the
+    /// next character types over the tail and a delete removes it.
+    var completion: String? = nil
+    /// The field is its own previous and next key view. Only for a field whose `onKey`
+    /// swallows Tab and Shift-Tab, so keyboard navigation never asks it for a neighbour.
+    var closedKeyLoop = false
+    /// Return true to swallow the key; false lets the field editor have it.
+    let onKey: (Key) -> Bool
+
+    /// ⌥⌘⌫ never reaches `doCommandBySelector`: the field editor has no action bound to that
+    /// combination, so AppKit drops it before the delegate is asked. Anything carrying ⌘ is
+    /// offered to `performKeyEquivalent` first, though, which is the one place a text field
+    /// gets to see it — and the field has to be a subclass to override it.
+    final class BarField: NSTextField {
+        var onForget: () -> Bool = { false }
+        var onMount: (() -> Void)?
+        var closedKeyLoop = false
+        /// AppKit's password AutoFill check asks a newly focused text field for its
+        /// neighbours. Answering that without a nearby key view searches every candidate in
+        /// the window — the whole sidebar — on each ⌘T. The bar's answer is always "none".
+        /// A field that keeps Tab gives the check the same answer and everyone else the
+        /// real one: these are search fields, and none sits beside a password field.
+        override var nextValidKeyView: NSView? {
+            closedKeyLoop || Self.askedByAutoFill() ? self : super.nextValidKeyView
+        }
+        override var previousValidKeyView: NSView? {
+            closedKeyLoop || Self.askedByAutoFill() ? self : super.previousValidKeyView
+        }
+        /// ponytail: names the caller by symbol, because the check has no per-field
+        /// opt-out. If AppKit renames it this is false and the search simply runs again.
+        /// Remembered per call site: looking a symbol up costs more than the frames do.
+        private static var autoFillCallers: [UnsafeMutableRawPointer: Bool] = [:]
+        private static func askedByAutoFill() -> Bool {
+            var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 6)
+            let count = Int(backtrace(&frames, Int32(frames.count)))
+            return frames.prefix(count).contains { frame in
+                guard let frame else { return false }
+                if let known = autoFillCallers[frame] { return known }
+                var info = Dl_info()
+                let asked = dladdr(frame, &info) != 0
+                    && info.dli_sname.map { strstr($0, "NSAutoFillHeuristicController") != nil } == true
+                autoFillCallers[frame] = asked
+                return asked
+            }
+        }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil { onMount?() }
+        }
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first?.value
+            // Exactly ⌥⌘, not "at least": ⌃⌥⌘⌫ belongs to whoever bound it.
+            if mods == [.command, .option],
+               scalar == 0x7F || scalar == 0x08, onForget() { return true }
+            return super.performKeyEquivalent(with: event)
+        }
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let f = BarField(string: text)
+        f.closedKeyLoop = closedKeyLoop
+        context.coordinator.watchSelection(of: f)
+        f.onForget = { [weak coordinator = context.coordinator] in
+            coordinator?.parent.onKey(.forget) ?? false
+        }
+        f.delegate = context.coordinator
+        f.isBordered = false
+        f.drawsBackground = false
+        f.focusRingType = .none
+        f.usesSingleLineMode = true
+        f.lineBreakMode = .byTruncatingTail
+        f.font = font
+        if let textColor { f.textColor = textColor }
+        f.placeholderString = prompt
+        f.setAccessibilityLabel(label)
+        f.setAccessibilityHelp(hint)
+        return f
+    }
+
+    func updateNSView(_ f: NSTextField, context: Context) {
+        // The coordinator holds a copy of this struct, so refresh it or the callbacks below
+        // keep calling into the state the view had when it was first made.
+        context.coordinator.parent = self
+        let shown = completion.flatMap { full -> String? in
+            guard full.count > text.count, full.lowercased().hasPrefix(text.lowercased()) else { return nil }
+            return text + full.dropFirst(text.count)
+        } ?? text
+        if f.stringValue != shown {
+            // Placing the tail moves the selection too; that is not the user moving it.
+            context.coordinator.showsCompletion = false
+            f.stringValue = shown
+            if shown != text, let editor = f.currentEditor() {
+                let start = (text as NSString).length
+                editor.selectedRange = NSRange(location: start, length: (shown as NSString).length - start)
+            }
+        }
+        context.coordinator.showsCompletion = shown != text
+        (f as? BarField)?.closedKeyLoop = closedKeyLoop
+        if f.font != font { f.font = font }
+        if let textColor, f.textColor != textColor { f.textColor = textColor }
+        // The prompt is not fixed for the life of the field: ⇥ turns the bar into an
+        // actions search and says so here as well as in the scope chip.
+        if f.placeholderString != prompt { f.placeholderString = prompt }
+        if f.accessibilityLabel() != label { f.setAccessibilityLabel(label) }
+        // Once only — otherwise every keystroke would reselect what was just typed.
+        guard context.coordinator.focusRequest != focusRequest else { return }
+        context.coordinator.focusRequest = focusRequest
+        context.coordinator.take(f, selectAll: selectAll)
+    }
+
+    static func dismantleNSView(_ nsView: NSTextField, coordinator: Coordinator) {
+        coordinator.invalidate()
+        nsView.delegate = nil
+        (nsView as? BarField)?.onMount = nil
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    @MainActor final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: CommandField
+        var focusRequest: Int?
+        /// The field holds `parent.text` plus a selected completion tail.
+        var showsCompletion = false
+        init(_ parent: CommandField) { self.parent = parent }
+
+        private weak var pendingField: NSTextField?
+        private var focusGeneration = 0
+        private var invalidated = false
+
+        /// Wait for attachment rather than spinning the main queue. The generation
+        /// and teardown guard stop an old field from reclaiming keyboard focus.
+        func take(_ f: NSTextField, selectAll: Bool, tries: Int = 20) {
+            guard !invalidated else { return }
+            focusGeneration += 1
+            let generation = focusGeneration
+            pendingField = f
+            let focus = { [weak self, weak f] in
+                guard let self, let f, !self.invalidated,
+                      self.focusGeneration == generation, self.pendingField === f,
+                      self.parent.canFocus(), let window = f.window else { return }
+                guard window.makeFirstResponder(f) else { return }
+                let end = (f.stringValue as NSString).length
+                f.currentEditor()?.selectedRange = selectAll
+                    ? NSRange(location: 0, length: end) : NSRange(location: end, length: 0)
+                self.pendingField = nil
+                (f as? BarField)?.onMount = nil
+            }
+            (f as? BarField)?.onMount = focus
+            if f.window != nil { focus() }
+        }
+
+        private weak var field: NSTextField?
+        private var selectionWatch: NSObjectProtocol?
+
+        func watchSelection(of field: NSTextField) {
+            self.field = field
+            selectionWatch = NotificationCenter.default.addObserver(
+                forName: NSTextView.didChangeSelectionNotification, object: nil, queue: .main
+            ) { [weak self] note in
+                // Only the sender's identity crosses into the main actor; the editor itself
+                // is read back off the field there.
+                let sender = (note.object as AnyObject?).map(ObjectIdentifier.init)
+                MainActor.assumeIsolated {
+                    guard let self, let editor = self.field?.currentEditor() as? NSTextView,
+                          sender == ObjectIdentifier(editor) else { return }
+                    self.selectionMoved(in: editor)
+                }
+            }
+        }
+
+        /// The caret or selection moved while a completion was showing. Off the tail — →,
+        /// End, ←, Home, a click — accepts it: the whole text becomes the query, so the next
+        /// keystroke edits what is on screen. A delete that removed only the tail leaves the
+        /// typed text, which `controlTextDidChange` reads as turning the completion down.
+        func selectionMoved(in editor: NSTextView) {
+            guard showsCompletion else { return }
+            let full = editor.string
+            let typed = (parent.text as NSString).length
+            let tail = NSRange(location: typed, length: (full as NSString).length - typed)
+            guard editor.selectedRange() != tail, full != parent.text else { return }
+            showsCompletion = false
+            parent.text = full
+        }
+
+        func invalidate() {
+            if let selectionWatch { NotificationCenter.default.removeObserver(selectionWatch) }
+            selectionWatch = nil
+            invalidated = true
+            focusGeneration += 1
+            (pendingField as? BarField)?.onMount = nil
+            pendingField = nil
+        }
+
+        func controlTextDidChange(_ note: Notification) {
+            guard let f = note.object as? NSTextField else { return }
+            let hadCompletion = showsCompletion
+            showsCompletion = false
+            // Deleting the selected tail leaves exactly what was typed: no edit to the
+            // query, but the completion has been turned down until the next character.
+            if hadCompletion, f.stringValue == parent.text {
+                _ = parent.onKey(.dismissCompletion)
+                return
+            }
+            parent.text = f.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView,
+                     doCommandBy selector: Selector) -> Bool {
+            // Shift-Return arrives as an ordinary insertNewline:, so the modifier has to be
+            // read off the event that caused it.
+            let flags = NSApp.currentEvent?.modifierFlags ?? []
+            let shift = flags.contains(.shift)
+            // ⌘Return arrives as insertNewlineIgnoringFieldEditor:, ⇧Return as an ordinary
+            // insertNewline:, so both modifiers have to be read off the event that caused it.
+            let command = flags.contains(.command)
+            // ⌥⌘⌫ arrives here only on the layouts where the field editor has an action
+            // bound to it — ⌥⌫ is a word, ⌘⌫ is the line, and the pair is often nothing at
+            // all. `BarField.performKeyEquivalent` is the route that always sees it; this
+            // one costs three lines and covers the case where AppKit got there first.
+            // Equality, not `contains`: ⌃⌥⌘⌫ is somebody else's shortcut, not this one.
+            if flags.intersection(.deviceIndependentFlagsMask) == [.option, .command],
+               [#selector(NSResponder.deleteBackward(_:)),
+                #selector(NSResponder.deleteWordBackward(_:)),
+                #selector(NSResponder.deleteToBeginningOfLine(_:))].contains(selector) {
+                return parent.onKey(.forget)
+            }
+            switch selector {
+            case #selector(NSResponder.deleteBackward(_:)): return parent.onKey(.backspace)
+            case #selector(NSResponder.moveUp(_:)):          return parent.onKey(.up)
+            case #selector(NSResponder.moveDown(_:)):        return parent.onKey(.down)
+            // ⇥ and ⇧⇥ both toggle the actions scope. Backtab has to be caught as well as
+            // tab, or ⇧⇥ walks first responder out of the bar and into the sidebar behind it.
+            case #selector(NSResponder.insertTab(_:)),
+                 #selector(NSResponder.insertBacktab(_:)):   return parent.onKey(.tab)
+            case #selector(NSResponder.cancelOperation(_:)): return parent.onKey(.escape)
+            case #selector(NSResponder.insertNewline(_:)),
+                 #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+                return parent.onKey(command ? .commandEnter : (shift ? .shiftEnter : .enter))
+            default: return false
+            }
+        }
+    }
+}
+
+/// A result slot owns its pointer state. Hovering must not invalidate the field,
+/// tab snapshots, or neighboring results while the user scrolls through search.
+@MainActor struct PaletteResultRow: View {
+    let row: PaletteRow
+    let index: Int
+    let rowCount: Int
+    let selected: Bool
+    let selectionColor: Color
+    let favicons: Favicons
+    let animations: Bool
+    let activate: () -> Void
+    let forget: () -> Void
+    @Environment(\.spaceChromeTheme) private var chromeTheme
+    // Slots keep their identity while queries replace the result occupying them.
+    @State private var hovering = false
+    @State private var nativeHover = PaletteNativeHoverExperiment.enabled
+
+    var body: some View {
+        let on = selected
+        let lit = hovering
+        HStack(spacing: Look.barRowSpacing) {
+            if let image = row.image {
+                SiteIcon(icon: image, size: Look.rowIcon, rounded: !row.detail.hasPrefix("file:"))
+            } else if ["Archived tab", "History", "Bookmark"].contains(row.kind) {
+                CachedFavicon(cache: favicons, url: URL(string: row.detail)) { image in
+                    if let image {
+                        SiteIcon(icon: image, size: Look.rowIcon, rounded: !row.detail.hasPrefix("file:"))
+                    } else {
+                        SpaceIcon(row.icon)
+                            .font(Look.symbol)
+                            .foregroundStyle(Look.barGlyph)
+                            .frame(width: Look.rowIcon, height: Look.rowIcon)
+                    }
+                }
+            } else if row.chip {
+                SpaceIcon(row.icon)
+                    .font(Look.chipGlyph)
+                    .foregroundStyle(Look.barGlyph)
+                    .frame(width: Look.chip, height: Look.chip)
+                    .background(Look.chipFill, in: .rect(cornerRadius: Look.chipRadius))
+                    // The chip is wider than the icon column, and centred on it, so the
+                    // titles down the bar stay on one line whether or not a row wears one.
+                    .frame(width: Look.rowIcon)
+            } else {
+                SpaceIcon(row.icon)
+                    .font(Look.symbol)
+                    .foregroundStyle(Look.barGlyph)
+                    .frame(width: Look.rowIcon, height: Look.rowIcon)
+            }
+            // Arc's title is a light grey until the row is the one Return will press,
+            // when it goes to full white — the fill alone is not the whole selection here.
+            Text(row.title).font(Look.rowText).lineLimit(1)
+                .foregroundStyle(on ? Look.barSelectedText : Look.barText)
+            if !row.subtitle.isEmpty {
+                Text(row.subtitle).font(Look.text).foregroundStyle(Look.barTrailing).lineLimit(1)
+                    .truncationMode(.head).layoutPriority(1)
+            }
+            Spacer(minLength: Look.inset)
+            // Forgetting a suggestion is a hover affordance, the way Arc's is: it appears on
+            // the row under the pointer or the arrow, and stays out of the way otherwise.
+            // Its width is held whether or not it is drawn, so arriving over a row does not
+            // shove "Open" sideways — the chrome stays put and only the ink changes.
+            if row.forget != nil {
+                Button(action: forget) {
+                    Image(systemName: "xmark")
+                        .font(Look.chipGlyph)
+                        .foregroundStyle(Look.barGlyph)
+                        .frame(width: Look.chip, height: Look.chip)
+                        .background(Look.chipFill, in: .rect(cornerRadius: Look.chipRadius))
+                }
+                .buttonStyle(.plain)
+                .opacity(lit || on ? 1 : 0)
+                .allowsHitTesting(lit || on)
+                .animation(animations ? Look.quick : nil, value: lit || on)
+                .accessibilityLabel("Remove from history")
+                .accessibilityHidden(!(lit || on))
+            }
+            // The verb and its chip travel together, on every row that has one; the
+            // selected row's are the bright pair, because that is the one Return presses.
+            if !row.shortcut.isEmpty {
+                Text(row.shortcut).font(Look.rowText)
+                    .foregroundStyle(on ? Look.barSelectedText : Look.barTrailing)
+                    .lineLimit(1).layoutPriority(1)
+            }
+            if !row.trailing.isEmpty {
+                Text(row.trailing).font(Look.rowText)
+                    .foregroundStyle(on ? Look.barSelectedText : Look.barTrailing)
+                    .lineLimit(1).layoutPriority(1)
+                Image(systemName: "arrow.right")
+                    .font(Look.chipGlyph)
+                    .foregroundStyle(on ? Look.barSelectedText : Look.barGlyph)
+                    .frame(width: Look.chip, height: Look.chip)
+                    .background(Look.chipFill, in: .rect(cornerRadius: Look.chipRadius))
+            }
+        }
+        .padding(.horizontal, Look.barRowInset)
+        .frame(height: Look.barRowHeight)
+        .background(on ? selectionColor
+                    : (lit ? chromeTheme.barHovered : .clear),
+                    in: .rect(cornerRadius: Look.pillRadius))
+        .animation(animations ? Look.quick : nil, value: on)
+        .animation(animations ? Look.quick : nil, value: lit)
+        .padding(.horizontal, Look.barInset)
+        .contentShape(.rect)
+        .id(index)
+        .modifier(PaletteResultHover(native: nativeHover) { hovering = $0 })
+        .onTapGesture(perform: activate)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(row.title)
+        .accessibilityValue("\(row.kind), \(row.detail), \(index + 1) of \(rowCount)")
+        .accessibilityAddTraits(on ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { activate() }
+    }
+
+}
+
+private struct PaletteResultHover: ViewModifier {
+    let native: Bool
+    let changed: (Bool) -> Void
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if native {
+            content.modifier(Feel02HoverFeedback(hoverChanged: changed))
+        } else {
+            content.onHover(perform: changed)
+        }
+    }
+}
+
+/// Resolve the bar from this layout pass, including the first frame and live resizing.
+struct PaletteSizing {
+    let window: CGSize
+    var preferredWidth = Look.barWidth
+    var visibleRows = Look.barVisibleRows
+    var rowCount: Int
+    var chromeHeight = Look.barFieldHeight
+    var topFraction = Look.barTop
+    var anchorTop: CGFloat?
+
+    var width: CGFloat { min(preferredWidth, max(0, window.width - Look.inset * 2)) }
+    var listPadding: CGFloat { Look.barInset * 2 - Look.barRowGap }
+    var rowCap: Int {
+        Palette.fittingRows(Look.clampedVisibleRows(visibleRows), windowHeight: window.height,
+                            chrome: chromeHeight + 1 + listPadding)
+    }
+    var listHeight: CGFloat { Palette.rowsHeight(min(rowCount, rowCap)) + listPadding }
+    var height: CGFloat { chromeHeight + (rowCount == 0 ? 0 : 1 + listHeight) }
+    var top: CGFloat {
+        if let anchorTop {
+            return max(Look.inset, min(anchorTop, window.height - height - Look.inset))
+        }
+        // Keep the input in place while results arrive; reserve the tallest fitted list.
+        let tallest = chromeHeight + 1 + Palette.rowsHeight(rowCap) + listPadding
+        return max(Look.inset, min(window.height * Look.clampedBarTop(topFraction),
+                                   window.height - tallest - Look.inset))
+    }
+}
+
+/// Notices that a listed tab changed — its content, ownership or order, or the set of tabs
+/// itself — and bumps `changes`. A leaf of its own so the comparison runs only when a
+/// window or a tab publishes: in `PaletteView.body` it walked every open tab on each
+/// keystroke and arrow press, which do not change a tab.
+private struct PaletteTabWatch: View, Equatable {
+    @EnvironmentObject private var store: TabStore
+    @ObservedObject var tabs: ChangeWatch
+    /// The other windows whose tabs are listed: one opening or closing a tab publishes there.
+    @StateObject private var windows = ChangeWatch()
+    /// A window opening or closing changes `TabStore.all`, which publishes nowhere else.
+    @State private var storeSet = 0
+    @Binding var changes: Int
+    private let identity: ObjectIdentifier
+
+    init(tabs: ChangeWatch, changes: Binding<Int>) {
+        self.tabs = tabs
+        _changes = changes
+        identity = ObjectIdentifier(tabs)
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool { lhs.identity == rhs.identity }
+
+    var body: some View {
+        let _ = storeSet
+        let sources = PaletteView.sources(for: store)
+        let content = sources.flatMap { number, owner in
+            owner.accessibleTabs.map { Feel03TabContent($0, owner: owner, windowNumber: number) }
+        }
+        let others = sources.map(\.element).filter { $0 !== store }
+        Color.clear
+            .accessibilityHidden(true)
+            .onReceive(TabStore.storesChanged) { storeSet += 1 }
+            .onChange(of: others.map(ObjectIdentifier.init), initial: true) { windows.watch(others) }
+            .onChange(of: content) { changes += 1 }
+            // Tabs opened or closed while the bar is up: watch the new set, and list it.
+            .onChange(of: content.map(\.id)) {
+                tabs.watch(sources.flatMap { $0.element.accessibleTabs })
+            }
+    }
+}
+
+/// Bumps `changes` when the window's suggestions or their pending halves change. They
+/// publish on their own object, so typing does not re-run every view observing the window.
+private struct PaletteSuggestionWatch: View, Equatable {
+    @ObservedObject var state: TabStore.SuggestionState
+    @Binding var changes: Int
+    private let identity: ObjectIdentifier
+
+    init(state: TabStore.SuggestionState, changes: Binding<Int>) {
+        self.state = state
+        _changes = changes
+        identity = ObjectIdentifier(state)
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool { lhs.identity == rhs.identity }
+
+    var body: some View {
+        Color.clear
+            .accessibilityHidden(true)
+            .onChange(of: state.suggestions) { changes += 1 }
+            .onChange(of: state.suggestionsPending) { changes += 1 }
+            .onChange(of: state.historyPending) { changes += 1 }
+            .onChange(of: state.enginePending) { changes += 1 }
+    }
+}
+
+/// The search bar: one centred sheet over the page for typing a url, a search, a question
+/// for an assistant, or the name of a tab.
+///
+/// It is a *search* bar, not a command palette, and the row order is the whole design:
+/// what you typed first, so Return always does the obvious thing; then what the engine and
+/// your own history complete it to; then the assistant; then the tabs you already have
+/// open. A strong action match follows what you typed; weaker actions stay in the tail.
+/// Every entry point — ⌘L, ⌘T, the address pill, ⌘⇧P, ⌘⇧A — lands here, looking the same.
+@MainActor struct PaletteView: View {
+    private let profileManager = ProfileManager.shared
+    @StateObject private var spaceCatalog = PaletteSpaceCatalog()
+    @Environment(\.spaceChromeTheme) private var chromeTheme
+    @EnvironmentObject var store: TabStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var sidebar = SidebarWidth.shared
+    @ObservedObject private var batterySaver = BatterySaver.shared
+    private var sidebarLayout: SidebarChromeLayout { SidebarChromeLayout(width: SidebarWidth.inWindow(store)) }
+    var ownsAccessibilityModal = true
+    let mode: PaletteMode
+    let dismiss: () -> Void
+
+    @State private var query = ""
+    /// The selected address is a starting value, not a query until the user edits it.
+    @State private var seededAddress: String?
+    @State private var initialized = false
+    @State private var index = 0
+    /// In-memory rows refresh immediately; database suggestions arrive separately.
+    @State private var rows: [PaletteRow] = []
+    @State private var layout = Feel03PaletteLayout<PaletteRow>()
+    /// Arc's ⇥: the bar narrows to its actions catalogue and says so with a scope chip in
+    /// the field. Escape takes the filter off before it closes the bar.
+    @State private var actionsOnly = false
+    @State private var tabSpaceID: UUID?
+    @State private var activeBang: Bang?
+    /// False for the first frame, so the bar can scale and fade in from `appearScale`.
+    @State private var shown = false
+    @State private var acceptingInput = true
+    @State private var fieldFocusRequest = 0
+    @State private var scrollRequest = 0
+    /// The last query's history and engine rows, held while this query's are pending so
+    /// the list does not collapse to its defaults and refill on every keystroke.
+    @State private var heldSuggestions: [PaletteRow] = []
+    /// The host the field is completing to, and whether the last edit was typing forward —
+    /// a delete or a paste over the middle turns completion off until the next character.
+    @State private var completion: Palette.HostCompletion?
+    /// A completion the user accepted into the query, kept for its origin until the next edit.
+    @State private var acceptedCompletion: Palette.HostCompletion?
+    @State private var completionAllowed = false
+    @State private var firstLetterVisits: (query: String, urls: [String]) = ("", [])
+    /// Every open tab, in every window: a title or favicon arriving redraws the row for it.
+    /// Observed by `PaletteTabWatch`, not here, so a tab's progress never re-runs this body.
+    @State private var tabs = ChangeWatch()
+    @State private var tabChanges = 0
+    @State private var suggestionChanges = 0
+    // `.timo`, the store Search Settings writes through, so a `TIMO_DATA_DIR` instance
+    // reads its own choices rather than the regular app's.
+    @AppStorage(Look.barVisibleRowsKey, store: .timo) private var visibleRows = Look.barVisibleRows
+    @AppStorage(Look.barTopKey, store: .timo) private var barTop = Look.barTop
+    @AppStorage(Look.barAnimationsKey, store: .timo) private var animations = true
+
+    /// Everything in the bar but the rows.
+    private var chromeHeight: CGFloat {
+        fieldHeight + (mode == .tabs && !store.isPrivate && !store.isLittle && !actionsOnly
+                       ? Look.control + Look.barRowGap : 0)
+    }
+    private var sidebarAddress: Bool {
+        mode.usesSidebarAddress(in: store)
+    }
+    private var fieldHeight: CGFloat { sidebarAddress ? Look.barRowHeight : Look.barFieldHeight }
+
+    /// Nil under Reduce Motion, Battery Saver or the Search Settings switch, which SwiftUI
+    /// reads as "just change".
+    private var motionDisabled: Bool { reduceMotion || batterySaver.isActive || !animations }
+
+    private func motion(_ a: Animation) -> Animation? {
+        motionDisabled ? nil : a
+    }
+
+    private var bangCandidate: Bangs.Activation? {
+        guard mode != .tabs, !actionsOnly, activeBang == nil else { return nil }
+        return Bangs.activation(typed)
+    }
+
+    private var bangColor: Color {
+        switch activeBang?.home?.host?.lowercased() {
+        case "www.youtube.com": Color(red: 1, green: 0, blue: 0)
+        case "www.reddit.com": Color(red: 0.85, green: 0.22, blue: 0)
+        case "open.spotify.com": Color(red: 0.08, green: 0.48, blue: 0.23)
+        case "www.twitch.tv": Color(red: 0.45, green: 0.20, blue: 0.82)
+        case "www.pinterest.com", "www.target.com": Color(red: 0.74, green: 0.03, blue: 0.11)
+        case "soundcloud.com", "www.etsy.com": Color(red: 0.78, green: 0.24, blue: 0.04)
+        case "x.com", "www.tiktok.com", "github.com", "unsplash.com", "medium.com": Color(white: 0.20)
+        default: Color(red: 0.16, green: 0.36, blue: 0.78)
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let sizing = PaletteSizing(window: geo.size,
+                preferredWidth: sidebarAddress ? Look.sidebarSearchWidth : Look.barWidth,
+                visibleRows: visibleRows, rowCount: rows.count, chromeHeight: chromeHeight,
+                topFraction: barTop, anchorTop: sidebarAddress ? sidebarLayout.addressTop : nil)
+            ZStack(alignment: sidebarAddress ? .topLeading : .top) {
+                // Click-off to dismiss. Decoration only — Esc is the accessible route out,
+                // and VoiceOver should never land on a full-screen unlabelled rectangle.
+                Color.clear
+                    .background {
+                        PaletteScrimSurface(opacity: sidebarAddress ? 0 : Look.scrimOpacity,
+                                            gesture: store.spaceGesture)
+                            .allowsHitTesting(false)
+                    }
+                    .contentShape(.rect)
+                    .onTapGesture { close() }
+                    .accessibilityHidden(true)
+
+                bar(listHeight: sizing.listHeight)
+                    .frame(width: sizing.width)
+                    .scaleEffect(shown ? 1 : Look.appearScale)
+                    .opacity(shown ? 1 : 0)
+                    // Editing the current address opens over the sidebar pill. Other
+                    // search modes sit at the position chosen in Search Settings.
+                    .padding(.leading, sidebarAddress ? Look.inset : 0)
+                    .padding(.top, sizing.top)
+                    .transaction(value: rows.count) {
+                        // Native Space handoff keeps covered sidebar rows immediate.
+                        // The floating search surface still owns its resize spring.
+                        $0.disablesAnimations = motionDisabled
+                        $0.animation = motion(Look.list)
+                    }
+            }
+        }
+        .background {
+            PaletteTabWatch(tabs: tabs, changes: $tabChanges).equatable()
+            PaletteSuggestionWatch(state: store.suggestionState, changes: $suggestionChanges).equatable()
+        }
+        .timoMotionPolicy()
+        .onDisappear {
+            acceptingInput = false
+            spaceCatalog.cancel()
+            if store.palette == nil { store.clearSuggestions() }
+        }
+        .onExitCommand { close() }
+        .onReceive(store.$palette) { presented in
+            guard let presented else {
+                acceptingInput = false
+                spaceCatalog.cancel()
+                store.clearSuggestions()
+                return
+            }
+            // A fast close/reopen can be coalesced into the same SwiftUI mount.
+            guard !acceptingInput else { return }
+            beginSession(presented)
+            fieldFocusRequest += 1
+        }
+        .onAppear {
+            if !initialized { beginSession(mode) }
+            tabs.watch(allTabs)
+            withAnimation(motion(Look.appear)) { shown = true }
+        }
+        .onChange(of: query) { old, _ in
+            acceptedCompletion = Palette.carriedCompletion(acceptedCompletion, completion: completion,
+                                                           query: query)
+            completionAllowed = Palette.typesForward(from: old, to: query, seeded: seededAddress)
+            if query != seededAddress { seededAddress = nil }
+            if mode != .tabs, !actionsOnly, activeBang == nil,
+               let activation = Bangs.activation(query, explicitOnly: true) {
+                enterBang(activation)
+                return
+            }
+            // Not while scoped to actions: the catalogue is local, and asking the engine
+            // for completions to "reload pa" is a network round-trip for rows the scope
+            // will not show anyway.
+            if mode != .tabs, !actionsOnly { store.suggest(typed, scopedTo: activeBang) }
+            refresh()
+            lookUpFirstLetter()
+        }
+        // Search Tabs can replace the mode of an already-open bar. SwiftUI keeps
+        // its state in that case, so rows/scopes must refresh without another onAppear.
+        .onChange(of: mode) {
+            // Held rows answered another scope; they must not stand in for this one.
+            heldSuggestions = []
+            actionsOnly = false
+            activeBang = nil
+            tabSpaceID = nil
+            store.clearSuggestions()
+            if mode != .tabs { store.suggest(typed) }
+            refresh()
+        }
+        // Completions land later than the keystroke that asked for them; the list has to
+        // grow under the user without moving what they had already arrowed onto. The same
+        // goes for a tab that renames itself or gets its favicon while the bar is up.
+        .onChange(of: suggestionChanges) { refresh(reset: false, rebuildLocal: false) }
+        // Tab content or the set of tabs changed (see `PaletteTabWatch`).
+        .onChange(of: tabChanges) { refresh(reset: false) }
+        .onChange(of: tabSpaceID) { refresh() }
+        // Space metadata changes between queries still update the open palette.
+        .onReceive(spaceCatalog.metadataChanges(manager: profileManager)) { _ in
+            guard acceptingInput else { return }
+            prepareCatalog()
+            refresh(reset: false)
+        }
+        .onChange(of: spaceCatalog.generation) {
+            guard acceptingInput else { return }
+            refresh(reset: false)
+        }
+        .onChange(of: store.previewSpace) { refresh(reset: false) }
+        .onChange(of: store.currentSpaceID) { refresh(reset: false) }
+    }
+
+    private var catalogStrip: [Space] {
+        store.isPrivate || store.isLittle ? [] : spaceCatalog.strip(manager: profileManager, preview: store.previewSpace)
+    }
+
+    private func prepareCatalog() {
+        guard acceptingInput else { return }
+        guard !store.isPrivate, !store.isLittle else { spaceCatalog.cancel(); return }
+        spaceCatalog.prepare(manager: profileManager)
+    }
+
+    private var catalogSpaces: [Space] {
+        guard !store.isPrivate, !store.isLittle else { return [] }
+        return spaceCatalog.spaces(for: store.profileID, manager: profileManager, preview: store.previewSpace)
+    }
+
+    static func sources(for store: TabStore) -> [(offset: Int, element: TabStore)] {
+        TabStore.all.enumerated().filter { _, other in
+            Palette.tabSourceAllowed(profileID: store.profileID, isPrivate: store.isPrivate,
+                ownWindow: other === store, sourceProfileID: other.profileID,
+                sourcePrivate: other.isPrivate, sourceLittle: other.isLittle)
+        }
+    }
+
+    private var allTabs: [Tab] { Self.sources(for: store).flatMap { $0.element.accessibleTabs } }
+
+    /// Seed the native field on its first creation, before onAppear updates State.
+    /// This lets focus select the address without delaying the field by a frame.
+    private var fieldText: Binding<String> {
+        Binding(get: {
+            !initialized && mode == .address ? (store.active?.address ?? query) : query
+        }, set: { query = $0 })
+    }
+
+    private func bar(listHeight: CGFloat) -> some View {
+        // Once per pass: matching a word against every engine name is not free.
+        let bangCandidate = bangCandidate
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: Look.barRowInset) {
+                Group {
+                    if sidebarAddress, !actionsOnly, activeBang == nil, let icon = store.active?.favicon {
+                        SiteIcon(icon: icon, size: Look.rowIcon, rounded: store.active?.currentURL?.isFileURL != true)
+                    } else {
+                        Image(systemName: actionsOnly ? "command" : "magnifyingglass")
+                            .font(Look.fieldIcon)
+                            .foregroundStyle(Look.barPlaceholder)
+                    }
+                }
+                .frame(width: Look.rowIcon, height: Look.rowIcon)
+                if let activeBang {
+                    Button { leaveBang() } label: {
+                        Text(activeBang.name).font(Look.rowText)
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, Look.barRowInset)
+                            .padding(.vertical, Look.barRowGap)
+                            .background(bangColor, in: .capsule)
+                    }
+                    .buttonStyle(.plain)
+                    .fixedSize()
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                    .accessibilityLabel("Searching \(activeBang.name). Click to leave site search")
+                }
+                Group {
+                    CommandField(text: fieldText, prompt: actionsOnly ? "Run a command…"
+                                 : (activeBang == nil ? mode.prompt : "Search…"),
+                                 selectAll: mode == .address,
+                                 label: activeBang.map { "Search \($0.name)" }
+                                     ?? (actionsOnly ? "Actions" : mode.title),
+                                 hint: "Type to filter. Up and down arrows choose a result, "
+                                     + "Return opens it, Tab activates a site shortcut or searches actions, "
+                                     + "Backspace in an empty site search removes its chip, "
+                                     + "Option-Command-Delete forgets a history result, "
+                                     + "Escape closes.",
+                                 font: sidebarAddress ? Look.Typography.addressInput.native
+                                     : Look.Typography.input.native,
+                                 focusRequest: fieldFocusRequest,
+                                 canFocus: { acceptingInput }, completion: completion?.text,
+                                 closedKeyLoop: true, onKey: key)
+                }
+                if let candidate = bangCandidate {
+                    Button { enterBang(candidate) } label: {
+                        HStack(spacing: Look.barRowGap * 2) {
+                            Text("Search \(candidate.engine.name)")
+                            Text("Tab")
+                                .padding(.horizontal, Look.barRowGap * 2)
+                                .padding(.vertical, Look.barRowGap)
+                                .background(Look.chipFill, in: .rect(cornerRadius: Look.chipRadius))
+                        }
+                        .font(Look.rowText).foregroundStyle(Look.barTrailing)
+                    }
+                    .buttonStyle(.plain).fixedSize()
+                    .accessibilityLabel("Search \(candidate.engine.name), press Tab to activate")
+                }
+                // The scope chip: with ⇥ on, the field says what it is searching, so a bar
+                // showing nothing but verbs never reads as a bar that has gone wrong.
+                // Trailing, not leading: a chip in front of the field would push the text
+                // sideways the moment ⇥ was pressed, and the caret is where the eye is.
+                if actionsOnly {
+                    Text("Actions").font(Look.rowText)
+                        .foregroundStyle(Look.barSelectedText)
+                        .padding(.horizontal, Look.barRowGap * 2)
+                        .padding(.vertical, Look.barRowGap / 2)
+                        .background(chromeTheme.barSelected, in: .rect(cornerRadius: Look.chipRadius))
+                        .fixedSize()
+                        .accessibilityLabel("Searching actions")
+                        .transition(.opacity)
+                } else if activeBang == nil, bangCandidate == nil {
+                    Button {
+                        _ = key(.tab)
+                        fieldFocusRequest += 1
+                    } label: {
+                        Text("⇥ Actions").font(Look.rowText)
+                            .foregroundStyle(Look.barTrailing)
+                    }
+                    .buttonStyle(.plain).fixedSize()
+                    .accessibilityLabel("Search actions, press Tab to activate")
+                    .transition(.opacity)
+                }
+            }
+            // The same two insets a row has, so the field's icon sits over the rows' icons.
+            .padding(.horizontal, Look.barInset + Look.barRowInset)
+            .frame(height: fieldHeight)
+            .animation(motion(Look.quick), value: activeBang)
+            .animation(motion(Look.quick), value: actionsOnly)
+
+            if mode == .tabs, !store.isPrivate, !store.isLittle, !actionsOnly {
+                Picker("Space", selection: $tabSpaceID) {
+                    Text("All open Spaces").tag(nil as UUID?)
+                    ForEach(catalogSpaces) { space in
+                        Text(space.name).tag(Optional(space.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .padding(.horizontal, Look.barInset + Look.barRowInset)
+                .padding(.bottom, Look.barRowGap)
+                .accessibilityHint("Filters open tabs in this profile by their current Space.")
+                .animation(motion(Look.quick), value: tabSpaceID)
+            }
+
+            if !rows.isEmpty {
+                Hairline().padding(.horizontal, Look.barInset)
+                list(height: listHeight)
+            }
+        }
+        // Arc's bar is one flat surface, not glass: a blur of whatever is behind it,
+        // darkened almost to opaque, and a single hairline. No specular edge, no
+        // refraction — the shadow is what lifts it off the page.
+        .background {
+            RoundedRectangle(cornerRadius: Look.barRadius)
+                .fill(chromeTheme.barFill)
+                .transaction(value: chromeTheme) {
+                    // Search sits above the native handoff, so its colour must not
+                    // inherit that covered content's animation suppression.
+                    $0.disablesAnimations = motionDisabled
+                    $0.animation = motion(Look.spaceSlide)
+                }
+        }
+        .background(Look.barMaterial, in: .rect(cornerRadius: Look.barRadius))
+        .hairline(radius: Look.barRadius, Look.barStroke)
+        .shadow(color: Look.barShadow, radius: Look.barShadowRadius, y: Look.barShadowY)
+        // The bar is dark over anything, including a white page, so the semantic colours
+        // inside it have to resolve dark too — otherwise light mode paints black on black.
+        .environment(\.colorScheme, .dark)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(mode.title)
+        // The bar owns the window while it is up, so everything behind it is noise.
+        .accessibilityAddTraits(ownsAccessibilityModal ? .isModal : [])
+    }
+
+    private func list(height: CGFloat) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: Look.barRowGap) {
+                    // Slots, not rows: a keystroke rewrites each slot in place rather than
+                    // fading out one row and fading in another where it stood. Only slots
+                    // added or removed at the bottom animate.
+                    ForEach(Array(rows.enumerated()), id: \.offset) { i, row in
+                        line(i, row)
+                    }
+                }
+                .padding(.top, Look.barInset - Look.barRowGap)
+                .padding(.bottom, Look.barInset)
+            }
+            .frame(height: height)
+            .scrollIndicators(.never)
+            // The scroll view's edge, not the first row's: aligning the row would scroll
+            // the list's top padding away whenever there are enough results to scroll.
+            .modifier(ScrollViewportPosition(resetRequest: scrollRequest))
+            .onChange(of: index) {
+                guard rows.indices.contains(index) else { return }
+                proxy.scrollTo(index)
+            }
+            .onChange(of: height) {
+                guard index > 0, rows.indices.contains(index) else { return }
+                proxy.scrollTo(index)
+            }
+        }
+    }
+
+    private func line(_ i: Int, _ row: PaletteRow) -> some View {
+        PaletteResultRow(row: row, index: i, rowCount: rows.count, selected: i == index,
+            selectionColor: activeBang == nil ? chromeTheme.barSelected : bangColor,
+            favicons: store.favicons, animations: motion(Look.quick) != nil,
+            activate: { index = i; activate() }, forget: { index = i; forget() })
+    }
+
+    // MARK: Behaviour
+
+    private func key(_ k: CommandField.Key) -> Bool {
+        switch k {
+        case .up:         move(-1)
+        case .down:       move(1)
+        case .enter:        activate()
+        case .commandEnter: activate(inNewTab: true)
+        // The only key here that can decline: on a row with nothing to forget, ⌥⌘⌫ is
+        // still the field editor's delete and must go back to it rather than be eaten.
+        case .forget:       return forget()
+        case .dismissCompletion:
+            completionAllowed = false
+            refresh(reset: false)
+        case .backspace:
+            guard activeBang != nil, query.isEmpty else { return false }
+            leaveBang()
+        case .escape:
+            if activeBang != nil { leaveBang(); break }
+            // One Escape takes the actions filter off, the next closes the bar — the same
+            // way Escape leaves a scope before it leaves the search everywhere else.
+            guard actionsOnly else { close(); break }
+            actionsOnly = false
+            axAnnounce("Actions filter off.")
+            refresh()
+        case .shiftEnter:
+            // Instant Links: skip the results page and open what it would have led to.
+            guard mode == .address || mode == .newTab, !typed.isEmpty else { return false }
+            let tab = target()
+            close()
+            if let activeBang, let url = Bangs.scopedURL(typed, using: activeBang) {
+                tab.go(url)
+            } else {
+                store.goInstant(typed, from: tab)
+            }
+        case .tab:
+            if let candidate = bangCandidate { enterBang(candidate); break }
+            if activeBang != nil { break }
+            // Arc's ⇥ narrows the bar to its actions. It used to hand the query to the
+            // assistant instead, which was Timo's own invention and cost the bar the one
+            // gesture Arc users reach for — the assistant keeps its own row, two under what
+            // was typed, which is where Arc puts it and where it can be arrowed onto.
+            //
+            // Entering the scope empties the field. Whatever is in it was typed at places,
+            // and ⌘L's bar comes up prefilled with the page's whole url — ranked against
+            // the catalogue that matches no action at all, which is a scope showing an
+            // empty list with a live Return. Leaving puts nothing back: the field is where
+            // you type, and it is now empty.
+            actionsOnly.toggle()
+            query = ""
+            store.clearSuggestions()
+            axAnnounce(actionsOnly ? "Actions" : "All results")
+            refresh()
+        }
+        return true
+    }
+
+    private func enterBang(_ activation: Bangs.Activation) {
+        withAnimation(motion(Look.quick)) {
+            activeBang = activation.engine
+            seededAddress = nil
+            query = activation.query
+        }
+        // The unscoped rows are other sites' history and engine phrases the scope excludes.
+        heldSuggestions = []
+        store.suggest(typed, scopedTo: activation.engine)
+        refresh()
+        axAnnounce("Searching \(activation.engine.name). Escape leaves site search.")
+    }
+
+    private func leaveBang() {
+        withAnimation(motion(Look.quick)) { activeBang = nil }
+        heldSuggestions = []
+        store.suggest(typed)
+        refresh()
+        axAnnounce("Site search off.")
+    }
+
+    /// ⌥⌘⌫, and the × the row grows on hover: forget this page. Only history rows carry a
+    /// url to forget — a suggestion you can never get rid of is what makes one embarrassing
+    /// address follow you around for a year. False when this row has nothing to forget, so
+    /// the keystroke goes back to the field editor instead of vanishing.
+    @discardableResult
+    private func forget() -> Bool {
+        guard rows.indices.contains(index), let url = rows[index].forget else { return false }
+        guard store.history.forget(url: url) else {
+            HistoryWindow.showWriteFailure(store.history)
+            return true
+        }
+        axAnnounce("Removed from history.")
+        // The suggestion list is the store's, and it is what has just changed underneath.
+        store.suggest(typed, scopedTo: activeBang)
+        refresh(reset: false)
+        return true
+    }
+
+    private var typed: String {
+        query == seededAddress ? "" : query.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Where Return loads: a fresh tab when the bar was opened by ⌘T or ⌘Return was held,
+    /// else the tab it was opened on. Made only now, so a dismissed bar never leaves an
+    /// empty tab behind.
+    private func target(inNewTab: Bool = false) -> Tab {
+        Palette.opensInNewTab(mode: mode, commandHeld: inNewTab, hasActiveTab: store.active != nil)
+            ? store.newBlankTab() : (store.active ?? store.newBlankTab())
+    }
+
+    private func move(_ delta: Int) {
+        guard !rows.isEmpty else { return }
+        index = max(0, min(rows.count - 1, index + delta))
+        let row = rows[index]
+        axAnnounce("\(row.title), \(row.kind), \(index + 1) of \(rows.count)")
+    }
+
+    private func activate(inNewTab: Bool = false) {
+        guard rows.indices.contains(index) else { return }
+        let row = rows[index]
+        // Dismiss first: a command may close this very window.
+        let previousPage = store.activePageResponder
+        close()
+        // …and then wait a turn. `close()` only sets `store.palette = nil`; the overlay and
+        // its field editor are still first responder until SwiftUI's next pass, and an
+        // action dispatched down the responder chain would land on the *bar* rather than on
+        // the page — File ▸ Print's `printView:` printed the command bar, not the web view.
+        // One runloop turn is all it takes for the bar to go away and the page to be back.
+        //
+        // The tab is made lazily, inside the row: a command row opens nothing, and eagerly
+        // making a tab for it would leave a blank one behind.
+        DispatchQueue.main.async {
+            row.run { target(inNewTab: inNewTab) }
+            // A result can replace the page that dismissal just focused. Finish the handoff
+            // after that selection, while leaving newly focused fields and overlays alone.
+            store.focusPage(from: previousPage)
+        }
+    }
+
+    /// The suggestion list belongs to the window, not to this view, so it has to be handed
+    /// back — otherwise the address bar's own overlay inherits a stale list.
+    private func beginSession(_ presented: PaletteMode) {
+        acceptingInput = true
+        prepareCatalog()
+        actionsOnly = false
+        activeBang = nil
+        tabSpaceID = nil
+        seededAddress = presented == .address ? store.active?.address : nil
+        query = seededAddress ?? ""
+        initialized = true
+        store.clearSuggestions()
+        refresh()
+    }
+
+    private func close() {
+        acceptingInput = false
+        spaceCatalog.cancel()
+        store.clearSuggestions()
+        dismiss()
+    }
+
+    // MARK: The list
+
+    private func refresh(reset: Bool = true, rebuildLocal: Bool = true) {
+        let completed = inlineCompletion()
+        // The typed row is local: a completion arriving with history has to rebuild it.
+        let rebuildLocal = rebuildLocal || completed != completion
+        completion = completed
+        let selectedRow = rows.indices.contains(index) ? rows[index] : nil
+        let selectedID = selectedRow?.id
+        if rebuildLocal {
+            var fresh = Feel03PaletteLayout<PaletteRow>()
+            // Ranked as tabs; only the rows that can be shown are built.
+            func matchingTabs() -> [TabSource] {
+                Palette.rankPages(query, tabSources(), title: \.tab.title, url: \.tab.address)
+            }
+            if actionsOnly {
+                // ⇥: the catalogue and nothing else, so the bar reads as one list of verbs.
+                fresh.leading = commandRows()
+            } else if mode == .tabs {
+                fresh.leading = matchingTabs().prefix(24).map(tabRow)
+            } else if activeBang != nil {
+                fresh.leading = typedRow().map { [$0] } ?? []
+                fresh.acceptsSuggestions = !fresh.leading.isEmpty
+            } else if let typedRow = typedRow() {
+                // Arc's order (refs 2, 3): a tab you already have open that matches is the
+                // best answer there is, so it leads — "Switch to Tab" is what Return does. Then
+                // what you typed, what the engine and your own history complete it to, the
+                // assistant, the rest of the tabs. Sections rather than one ranked pool: the
+                // order *is* the ranking, and a fuzzy score must never be able to move "what
+                // you actually typed" around. Actions are a tail, never a headline — someone
+                // typing two letters means a search far more often than "Archive Tab" — but
+                // they are always *there*, from the first character on. Archived tabs and Spaces
+                // are places, so they are searched the moment there is something to search with.
+                // Ranked as places; rows are built only for those the 24-row tail can show.
+                let places = Palette.rankPages(typed, placeSources(), title: \.title, url: \.url)
+                    .prefix(24).map(placeRow)
+                // Only a strong match leads, and only one: a search is what two typed letters
+                // mean far more often than "Switch to Tab", so the tabs that merely fuzz-match
+                // wait until after what the engine completes the words to.
+                // A tab row's detail is "address — Window n" when there are several windows.
+                let tabs = matchingTabs()
+                let isStrong = Palette.strongMatcher(typed)
+                let strongFlags = tabs.map { isStrong($0.tab.title, $0.tab.address) }
+                let strong = zip(tabs, strongFlags).filter(\.1).map(\.0)
+                let weak = zip(tabs, strongFlags).filter { !$0.1 }.map(\.0)
+                let lead = min(strong.count, 1)
+                // Nothing past the lead and the 24-row tail is ever shown.
+                let ordered = (strong + weak).prefix(lead + 24).map(tabRow)
+                let commands = Palette.commandSections(typed, commands: commandRows(), title: \.title)
+                // "chatgpt news" names an assistant, so asking it is what Return does — but as
+                // its own "Ask ChatGPT" row, with a real "Search" row right under it.
+                let ai = aiRow()
+                let asked = AIChat.match(query) != nil ? ai : nil
+                fresh.leading = Array(ordered.prefix(lead)) + (asked.map { [$0] } ?? []) + [typedRow]
+                    + commands.leading
+                fresh.trailing = Array((Array(ordered.dropFirst(lead)) + places + commands.trailing).prefix(24))
+                fresh.assistant = asked == nil ? ai : nil
+                fresh.acceptsSuggestions = true
+            } else {
+                // Nothing typed (ref 2): Arc's bar at rest is the handful of tabs you are most
+                // likely to want back — this window's, most recently used first — with one row
+                // under them to report a problem. Not the other windows' tabs, not the archive,
+                // not the catalogue: all of that answers a query, and one letter brings it.
+                fresh.leading = Palette.empty(tabs: recentTabRows(), report: reportRow())
+            }
+            layout = fresh
+        }
+        let out = layout.rows(suggestions: layout.acceptsSuggestions ? shownSuggestions() : [])
+        // A cap so a bar over a hundred open tabs stays a list and not a scroll marathon —
+        // but not while ⇥ is on, where the tail of the catalogue is the whole point.
+        let visible = actionsOnly ? out : Feel03PaletteLayout.visible(out, limit: 24,
+            retaining: reset ? nil : selectedID,
+            // History can cap or deduplicate a completion after it was arrowed onto.
+            // Preserve its action through subsequent refreshes of the same query.
+            fallback: !reset && selectedRow?.kind == "Search suggestion"
+                ? selectedRow : nil, id: \.id)
+        rows = visible
+        index = Palette.selectedIndex(previous: index, selectedID: selectedID,
+                                      rowIDs: rows.map(\.id), reset: reset)
+        if reset, mode == .newTab, layout.leading.last?.id == "report" {
+            index = Palette.restingIndex(
+                rowIDs: rows.map(\.id),
+                currentID: store.current.map { Feel03TabContent.rowID($0, owner: store) },
+                previousIsTab: rows.count > 1 && rows[1].kind == "Open tab")
+        }
+        guard reset else { return }
+        scrollRequest += 1
+        axAnnounce(rows.isEmpty ? "No results" : "\(rows.count) result\(rows.count == 1 ? "" : "s")")
+    }
+
+    private var completesInline: Bool {
+        completionAllowed && mode != .tabs && !actionsOnly && activeBang == nil && query == typed
+    }
+
+    private func inlineCompletion() -> Palette.HostCompletion? {
+        guard completesInline else { return nil }
+        let urls = Palette.completionSources(
+            typed: typed, history: store.suggestions.filter { !$0.completion }.map(\.url),
+            held: store.suggestionsPending ? heldSuggestions.map(\.detail) : [],
+            firstLetter: firstLetterVisits, tabs: tabSources().map(\.tab.address))
+        return Palette.completeHost(typed, urls: urls)
+    }
+
+    /// History is not suggested until two characters, but a first letter can still complete
+    /// a visited site: ask history for that letter's best pages, for completion only.
+    /// Never in a private window, which reads no saved history.
+    private func lookUpFirstLetter() {
+        let letter = typed
+        guard letter.count == 1, completesInline, !store.isPrivate,
+              firstLetterVisits.query != letter else { return }
+        let history = store.history
+        Task {
+            let pages = await history.suggestAsync(letter)
+            guard typed == letter else { return }
+            firstLetterVisits = (letter, pages.map(\.url))
+            refresh(reset: false, rebuildLocal: false)
+        }
+    }
+
+    /// Row one: what Return does with exactly what is in the field. Which of the three it is
+    /// is decided by asking the same functions that will run — `Bangs` then `Search.url`,
+    /// the address bar's own decision table — rather than by a second copy of the heuristic.
+    private func typedRow() -> PaletteRow? {
+        if let activeBang {
+            // Never fall through to the default engine with words meant for this bang.
+            guard let url = Bangs.scopedURL(typed, using: activeBang) else {
+                return PaletteRow(id: "typed", icon: "exclamationmark.triangle", title: typed.isEmpty ? activeBang.name : typed,
+                                  trailing: "Blocked", kind: "\(activeBang.name) address is not valid") { _ in
+                    axAnnounce("\(activeBang.name) has an address Timo cannot open. Edit it in Settings.")
+                }
+            }
+            return PaletteRow(id: "typed", icon: "magnifyingglass",
+                              title: typed.isEmpty ? "Open \(activeBang.name)" : typed,
+                              kind: "\(typed.isEmpty ? "Open" : "Search") \(activeBang.name)") { target in
+                target().go(url)
+            }
+        }
+        guard !typed.isEmpty else { return nil }
+        if Search.isJavaScriptURL(typed) {
+            return PaletteRow(id: "typed", icon: "exclamationmark.triangle", title: typed,
+                              trailing: "Blocked", kind: "JavaScript URL blocked") { _ in
+                axAnnounce("JavaScript URLs cannot be opened from the address bar.")
+            }
+        }
+        // An inline completion is what the field shows, so it is what Return opens — its
+        // origin, not the text re-parsed.
+        if let site = completion ?? Palette.carriedCompletion(acceptedCompletion, completion: nil,
+                                                              query: typed) {
+            return PaletteRow(id: "typed", icon: "globe", title: completion == nil ? typed : site.text,
+                              trailing: "Open", kind: "Open") { target in
+                target().go(site.url)
+            }
+        }
+        let icon: String, trailing: String
+        if let bang = Bangs.split(typed).flatMap({ Bangs.lookup($0.keyword) }) {
+            (icon, trailing) = ("magnifyingglass", "Search \(bang.name)")
+        } else if !typed.hasPrefix("?"), Search.url(for: typed) != Search.search(typed) {
+            (icon, trailing) = ("globe", "Open")
+        } else {
+            (icon, trailing) = ("magnifyingglass", "Search \(Search.current.name)")
+        }
+        let text = typed
+        return PaletteRow(id: "typed", icon: icon, title: text, trailing: trailing,
+                          kind: trailing) { target in
+            // go() resolves bangs, urls and searches. Never assistants: this row says "Search".
+            target().go(text)
+        }
+    }
+
+    /// The last query's rows stay, all of them, until this query's own results are in —
+    /// then those replace them, even when empty. Filtering them to the new text emptied the
+    /// list whenever they were fuzzy matches, which flashed the bar's defaults for a frame.
+    /// History and engine completions land separately; until the engine's do, the last
+    /// query's completions stay under the new history instead of vanishing and returning.
+    private func shownSuggestions() -> [PaletteRow] {
+        let shown = Palette.heldResults(live: suggestionRows(), held: heldSuggestions,
+                                        historyPending: store.historyPending,
+                                        enginePending: store.enginePending,
+                                        isCompletion: { $0.kind == "Search suggestion" }, id: \.id)
+        // Held is always what is on screen: typing faster than the engine answers must
+        // still carry the newest history forward, not the list from before it arrived.
+        heldSuggestions = shown
+        return shown
+    }
+
+    /// History, bookmarks and engine completions, in the order `TabStore.suggest` merged
+    /// them. A completion is a search that has not happened yet, so it gets no url and no
+    /// "Open" label; the others are places, shown with their host so two pages with the
+    /// same title can be told apart.
+    private func suggestionRows() -> [PaletteRow] {
+        store.suggestions.map { (s: Suggestion) -> PaletteRow in
+            let title = s.title.isEmpty ? s.url : s.title
+            let icon = s.completion ? "magnifyingglass" : (s.bookmarked ? "star.fill" : "clock")
+            let host = URL(string: s.url)?.host ?? s.url
+            return PaletteRow(
+                id: "url:" + s.url, icon: icon,
+                title: title,
+                detail: s.completion ? "" : s.url,
+                subtitle: s.completion || s.title.isEmpty ? "" : host,
+                trailing: s.completion ? "" : "Open",
+                // A completion belongs to the engine and a bookmark was put there on
+                // purpose; only a page you happened to visit is the bar's to forget.
+                forget: s.completion || s.bookmarked ? nil : s.url,
+                kind: s.completion ? "Search suggestion" : (s.bookmarked ? "Bookmark" : "History")
+            ) { target in
+                guard let u = URL(string: s.url) else { return }
+                let tab = target()
+                tab.editing = false
+                tab.go(u)
+            }
+        }
+    }
+
+    /// An open tab as the bar searches it, before it is made into a row.
+    private struct TabSource {
+        let tab: Tab
+        let owner: TabStore
+        let place: String
+    }
+
+    /// Other ordinary windows in this profile are searchable. Private and Little Timo
+    /// tabs are visible only in their own window; private searches never read other windows.
+    private func tabSources() -> [TabSource] {
+        var out: [TabSource] = []
+        let manyWindows = TabStore.all.count > 1
+        for (w, other) in TabStore.all.enumerated()
+        where Palette.tabSourceAllowed(profileID: store.profileID, isPrivate: store.isPrivate,
+                                       ownWindow: other === store, sourceProfileID: other.profileID,
+                                       sourcePrivate: other.isPrivate, sourceLittle: other.isLittle)
+            && (tabSpaceID == nil || other.currentSpaceID == tabSpaceID) {
+            let place = manyWindows ? "Window \(w + 1)" : ""
+            out += other.accessibleTabs.map { TabSource(tab: $0, owner: other, place: place) }
+        }
+        return out
+    }
+
+    private func tabRow(_ source: TabSource) -> PaletteRow {
+        tabRow(source.tab, in: source.owner, place: source.place)
+    }
+
+    /// Only another tab or window needs a switch label; the current page needs no verb.
+    private func tabRow(_ tab: Tab, in owner: TabStore, place: String) -> PaletteRow {
+        let detail = [tab.address, place].filter { !$0.isEmpty }.joined(separator: " — ")
+        let isCurrent = owner === store && tab.id == store.current
+        return PaletteRow(id: Feel03TabContent.rowID(tab.id, owner: owner), icon: "square.on.square",
+                          image: tab.favicon, title: tab.title, detail: detail, matchURL: tab.address,
+                          subtitle: Palette.tabSubtitle(address: tab.currentURL?.absoluteString ?? tab.address,
+                                                        place: place),
+                          trailing: isCurrent ? "" : "Switch to Tab", kind: "Open tab") { [weak tab, weak owner] _ in
+            guard let tab, let owner else { return }
+            Windows.reveal(tab, in: owner)
+        }
+    }
+
+    /// The bar at rest: *this* window's tabs, most recently used first with the one in front
+    /// at the top. `TabSwitcher.recent` is the order ⌃⇥ walks, and the two lists answering
+    /// the same question differently is exactly the sort of thing nobody would notice for a
+    /// year. No "Window n" subtitle here — every row is this window's.
+    private func recentTabRows() -> [PaletteRow] {
+        let byID = Dictionary(store.accessibleTabs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        // Prepare only the rows that the empty bar will display.
+        let order = TabSwitcher.recent(store.accessibleTabs.map { ($0.id, $0.lastActive) },
+                                       current: store.current, limit: Look.barEmptyTabs)
+        return order.compactMap { byID[$0] }.map { tabRow($0, in: store, place: "") }
+    }
+
+    /// The bar's feedback row opens the same optional-diagnostics draft as Help.
+    private func reportRow() -> PaletteRow {
+        return PaletteRow(id: "report", icon: "bubble.left", title: "Report a Problem",
+                          detail: "Describe an issue · optionally include recent logs",
+                          chip: true, kind: "Feedback") { [weak store] _ in
+            IssueReportWindow.show(in: store)
+        }
+    }
+
+    /// An archived tab or a Space as the bar searches it, before it is made into a row.
+    private enum PlaceSource {
+        case archived(Archive.Entry), space(Space)
+        var title: String {
+            switch self {
+            case .archived(let entry): entry.title.isEmpty ? entry.url : entry.title
+            case .space(let space): space.name
+            }
+        }
+        var url: String {
+            switch self {
+            case .archived(let entry): entry.url
+            case .space: ""
+            }
+        }
+    }
+
+    /// Tabs that have left the sidebar but not the browser — up to `Archive.limit` of them —
+    /// then every Space on the strip, by name: every profile's, because that is what the
+    /// strip is. Arc switches Space from the bar, and typing the name of the Space you want
+    /// is faster than counting ⌃1…⌃9. A private window has no archive and no strip; a
+    /// Little Arc has no Space to leave.
+    private func placeSources() -> [PlaceSource] {
+        guard !store.isPrivate else { return [] }
+        let archived = Archive.shared(for: store.profileID).entries.map(PlaceSource.archived)
+        guard !store.isLittle else { return archived }
+        return archived + catalogStrip.filter { $0.id != store.currentSpaceID }.map(PlaceSource.space)
+    }
+
+    /// Return on an archived tab puts it back where it was, which is what the Library's
+    /// rows do — this is the same list, searchable.
+    private func placeRow(_ place: PlaceSource) -> PaletteRow {
+        switch place {
+        case .archived(let entry):
+            PaletteRow(id: "archived:" + entry.url, icon: "archivebox",
+                       // Visible icon leaves load artwork after ranking and the row cap.
+                       title: place.title, detail: entry.url, matchURL: entry.url,
+                       trailing: "Restore Tab", kind: "Archived tab") { _ in
+                Windows.current?.unarchive(entry)
+            }
+        case .space(let space):
+            PaletteRow(id: "space:" + space.id.uuidString, icon: space.icon ?? "square.stack",
+                       title: space.name, detail: "Space",
+                       trailing: "Switch to Space", kind: "Space") { _ in
+                Windows.current?.selectSpace(space)
+            }
+        }
+    }
+
+    /// The actions catalogue, as much of it as this query asks for. The rows carry the
+    /// keystroke rather than a "Command →" chip: an action row's right-hand side is where
+    /// Arc teaches you the shortcut, and a bar that says "Command" forty times says nothing.
+    private func commandRows() -> [PaletteRow] {
+        guard Palette.actions(query: query, mode: mode, filtered: actionsOnly) == .matching
+        else { return [] }
+        // Ranked on the title alone: matching the shortcut too would put every ⌘-something
+        // under a query like "d", and the Shortcuts pane is where keys are searched.
+        return Palette.rank(typed, PaletteCommand.all(for: store, strip: catalogStrip,
+            ownSpaces: catalogSpaces), key: \.title).map { c in
+            PaletteRow(id: "cmd:" + c.id, icon: c.icon, title: c.title,
+                       detail: c.shortcut, shortcut: c.shortcut, kind: "Action") { _ in
+                c.run()
+            }
+        }
+    }
+
+    private func aiRow() -> PaletteRow? {
+        guard mode != .tabs, !typed.isEmpty else { return nil }
+        let (assistant, question) = AIChat.match(query) ?? (AIChat.preferred, query)
+        guard let url = AIChat.url(for: question, using: assistant) else { return nil }
+        return PaletteRow(id: "ai", icon: "sparkles", title: question,
+                          trailing: "Ask \(assistant.name)", kind: "AI Chat") { _ in
+            (Windows.current ?? Windows.open()).newTab(url)
+        }
+    }
+}

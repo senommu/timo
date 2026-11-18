@@ -1,0 +1,1813 @@
+import AppKit
+import LocalAuthentication
+import Security
+import WebKit
+
+/// Credentials live in the macOS login keychain as ordinary Internet passwords.
+/// ponytail: no vault format and no crypto — the login keychain is already unlocked by the
+/// user's login and is already the right place for a password. Settings ▸ Passwords is the
+/// management UI over it; Keychain Access.app still opens exactly the same items.
+enum Passwords {
+    /// One saved login as everything outside this file knows it: which site, which account.
+    /// Deliberately *not* the password — a password is read one item at a time, at the
+    /// moment something actually needs it, and is never held anywhere that outlives the use.
+    struct Login: Identifiable, Hashable, Sendable {
+        let origin: PasswordOrigin
+        let account: String
+        var host: String { origin.host }
+        init(host: String, account: String) {
+            self.init(origin: PasswordOrigin(host: host), account: account)
+        }
+        init(origin: PasswordOrigin, account: String) {
+            self.origin = origin
+            self.account = account
+        }
+        /// Host and account are the keychain's own primary key for the item, so they are
+        /// also what "the same login" means everywhere else — last-used included.
+        var id: String { origin.key(account: account) }
+    }
+
+    static func key(host: String, account: String) -> String { PasswordOrigin(host: host).key(account: account) }
+
+    /// Originals stay local. The opt-in iCloud bridge maintains a separate verified
+    /// synchronizable mirror; switching it off keeps these originals available.
+    /// 'Timo' as an OSType. Stamped on save and required on every read, so Timo can only
+    /// ever see credentials Timo created. Without it the query matches any app's item for
+    /// that host — your `gh` login, Safari's, a password manager's — and macOS puts up a
+    /// "timo wants to use your confidential information" panel for a secret we have no
+    /// business reading.
+    private static let creator: NSNumber = 0x5661_6E65
+
+    /// The profile *and instance* discriminator. kSecAttrSecurityDomain is a free-text
+    /// attribute that is part of an Internet password's primary key, so two profiles can
+    /// hold the same host+account without colliding.
+    ///
+    /// The real app's default profile deliberately writes *no* security domain: that is
+    /// exactly what every item saved before profiles existed looks like, so those items
+    /// keep resolving with no migration pass over the keychain.
+    ///
+    /// A `TIMO_DATA_DIR` instance instead namespaces *every* profile, off a hash of that
+    /// directory — the same derivation `UserDefaults.timo`'s suite uses. A test instance
+    /// therefore cannot read, overwrite or delete the real app's saved logins, and two test
+    /// instances cannot see each other's: the domains never coincide.
+    private static func domain(_ profileID: UUID) -> String? {
+        namespace(profileID: profileID, dataDir: Store.overrideDirectory)
+    }
+
+    /// `domain` with the data directory passed in, so the isolation rule is provable
+    /// headless — a process only ever has one `TIMO_DATA_DIR`.
+    static func namespace(profileID: UUID, dataDir: String?) -> String? {
+        let profile = profileID == ProfileManager.defaultID
+            ? "" : "-" + profileID.uuidString.lowercased()
+        guard let dataDir else { return profile.isEmpty ? nil : "timo" + profile }
+        return "timo-" + UserDefaults.suiteName(forDataDir: dataDir) + profile
+    }
+
+    private static func query(host: String, account: String? = nil,
+                              profileID: UUID) -> [String: Any] {
+        query(origin: PasswordOrigin(host: host), account: account, profileID: profileID)
+    }
+
+    private static func query(origin: PasswordOrigin, account: String? = nil,
+                              profileID: UUID) -> [String: Any] {
+        var q: [String: Any] = [
+            kSecClass as String: kSecClassInternetPassword,
+            kSecAttrServer as String: origin.host,
+            kSecAttrProtocol as String: origin.keychainProtocol,
+            kSecAttrCreator as String: creator,
+            kSecAttrSynchronizable as String: false,
+        ]
+        if let account { q[kSecAttrAccount as String] = account }
+        if let d = domain(profileID) { q[kSecAttrSecurityDomain as String] = d }
+        return q
+    }
+
+    // MARK: Scope
+
+    /// Whether an item carrying this security domain belongs to `scope`.
+    ///
+    /// The whole point of a separate function: "no security domain" is not expressible as a
+    /// `SecItemCopyMatching` query, so a default-profile query matches *every* profile's and
+    /// every test instance's item for the same host, and the narrowing has to be done by
+    /// hand on the results. Getting it wrong fails open — you read, overwrite or delete
+    /// somebody else's login — so it lives in one place and is asserted.
+    static func owns(scope: String?, itemDomain: String?) -> Bool {
+        scope == nil ? (itemDomain ?? "").isEmpty : itemDomain == scope
+    }
+
+    /// The persistent reference of the one item this profile owns for host+account.
+    ///
+    /// Everything that touches a single item goes through here, because a plain
+    /// host+account query is exactly the one that fails open for the default profile.
+    /// A persistent ref names *that* item and nothing else, so the read or the delete that
+    /// follows cannot land on a neighbour.
+    struct Failure: LocalizedError {
+        let status: OSStatus
+        var errorDescription: String? {
+            switch status {
+            case errSecInteractionNotAllowed, errSecNotAvailable:
+                "Keychain is unavailable. Open Keychain Access, unlock your login keychain, and try again."
+            case errSecAuthFailed, errSecUserCanceled:
+                "Keychain access was not authorized. Allow access when macOS asks, then try again."
+            case errSecDuplicateItem:
+                "A login already exists for this website and username. Review the existing account before updating it."
+            case errSecItemNotFound:
+                "This login is no longer in Keychain. Refresh saved passwords and try again."
+            default:
+                "Keychain could not complete this action (error \(status)). Open Keychain Access and check your login keychain, then try again."
+            }
+        }
+    }
+
+    private static func ref(origin: PasswordOrigin, account: String, profileID: UUID) -> Data? {
+        try? referenceChecked(origin: origin, account: account, profileID: profileID)
+    }
+
+    static func referenceChecked(origin: PasswordOrigin, account: String, profileID: UUID,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching) throws -> Data? {
+        var q = query(origin: origin, account: account, profileID: profileID)
+        q[kSecReturnAttributes as String] = true
+        q[kSecReturnPersistentRef as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitAll
+        var out: CFTypeRef?
+        let status = copyMatching(q as CFDictionary, &out)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw Failure(status: status) }
+        guard let items = out as? [[String: Any]] else { throw Failure(status: errSecDecode) }
+        let scope = domain(profileID)
+        guard let item = items.first(where: {
+            owns(scope: scope, itemDomain: $0[kSecAttrSecurityDomain as String] as? String)
+                && PasswordOrigin(attributes: $0) == origin
+        }) else { return nil }
+        guard let ref = item[kSecValuePersistentRef as String] as? Data else { throw Failure(status: errSecDecode) }
+        return ref
+    }
+
+    // MARK: Reading and writing
+
+    /// True when the credential is stored. It can fail: the keychain's primary key for an
+    /// Internet password does not include the creator code, so another app's item for the
+    /// same site and account collides with ours — the add is refused, and there is nothing
+    /// of Timo's to update in its place. Silent failure there is a password the user
+    /// believes is saved and is not.
+    @discardableResult
+    static func save(host: String, account: String, password: String,
+                     profileID: UUID = ProfileManager.activeProfileID) -> Bool {
+        save(origin: PasswordOrigin(host: host), account: account, password: password, profileID: profileID)
+    }
+
+    @discardableResult
+    static func save(origin: PasswordOrigin, account: String, password: String,
+                     profileID: UUID = ProfileManager.activeProfileID, replacingExisting: Bool = true) -> Bool {
+        do {
+            try saveChecked(origin: origin, account: account, password: password, profileID: profileID,
+                            replacingExisting: replacingExisting)
+            return true
+        } catch { return false }
+    }
+
+    static func saveChecked(origin: PasswordOrigin, account: String, password: String,
+                            profileID: UUID, replacingExisting: Bool = true, admission: () throws -> Void = {}) throws {
+        return try serviceLane.sync {
+            defer { invalidate() }
+            guard origin != IntegrationTokens.legacyOrigin else { throw Failure(status: errSecParam) }
+            var add = query(origin: origin, account: account, profileID: profileID)
+            if !origin.isDefaultPort { add[kSecAttrPort as String] = origin.port }
+            add[kSecValueData as String] = Data(password.utf8)
+            add[kSecAttrLabel as String] = "\(origin.url.absoluteString) (Timo)"
+            try checkServiceCancellation()
+            try admission()
+            let status = SecItemAdd(add as CFDictionary, nil)
+            if status == errSecSuccess { secretDidChange(); return }
+            guard status == errSecDuplicateItem, replacingExisting else { throw Failure(status: status) }
+            try admission()
+            guard let existing = try referenceChecked(origin: origin, account: account, profileID: profileID)
+            else { throw Failure(status: status) }
+            try checkServiceCancellation()
+            try admission()
+            let updated = SecItemUpdate([kSecValuePersistentRef as String: existing] as CFDictionary,
+                                        [kSecValueData as String: Data(password.utf8)] as CFDictionary)
+            guard updated == errSecSuccess else { throw Failure(status: updated) }
+            secretDidChange()
+        }
+    }
+
+    /// Keychain changes the identity in place and refuses primary-key collisions. No
+    /// add/delete window or replacement of the owned item's ACL. macOS may refresh
+    /// its opaque reference when primary-key attributes change.
+    static func editChecked(_ login: Login, origin: PasswordOrigin, account: String,
+                            password: String, profileID: UUID) throws {
+        return try serviceLane.sync {
+            defer { invalidate() }
+            guard origin != IntegrationTokens.legacyOrigin, login.origin != IntegrationTokens.legacyOrigin
+            else { throw Failure(status: errSecParam) }
+            guard let ref = try referenceChecked(origin: login.origin, account: login.account, profileID: profileID)
+            else { throw Failure(status: errSecItemNotFound) }
+            try checkServiceCancellation()
+            let status = SecItemUpdate([kSecValuePersistentRef as String: ref] as CFDictionary, [
+                kSecAttrServer as String: origin.host, kSecAttrProtocol as String: origin.keychainProtocol,
+                kSecAttrPort as String: origin.isDefaultPort ? 0 : origin.port,
+                kSecAttrAccount as String: account, kSecValueData as String: Data(password.utf8),
+                kSecAttrLabel as String: "\(origin.url.absoluteString) (Timo)",
+            ] as CFDictionary)
+            guard status == errSecSuccess else { throw Failure(status: status) }
+            secretDidChange()
+            if origin == login.origin {
+                renameUse(origin: origin, from: login.account, to: account, profileID: profileID)
+            } else { forgetUse(origin: login.origin, account: login.account, profileID: profileID) }
+        }
+    }
+
+    /// Nil when nothing is stored. With several accounts for one host this is the one the
+    /// chooser would put first — see `matches`.
+    static func lookup(host: String,
+                       profileID: UUID = ProfileManager.activeProfileID) -> (account: String, password: String)? {
+        guard let hit = matches(host: host, profileID: profileID).first,
+              let secret = password(host: hit.host, account: hit.account, profileID: profileID)
+        else { return nil }
+        return (hit.account, secret)
+    }
+
+    enum CredentialRead: Sendable {
+        case found(account: String, password: String)
+        case missing
+        case unavailable(OSStatus)
+    }
+
+    enum CredentialCleanup: Sendable {
+        case complete
+        case unavailable(OSStatus)
+    }
+
+    /// Every saved login for one host, best first: whatever was filled here most recently,
+    /// then the never-used ones alphabetically. More than one is what raises the chooser on
+    /// the page; one keeps the old fill-and-go behaviour.
+    ///
+    /// Names only. The page needs to know *whether* there is a choice long before anything
+    /// needs a password, and answering that must not decrypt anything.
+    static func matches(host: String,
+                        profileID: UUID = ProfileManager.activeProfileID) -> [Login] {
+        matches(origin: PasswordOrigin(host: host), profileID: profileID)
+    }
+
+    static func matches(origin: PasswordOrigin,
+                        profileID: UUID = ProfileManager.activeProfileID) -> [Login] {
+        rank(all(profileID: profileID).filter { $0.origin == origin },
+             used: lastUsed(profileID: profileID))
+    }
+
+    static func matchesChecked(origin: PasswordOrigin, profileID: UUID) throws -> [Login] {
+        rank(try allChecked(profileID: profileID).filter { $0.origin == origin }, used: lastUsed(profileID: profileID))
+    }
+
+    /// One password, decrypted here and now. The only door to plaintext in the app; nothing
+    /// caches what comes back out of it.
+    static func password(host: String, account: String,
+                         profileID: UUID = ProfileManager.activeProfileID) -> String? {
+        password(origin: PasswordOrigin(host: host), account: account, profileID: profileID)
+    }
+
+    static func password(origin: PasswordOrigin, account: String,
+                         profileID: UUID = ProfileManager.activeProfileID) -> String? {
+        try? passwordChecked(origin: origin, account: account, profileID: profileID)
+    }
+
+    static func passwordChecked(origin: PasswordOrigin, account: String, profileID: UUID,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching) throws -> String? {
+        try passwordCheckedForSync(origin: origin, account: account, profileID: profileID, admission: {}, copyMatching: copyMatching)
+    }
+
+    static func passwordCheckedForSync(origin: PasswordOrigin, account: String, profileID: UUID,
+        admission: () throws -> Void,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching) throws -> String? {
+        guard origin != IntegrationTokens.legacyOrigin else { return nil }
+        try admission()
+        guard let ref = try referenceChecked(origin: origin, account: account, profileID: profileID, copyMatching: copyMatching)
+        else { return nil }
+        try checkServiceCancellation()
+        try admission()
+        var out: CFTypeRef?
+        let status = copyMatching([
+            kSecClass as String: kSecClassInternetPassword,
+            kSecValuePersistentRef as String: ref, kSecReturnData as String: true,
+        ] as CFDictionary, &out)
+        guard status == errSecSuccess else { throw Failure(status: status) }
+        guard let data = out as? Data, let text = String(data: data, encoding: .utf8) else { throw Failure(status: errSecDecode) }
+        return text
+    }
+
+    /// The order rule itself, taking its inputs rather than reading them, so it is provable
+    /// headless. Ties on the same instant — two fills inside one clock tick — fall back to
+    /// the alphabet rather than to whatever order the keychain handed the items over in.
+    static func rank(_ logins: [Login], used: [String: Date]) -> [Login] {
+        logins.sorted { a, b in
+            switch (used[a.id], used[b.id]) {
+            case let (x?, y?): x == y ? a.account < b.account : x > y
+            case (_?, nil): true
+            case (nil, _?): false
+            case (nil, nil): a.account < b.account
+            }
+        }
+    }
+
+    /// Which logins this profile has — sites and usernames, no secrets. Lives here, beside
+    /// `creator` and `owns`, because a second copy of that query elsewhere silently returns
+    /// nothing, or somebody else's items, the day either of them changes.
+    ///
+    /// Read through a cache, and the cache holds *only* what this returns: the pane asks for
+    /// the whole list on every keystroke in its search field, and a cache of decrypted
+    /// passwords sitting in a process for its whole life is exactly what a password manager
+    /// must not be. Any write through this file drops it; a change made outside Timo —
+    /// Keychain Access, another instance — is picked up on the next launch. ponytail: that
+    /// is the ceiling; the upgrade path is a keychain change notification.
+    static func all(profileID: UUID = ProfileManager.activeProfileID) -> [Login] {
+        cacheLock.lock()
+        let hit = cached[profileID]
+        let revision = cacheRevision
+        cacheLock.unlock()
+        if let hit { return hit }
+        guard let fresh = try? allChecked(profileID: profileID) else { return [] }
+        cacheLock.lock()
+        if cacheRevision == revision { cached[profileID] = fresh }
+        cacheLock.unlock()
+        return fresh
+    }
+
+    /// Export bypasses the metadata cache and reads owned persistent references. A failed
+    /// enumeration or secret read must not publish an empty or incomplete password file.
+    static func exportEntries(profileID: UUID,
+                              copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching)
+        throws -> [PasswordImport.Entry] {
+        return try serviceLane.sync {
+            var q: [String: Any] = [
+                kSecClass as String: kSecClassInternetPassword,
+                kSecAttrCreator as String: creator,
+                kSecAttrSynchronizable as String: false,
+                kSecReturnAttributes as String: true,
+                kSecReturnPersistentRef as String: true,
+                kSecMatchLimit as String: kSecMatchLimitAll,
+            ]
+            let scope = domain(profileID)
+            if let scope { q[kSecAttrSecurityDomain as String] = scope }
+            var out: CFTypeRef?
+            let status = copyMatching(q as CFDictionary, &out)
+            if status == errSecItemNotFound { return [] }
+            guard status == errSecSuccess, let items = out as? [[String: Any]] else {
+                throw PasswordImport.Failure("Could not read saved passwords from Keychain. No file was exported.")
+            }
+            var entries: [PasswordImport.Entry] = []
+            for item in items where owns(scope: scope, itemDomain: item[kSecAttrSecurityDomain as String] as? String) {
+                if PasswordOrigin(attributes: item) == IntegrationTokens.legacyOrigin { continue }
+                guard let origin = PasswordOrigin(attributes: item),
+                      let ref = item[kSecValuePersistentRef as String] as? Data else {
+                    throw PasswordImport.Failure("A saved login has unsupported attributes. No file was exported.")
+                }
+                var secret: CFTypeRef?
+                let read = copyMatching([
+                    kSecClass as String: kSecClassInternetPassword,
+                    kSecValuePersistentRef as String: ref,
+                    kSecReturnData as String: true,
+                ] as CFDictionary, &secret)
+                guard read == errSecSuccess, let data = secret as? Data,
+                      let password = String(data: data, encoding: .utf8) else {
+                    throw PasswordImport.Failure("Could not read every saved password from Keychain. No file was exported.")
+                }
+                entries.append(PasswordImport.Entry(origin: origin,
+                    account: item[kSecAttrAccount as String] as? String ?? "", password: password))
+            }
+            return entries.sorted { ($0.origin.url.absoluteString, $0.account) < ($1.origin.url.absoluteString, $1.account) }
+        }
+    }
+
+    /// `nonisolated(unsafe)` plus an explicit lock, for the same reason `UserDefaults.timo`
+    /// is: the keychain is reachable from any thread and this is only a read-through copy.
+    private nonisolated(unsafe) static var cached: [UUID: [Login]] = [:]
+    private nonisolated(unsafe) static var cacheRevision: UInt64 = 0
+    private static let cacheLock = NSLock()
+
+    private static func invalidate() {
+        cacheLock.lock()
+        cacheRevision &+= 1
+        cached.removeAll()
+        cacheLock.unlock()
+    }
+
+    static func allChecked(profileID: UUID,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching) throws -> [Login] {
+        var q: [String: Any] = [
+            kSecClass as String: kSecClassInternetPassword,
+            kSecAttrCreator as String: creator,
+            kSecAttrSynchronizable as String: false,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        let scope = domain(profileID)
+        if let scope { q[kSecAttrSecurityDomain as String] = scope }
+
+        var out: CFTypeRef?
+        let status = copyMatching(q as CFDictionary, &out)
+        if status == errSecItemNotFound { return [] }
+        guard status == errSecSuccess else { throw Failure(status: status) }
+        guard let items = out as? [[String: Any]] else { throw Failure(status: errSecDecode) }
+
+        return items.compactMap { item -> Login? in
+            guard let origin = PasswordOrigin(attributes: item), origin != IntegrationTokens.legacyOrigin,
+                  owns(scope: scope, itemDomain: item[kSecAttrSecurityDomain as String] as? String)
+            else { return nil }
+            return Login(origin: origin, account: item[kSecAttrAccount as String] as? String ?? "")
+        }.sorted { ($0.host, $0.account) < ($1.host, $1.account) }
+    }
+
+    @discardableResult
+    static func delete(host: String, account: String,
+                       profileID: UUID = ProfileManager.activeProfileID) -> Bool {
+        delete(origin: PasswordOrigin(host: host), account: account, profileID: profileID)
+    }
+
+    @discardableResult
+    static func delete(origin: PasswordOrigin, account: String,
+                       profileID: UUID = ProfileManager.activeProfileID) -> Bool {
+        do { try deleteChecked(origin: origin, account: account, profileID: profileID); return true }
+        catch { return false }
+    }
+
+    static func deleteChecked(origin: PasswordOrigin, account: String, profileID: UUID, admission: () throws -> Void = {}) throws {
+        return try serviceLane.sync {
+            defer { invalidate() }
+            try admission()
+            guard let ref = try referenceChecked(origin: origin, account: account, profileID: profileID)
+            else { throw Failure(status: errSecItemNotFound) }
+            try checkServiceCancellation()
+            try admission()
+            let status = SecItemDelete([kSecClass as String: kSecClassInternetPassword,
+                                       kSecValuePersistentRef as String: ref] as CFDictionary)
+            guard status == errSecSuccess else { throw Failure(status: status) }
+            forgetUse(origin: origin, account: account, profileID: profileID)
+            secretDidChange()
+        }
+    }
+
+    private static func secretDidChange() {
+        NotificationCenter.default.post(name: .timoSecretsChanged, object: nil)
+    }
+
+    /// All Timo-owned instance credentials, including opaque profile contexts imported
+    /// before the profile category is enabled. The incognito and integration namespaces
+    /// never enter this mirror. Read on the existing serial password lane.
+    static func iCloudSnapshot(admission: () throws -> Void = {}) throws -> [ICloudSecrets.Identity: Data] {
+        try serialized {
+            try admission()
+            var output: CFTypeRef?
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            let query: [String: Any] = [kSecClass as String: kSecClassInternetPassword,
+                kSecAttrCreator as String: creator, kSecAttrSynchronizable as String: false,
+                kSecReturnAttributes as String: true, kSecReturnPersistentRef as String: true,
+                kSecUseAuthenticationContext as String: context,
+                kSecMatchLimit as String: kSecMatchLimitAll]
+            let status = SecItemCopyMatching(query as CFDictionary, &output)
+            if status == errSecItemNotFound { return [:] }
+            guard status == errSecSuccess else { throw Failure(status: status) }
+            guard let items = output as? [[String: Any]], items.count <= 20_000 else { throw Failure(status: errSecDecode) }
+            let dataDir = Store.overrideDirectory
+            let base = dataDir.map { namespace(profileID: ProfileManager.defaultID, dataDir: $0)! } ?? "timo"
+            var result: [ICloudSecrets.Identity: Data] = [:]
+            for item in items {
+                let itemDomain = item[kSecAttrSecurityDomain as String] as? String
+                guard ownsInstance(dataDir: dataDir, itemDomain: itemDomain) else { continue }
+                let profileID: UUID
+                if owns(scope: namespace(profileID: ProfileManager.defaultID, dataDir: dataDir), itemDomain: itemDomain) {
+                    profileID = ProfileManager.defaultID
+                } else {
+                    guard let itemDomain, itemDomain.hasPrefix(base + "-"),
+                          let parsed = UUID(uuidString: String(itemDomain.dropFirst(base.count + 1))) else { continue }
+                    profileID = parsed
+                }
+                guard profileID != Profile.incognito.id else { continue }
+                guard let origin = PasswordOrigin(attributes: item),
+                      let ref = item[kSecValuePersistentRef as String] as? Data else { throw Failure(status: errSecDecode) }
+                guard origin != IntegrationTokens.legacyOrigin else { continue }
+                try admission()
+                var secret: CFTypeRef?
+                let read = SecItemCopyMatching([kSecClass as String: kSecClassInternetPassword,
+                    kSecValuePersistentRef as String: ref, kSecReturnData as String: true,
+                    kSecUseAuthenticationContext as String: context] as CFDictionary, &secret)
+                guard read == errSecSuccess else { throw Failure(status: read) }
+                guard let bytes = secret as? Data, String(data: bytes, encoding: .utf8) != nil else { throw Failure(status: errSecDecode) }
+                result[.password(profileID: profileID, origin: origin.url.absoluteString,
+                                 account: item[kSecAttrAccount as String] as? String ?? "")] = bytes
+            }
+            return result
+        }
+    }
+
+    struct Revision: Equatable, Sendable {
+        let reference: Data
+        let modified: Date?
+    }
+
+    static func revision(origin: PasswordOrigin, account: String, profileID: UUID) throws -> Revision? {
+        guard let ref = try referenceChecked(origin: origin, account: account, profileID: profileID) else { return nil }
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching([kSecValuePersistentRef as String: ref,
+                                         kSecReturnAttributes as String: true] as CFDictionary, &out)
+        guard status == errSecSuccess else { throw Failure(status: status) }
+        guard let attrs = out as? [String: Any] else { throw Failure(status: errSecDecode) }
+        return Revision(reference: ref, modified: attrs[kSecAttrModificationDate as String] as? Date)
+    }
+
+    /// Every in-app mutation and reviewed check/write enters this one queue. Sync entry
+    /// is retained for CLI/fixtures and already-detached import batches; UI uses perform.
+    private final class ServiceLane: @unchecked Sendable {
+        let queue = DispatchQueue(label: "app.timo.password-service", qos: .userInitiated)
+        let key = DispatchSpecificKey<Bool>()
+        let cancellationKey = DispatchSpecificKey<Cancellation>()
+        init() { queue.setSpecific(key: key, value: true) }
+        func sync<Value>(_ operation: () throws -> Value) rethrows -> Value {
+            if DispatchQueue.getSpecific(key: key) == true { return try operation() }
+            return try queue.sync(execute: operation)
+        }
+    }
+    private final class Cancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func cancel() { lock.withLock { value = true } }
+        var cancelled: Bool { lock.withLock { value } }
+    }
+    private static let serviceLane = ServiceLane()
+
+    static func serialized<Value>(_ operation: () throws -> Value) rethrows -> Value {
+        try serviceLane.sync(operation)
+    }
+
+    static func perform<Value: Sendable>(_ operation: @escaping @Sendable () throws -> Value) async throws -> Value {
+        let cancellation = Cancellation()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let result: Value = try await withCheckedThrowingContinuation { continuation in
+                serviceLane.queue.async {
+                    guard !cancellation.cancelled else { continuation.resume(throwing: CancellationError()); return }
+                    serviceLane.queue.setSpecific(key: serviceLane.cancellationKey, value: cancellation)
+                    defer { serviceLane.queue.setSpecific(key: serviceLane.cancellationKey, value: nil) }
+                    do {
+                        let result = try operation()
+                        if cancellation.cancelled { continuation.resume(throwing: CancellationError()) }
+                        else { continuation.resume(returning: result) }
+                    } catch { continuation.resume(throwing: error) }
+                }
+            }
+            try Task.checkCancellation()
+            return result
+        } onCancel: { cancellation.cancel() }
+    }
+
+    /// Register synchronously on the UI actor before launching a task, closing the gap
+    /// between a Save click and its eventual service-queue admission.
+    struct PendingUIOperation: Sendable {
+        fileprivate let id: UUID
+        @MainActor func finish() { Passwords.finishUIOperation(id) }
+    }
+    @MainActor private static var pendingUIOperations: Set<UUID> = []
+    @MainActor private static var pendingUIWaiters: [CheckedContinuation<Void, Never>] = []
+    @MainActor static var hasPendingOperations: Bool { !pendingUIOperations.isEmpty }
+
+    @MainActor static func beginUIOperation() -> PendingUIOperation? {
+        guard !AppLifecycle.shared.persistenceExitInProgress else { return nil }
+        let id = UUID()
+        pendingUIOperations.insert(id)
+        return PendingUIOperation(id: id)
+    }
+    @MainActor private static func finishUIOperation(_ id: UUID) {
+        guard pendingUIOperations.remove(id) != nil, pendingUIOperations.isEmpty else { return }
+        let waiters = pendingUIWaiters
+        pendingUIWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Caller closes new intent first, then drains imports before this barrier. No UI
+    /// thread waits on queue.sync; admitted UI tasks may reach the lane after this starts.
+    @MainActor static func flushPendingOperations() async throws {
+        while true {
+            if !pendingUIOperations.isEmpty {
+                await withCheckedContinuation { pendingUIWaiters.append($0) }
+            }
+            try Task.checkCancellation()
+            try await perform { }
+            if pendingUIOperations.isEmpty { return }
+        }
+    }
+
+    static func checkServiceCancellation() throws {
+        try Task.checkCancellation()
+        if DispatchQueue.getSpecific(key: serviceLane.cancellationKey)?.cancelled == true {
+            throw CancellationError()
+        }
+    }
+
+    struct MutationOperations: Sendable {
+        var add: @Sendable (PasswordOrigin, String, String, UUID) throws -> Void = {
+            try saveChecked(origin: $0, account: $1, password: $2, profileID: $3, replacingExisting: false)
+        }
+        var edit: @Sendable (Login, PasswordOrigin, String, String, UUID) throws -> Void = {
+            try editChecked($0, origin: $1, account: $2, password: $3, profileID: $4)
+        }
+        var delete: @Sendable (Login, UUID) throws -> Void = {
+            try deleteChecked(origin: $0.origin, account: $0.account, profileID: $1)
+        }
+    }
+    static func addAsync(origin: PasswordOrigin, account: String, password: String, profileID: UUID,
+                         operations: MutationOperations = .init()) async throws {
+        try await perform { try operations.add(origin, account, password, profileID) }
+    }
+    static func editAsync(_ login: Login, origin: PasswordOrigin, account: String, password: String,
+                          profileID: UUID, operations: MutationOperations = .init()) async throws {
+        try await perform { try operations.edit(login, origin, account, password, profileID) }
+    }
+    static func deleteAsync(_ login: Login, profileID: UUID,
+                            operations: MutationOperations = .init()) async throws {
+        try await perform { try operations.delete(login, profileID) }
+    }
+
+    struct ReviewOperations: Sendable {
+        var snapshot: @Sendable (PasswordOrigin, String, UUID) throws -> (String?, Revision?) = {
+            let password = try passwordChecked(origin: $0, account: $1, profileID: $2)
+            try checkServiceCancellation()
+            return (password, try revision(origin: $0, account: $1, profileID: $2))
+        }
+        var update: @Sendable (Login, PasswordOrigin, String, String, UUID) throws -> Void = {
+            try editChecked($0, origin: $1, account: $2, password: $3, profileID: $4)
+        }
+        var insert: @Sendable (PasswordOrigin, String, String, UUID) throws -> Void = {
+            try saveChecked(origin: $0, account: $1, password: $2, profileID: $3, replacingExisting: false)
+        }
+    }
+
+    enum SaveDecision: Sendable {
+        case saved
+        case review(PendingSave)
+    }
+
+    struct SaveOriginChanged: LocalizedError {
+        var errorDescription: String? { "A submitted password can only be saved for the website where it was captured." }
+    }
+
+    static func reviewedSave(_ offer: PendingSave, origin: PasswordOrigin, account: String,
+                             password: String, profileID: UUID,
+                             operations: ReviewOperations = .init()) throws -> SaveDecision {
+        return try serviceLane.sync {
+            guard offersSaving(profileID: profileID) else { throw SavingDisabled() }
+            guard origin == offer.origin else { throw SaveOriginChanged() }
+            let (existing, revision) = try operations.snapshot(origin, account, profileID)
+            guard offersSaving(profileID: profileID) else { throw SavingDisabled() }
+            let sameIdentity = origin == offer.origin && account == offer.account
+            if existing != nil && (!offer.update || !sameIdentity || (offer.revision != nil && offer.revision != revision)) {
+                return .review(PendingSave(attempt: offer.attempt, revision: revision, port: origin.port,
+                    host: origin.host, account: account, password: password, update: true))
+            }
+            try checkServiceCancellation()
+            if offer.update && sameIdentity {
+                guard existing != nil else { throw Failure(status: errSecItemNotFound) }
+                try operations.update(.init(origin: origin, account: account), origin, account, password, profileID)
+            } else {
+                try operations.insert(origin, account, password, profileID)
+            }
+            return .saved
+        }
+    }
+
+    /// Immutable injected operations keep Keychain calls on the worker while UI callers
+    /// retain the profile, document and account authorization around every suspension.
+    struct Reader: Sendable {
+        var matches: @Sendable (PasswordOrigin, UUID) throws -> [Login] = {
+            try matchesChecked(origin: $0, profileID: $1)
+        }
+        var password: @Sendable (PasswordOrigin, String, UUID) throws -> String? = {
+            try passwordChecked(origin: $0, account: $1, profileID: $2)
+        }
+        var revision: @Sendable (PasswordOrigin, String, UUID) throws -> Revision? = {
+            try Passwords.revision(origin: $0, account: $1, profileID: $2)
+        }
+
+        var commit: @Sendable (PendingSave, PasswordOrigin, String, String, UUID) throws -> SaveDecision = {
+            try reviewedSave($0, origin: $1, account: $2, password: $3, profileID: $4)
+        }
+
+        func save(_ offer: PendingSave, origin: PasswordOrigin, account: String,
+                  password: String, profileID: UUID) async throws -> SaveDecision {
+            try await perform { try commit(offer, origin, account, password, profileID) }
+        }
+        func logins(origin: PasswordOrigin, profileID: UUID) async throws -> [Login] {
+            try await perform { try matches(origin, profileID) }
+        }
+        func secret(_ login: Login, profileID: UUID) async throws -> String? {
+            try await perform { try password(login.origin, login.account, profileID) }
+        }
+        func saved(origin: PasswordOrigin, account: String, profileID: UUID) async throws -> (String?, Revision?) {
+            try await perform {
+                let saved = try password(origin, account, profileID)
+                try checkServiceCancellation()
+                return (saved, try revision(origin, account, profileID))
+            }
+        }
+    }
+
+    // MARK: Last used
+
+    /// When each login was last filled, so the chooser can lead with the account you
+    /// actually use on that site. A date is not a secret, so plain preferences is the right
+    /// store — and being per-profile it follows the credentials it orders.
+    private static func usedKey(_ profileID: UUID) -> String {
+        ProfileManager.defaultsKey("passwordsLastUsed", profileID)
+    }
+
+    static func lastUsed(profileID: UUID = ProfileManager.activeProfileID) -> [String: Date] {
+        (UserDefaults.timo.dictionary(forKey: usedKey(profileID)) ?? [:])
+            .compactMapValues { ($0 as? Double).map(Date.init(timeIntervalSince1970:)) }
+    }
+
+    static func recordUse(host: String, account: String,
+                          profileID: UUID = ProfileManager.activeProfileID) {
+        recordUse(origin: PasswordOrigin(host: host), account: account, profileID: profileID)
+    }
+
+    static func recordUse(origin: PasswordOrigin, account: String,
+                          profileID: UUID = ProfileManager.activeProfileID) {
+        var d = UserDefaults.timo.dictionary(forKey: usedKey(profileID)) ?? [:]
+        d[origin.key(account: account)] = Date.now.timeIntervalSince1970
+        UserDefaults.timo.set(d, forKey: usedKey(profileID))
+    }
+
+    /// A deleted login must not leave its timestamp behind to promote the next login that
+    /// happens to be saved under the same host and account.
+    private static func forgetUse(host: String, account: String, profileID: UUID) {
+        forgetUse(origin: PasswordOrigin(host: host), account: account, profileID: profileID)
+    }
+
+    private static func forgetUse(origin: PasswordOrigin, account: String, profileID: UUID) {
+        var d = UserDefaults.timo.dictionary(forKey: usedKey(profileID)) ?? [:]
+        guard d.removeValue(forKey: origin.key(account: account)) != nil else { return }
+        UserDefaults.timo.set(d, forKey: usedKey(profileID))
+    }
+
+    // MARK: Browser save offers
+
+    static func offerSavingKey(_ profileID: UUID) -> String {
+        ProfileManager.defaultsKey("offerToSavePasswords", profileID)
+    }
+
+    static func offersSaving(profileID: UUID) -> Bool {
+        UserDefaults.timo.object(forKey: offerSavingKey(profileID)) as? Bool ?? true
+    }
+
+    @MainActor static func setOffersSaving(_ enabled: Bool, profileID: UUID) {
+        UserDefaults.timo.set(enabled, forKey: offerSavingKey(profileID))
+        guard !enabled else { return }
+        for store in TabStore.all where store.profileID == profileID {
+            for tab in store.everyTab { tab.cancelPasswordSaveOffer() }
+        }
+    }
+
+    struct SavingDisabled: LocalizedError {
+        var errorDescription: String? { "Password-save offers are turned off for this profile." }
+    }
+
+    // MARK: Never for this site
+
+    /// Sites the user has said no for. Not a secret and not a credential, so it lives in
+    /// preferences beside the last-used stamps — and being per-profile it follows them.
+    private static func neverKey(_ profileID: UUID) -> String {
+        ProfileManager.defaultsKey("passwordsNeverSaved", profileID)
+    }
+
+    static func neverSaved(profileID: UUID = ProfileManager.activeProfileID) -> [String] {
+        (UserDefaults.timo.stringArray(forKey: neverKey(profileID)) ?? []).sorted()
+    }
+
+    static func isNeverSaved(host: String,
+                             profileID: UUID = ProfileManager.activeProfileID) -> Bool {
+        neverSaved(profileID: profileID).contains(host.lowercased())
+    }
+
+    /// "Never for this site" on the offer. Saying no once is a decision about this password;
+    /// saying never is a decision about the site, so it is the only one that is remembered.
+    static func neverSave(host: String, profileID: UUID = ProfileManager.activeProfileID) {
+        var hosts = Set(neverSaved(profileID: profileID))
+        hosts.insert(host.lowercased())
+        UserDefaults.timo.set(Array(hosts).sorted(), forKey: neverKey(profileID))
+    }
+
+    /// Taking it back, from Settings ▸ Passwords.
+    static func allowSaving(host: String, profileID: UUID = ProfileManager.activeProfileID) {
+        let hosts = neverSaved(profileID: profileID).filter { $0 != host.lowercased() }
+        UserDefaults.timo.set(hosts, forKey: neverKey(profileID))
+    }
+
+    /// Renaming an account in the pane is a delete plus a save, and the timestamp is keyed
+    /// on the account — so without this, correcting a typo in a username silently demotes
+    /// that login to the bottom of its own site's chooser.
+    static func renameUse(host: String, from: String, to: String,
+                          profileID: UUID = ProfileManager.activeProfileID) {
+        renameUse(origin: PasswordOrigin(host: host), from: from, to: to, profileID: profileID)
+    }
+
+    static func renameUse(origin: PasswordOrigin, from: String, to: String,
+                          profileID: UUID = ProfileManager.activeProfileID) {
+        var d = UserDefaults.timo.dictionary(forKey: usedKey(profileID)) ?? [:]
+        guard let when = d.removeValue(forKey: origin.key(account: from)) else { return }
+        d[origin.key(account: to)] = when
+        UserDefaults.timo.set(d, forKey: usedKey(profileID))
+    }
+
+    // MARK: Revealing
+
+    /// Turning a row of bullets into a password asks the Mac who you are first — Touch ID,
+    /// an Apple Watch, or the login password. `.deviceOwnerAuthentication` rather than the
+    /// biometrics-only policy so a Mac without Touch ID gets the password sheet instead of a
+    /// refusal, and so a laptop with the lid shut still has a way through.
+    ///
+    /// The callback runs on the main actor, because everything that acts on it is a view.
+    @MainActor static func authenticate(_ reason: String,
+                                        _ done: @escaping @MainActor (Bool) -> Void) {
+        let ctx = LAContext()
+        guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: nil) else {
+            done(false)
+            return
+        }
+        ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, _ in
+            Task { @MainActor in done(ok) }
+        }
+    }
+
+    /// Erasing one instance must leave every other data directory's credentials alone.
+    /// Enumerate metadata first, then delete exact owned references, including legacy tokens.
+    @discardableResult static func deleteEverything(dataDir: String? = Store.overrideDirectory,
+                                 keychain: IntegrationTokens.Keychain = .system) -> Bool {
+        return serialized {
+            defer { invalidate() }
+            guard deleteOwnedInternetPasswords(profileID: nil, dataDir: dataDir, keychain: keychain) else { return false }
+            secretDidChange()
+            let integrations = IntegrationTokens.deleteEverything(dataDir: dataDir, keychain: keychain)
+            let ai = AIKeys.deleteEverything(namespace: dataDir.map { UserDefaults.suiteName(forDataDir: $0) }, delete: keychain.delete)
+            let mirrors = deletePasswordMirrors(dataDir: dataDir, keychain: keychain)
+            return integrations && ai && mirrors
+        }
+    }
+
+    /// Only the production instance can own iCloud mirrors. Enumerate metadata in its
+    /// data-protection Keychain and remove exact references, including legacy envelopes.
+    private static func deletePasswordMirrors(dataDir: String?, keychain: IntegrationTokens.Keychain) -> Bool {
+        guard dataDir == nil else { return true }
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecUseDataProtectionKeychain as String: true,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnAttributes as String: true, kSecReturnPersistentRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll]
+        if let group = try? ICloudProvisioning.current().keychainGroup { query[kSecAttrAccessGroup as String] = group }
+        var output: CFTypeRef?
+        let status = keychain.copy(query as CFDictionary, &output)
+        // Unentitled (local/dev) builds cannot reach, and so never wrote, a mirror.
+        if status == errSecItemNotFound || status == errSecMissingEntitlement { return true }
+        guard status == errSecSuccess, let items = output as? [[String: Any]] else { return false }
+        let prefix = "io.github.senommu.timo.icloud-secrets.v1."
+        for item in items {
+            guard let service = item[kSecAttrService as String] as? String, service.hasPrefix(prefix) else { continue }
+            let parts = service.dropFirst(prefix.count).split(separator: ".", maxSplits: 2)
+            guard parts.count >= 2, parts[1] == "passwords" else { continue }
+            guard let reference = item[kSecValuePersistentRef as String] as? Data else { return false }
+            var deletion: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecValuePersistentRef as String: reference, kSecUseDataProtectionKeychain as String: true,
+                kSecAttrSynchronizable as String: kSecAttrSynchronizableAny]
+            deletion[kSecAttrAccessGroup as String] = query[kSecAttrAccessGroup as String]
+            let deleted = keychain.delete(deletion as CFDictionary)
+            guard deleted == errSecSuccess || deleted == errSecItemNotFound else { return false }
+        }
+        return true
+    }
+
+    static func deleteAll(profileID: UUID, dataDir: String? = Store.overrideDirectory,
+                          keychain: IntegrationTokens.Keychain = .system) {
+        return serialized {
+            defer { invalidate() }
+            guard deleteOwnedInternetPasswords(profileID: profileID, dataDir: dataDir, keychain: keychain) else { return }
+            secretDidChange()
+            if !IntegrationTokens(profileID: profileID, dataDir: dataDir, keychain: keychain, lastUsed: [:]).deleteAll() {
+                NSLog("[timo] Profile integration credentials could not be erased")
+            }
+        }
+    }
+
+    private static func ownsInstance(dataDir: String?, itemDomain: String?) -> Bool {
+        let value = itemDomain ?? ""
+        if let dataDir {
+            let base = namespace(profileID: ProfileManager.defaultID, dataDir: dataDir)!
+            if value == base { return true }
+            guard value.hasPrefix(base + "-") else { return false }
+            return UUID(uuidString: String(value.dropFirst(base.count + 1))) != nil
+        }
+        if value.isEmpty { return true }
+        guard value.hasPrefix("timo-") else { return false }
+        return UUID(uuidString: String(value.dropFirst(5))) != nil
+    }
+
+    private static func deleteOwnedInternetPasswords(profileID: UUID?, dataDir: String?,
+                                                      keychain: IntegrationTokens.Keychain) -> Bool {
+        var query: [String: Any] = [kSecClass as String: kSecClassInternetPassword,
+            kSecAttrCreator as String: creator, kSecReturnAttributes as String: true,
+            kSecReturnPersistentRef as String: true, kSecMatchLimit as String: kSecMatchLimitAll]
+        let scope = profileID.flatMap { namespace(profileID: $0, dataDir: dataDir) }
+        if let scope { query[kSecAttrSecurityDomain as String] = scope }
+        var output: CFTypeRef?
+        let status = keychain.copy(query as CFDictionary, &output)
+        if status == errSecItemNotFound { return true }
+        guard status == errSecSuccess, let items = output as? [[String: Any]] else {
+            NSLog("[timo] Credentials could not be enumerated for deletion (status %d)", status)
+            return false
+        }
+        for item in items {
+            let itemDomain = item[kSecAttrSecurityDomain as String] as? String
+            let owned = profileID != nil ? owns(scope: scope, itemDomain: itemDomain)
+                : ownsInstance(dataDir: dataDir, itemDomain: itemDomain)
+            guard owned else { continue }
+            guard let reference = item[kSecValuePersistentRef as String] as? Data else { return false }
+            let deleted = keychain.delete([kSecClass as String: kSecClassInternetPassword,
+                kSecValuePersistentRef as String: reference] as CFDictionary)
+            guard deleted == errSecSuccess || deleted == errSecItemNotFound else {
+                NSLog("[timo] Credential deletion failed (status %d)", deleted)
+                return false
+            }
+        }
+        return true
+    }
+
+    // MARK: check
+
+    /// The three rules that decide whose credentials this process can see, which of them
+    /// counts as ours, and which one a login form is offered first. All pure, and all the
+    /// kind of thing that fails silently: a namespace collision hands a test instance the
+    /// user's real logins, a bad scope test reads or deletes another profile's item, and a
+    /// bad ordering just puts the wrong username in the box.
+    static func check() -> [(String, Bool)] {
+        let other = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        let real = namespace(profileID: ProfileManager.defaultID, dataDir: nil)
+        let realOther = namespace(profileID: other, dataDir: nil)
+        let testA = namespace(profileID: ProfileManager.defaultID, dataDir: "/tmp/a")
+        let testB = namespace(profileID: ProfileManager.defaultID, dataDir: "/tmp/b")
+        let testAOther = namespace(profileID: other, dataDir: "/tmp/a")
+
+        func login(_ account: String) -> Login { Login(host: "example.com", account: account) }
+        let (ada, bob, cam) = (login("ada"), login("bob"), login("cam"))
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        return [
+            ("the real app's default profile stamps no security domain", real == nil),
+            ("a second profile is namespaced", realOther == "timo-" + other.uuidString.lowercased()),
+            ("a TIMO_DATA_DIR instance namespaces even the default profile", testA != nil),
+            ("…so it can never match the real app's items", testA != real && testA != realOther),
+            ("two data dirs never share a namespace", testA != testB),
+            ("…and profiles inside one still differ", testA != testAOther),
+            ("the same data dir is stable across launches",
+             testA == namespace(profileID: ProfileManager.defaultID, dataDir: "/tmp/a")),
+
+            // The scope test. Every read, write and delete of a single item hangs off this,
+            // and every wrong answer here is somebody else's password.
+            ("the default profile owns an item with no domain", owns(scope: nil, itemDomain: nil)),
+            ("…and an empty domain is the same as none", owns(scope: nil, itemDomain: "")),
+            ("…but not another profile's item",
+             owns(scope: nil, itemDomain: realOther) == false),
+            ("…and not a test instance's item", owns(scope: nil, itemDomain: testA) == false),
+            ("a profile owns only its own domain", owns(scope: realOther, itemDomain: realOther)),
+            ("…not an undomained one", owns(scope: realOther, itemDomain: nil) == false),
+            ("…and not another profile's", owns(scope: realOther, itemDomain: testAOther) == false),
+
+            ("with nothing used, accounts are alphabetical",
+             rank([cam, ada, bob], used: [:]).map(\.account) == ["ada", "bob", "cam"]),
+            ("the last-used account leads",
+             rank([ada, bob, cam], used: [bob.id: now]).map(\.account) == ["bob", "ada", "cam"]),
+            ("…and the more recent of two wins",
+             rank([ada, bob, cam], used: [bob.id: now, cam.id: now.addingTimeInterval(60)])
+                .map(\.account) == ["cam", "bob", "ada"]),
+            ("a tie falls back to the alphabet, not to keychain order",
+             rank([cam, bob], used: [bob.id: now, cam.id: now]).map(\.account) == ["bob", "cam"]),
+            ("a timestamp for a login that is gone changes nothing",
+             rank([ada, bob], used: ["gone.example\nx": now]).map(\.account) == ["ada", "bob"]),
+            ("one account is one account", rank([ada], used: [:]) == [ada]),
+            ("nothing saved ranks to nothing", rank([], used: [ada.id: now]).isEmpty),
+
+            ("a new password is offered as a save",
+             PendingSave(host: "example.com", account: "ada", password: "x").title
+                == "Save password for example.com?"),
+            ("…and a replacement says so",
+             PendingSave(host: "example.com", account: "ada", password: "x", update: true).title
+                == "Update the password for example.com?"),
+        ]
+    }
+}
+
+/// A save offer waiting on the user. Held only until they answer.
+struct PendingSave: Equatable, Identifiable, Sendable {
+    var attempt: String? = nil
+    var revision: Passwords.Revision? = nil
+    var port: Int = 443
+    var origin: PasswordOrigin { PasswordOrigin(host: host, port: port) }
+    let id = UUID()
+    let host: String
+    let account: String
+    let password: String
+    /// This site and account are already saved with a *different* password — so the offer
+    /// is to replace one, which is a different question and gets a different title.
+    var update = false
+
+    /// Said out loud and drawn at the top of the card. Named so the wording can be asserted:
+    /// telling someone you are about to save a password you are in fact about to overwrite
+    /// is the one thing this card must not do.
+    var title: String {
+        update ? "Update the password for \(host)?" : "Save password for \(host)?"
+    }
+}
+
+/// The account list hanging under a login form's username field, when a site has more than
+/// one saved login. Usernames only — the passwords stay in the keychain until one is picked,
+/// so nothing secret sits in view state waiting to be screenshotted or read by VoiceOver.
+struct PasswordChoice: Equatable {
+    /// Isolated-world document and field identity captured when this list opened.
+    var target: String? = nil
+    var port: Int = 443
+    let host: String
+    let accounts: [String]
+    /// Under the username field, in the web view's own coordinates.
+    let anchor: CGRect
+    /// Which row Return would fill. The first is what Chromium highlights, and it is the
+    /// one `Passwords.rank` put there.
+    var selected = 0
+}
+
+/// WKUserContentController retains its handlers, and the handler here is the Tab that owns
+/// the web view that owns the controller. Break the cycle.
+final class WeakHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ target: WKScriptMessageHandler) { self.target = target }
+    func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        target?.userContentController(c, didReceive: m)
+    }
+}
+
+/// `timo selfcheck` — the runnable check. Round-trips the keychain, then drives the injected
+/// script against a real form in a real https origin: fill it, read the values back, submit
+/// it, and confirm the offer comes back up. Fails loudly if any link in that chain breaks.
+@MainActor enum SelfCheck {
+    private static var web: WKWebView?
+    private static var holder: NSWindow?
+    private static var bridge: Bridge?
+
+    private static let host = "timo-selftest.invalid"
+    private static let user = "ada@example.com"
+    private static let pass = "correct horse battery staple"
+
+    private static let page = """
+    <!doctype html><meta charset=utf-8><body>
+    <form id=signup>
+      <input type=email id=signupUser value=signup@example.com>
+      <input type=password id=signupPass value=signup-secret>
+    </form>
+    <form id=f>
+      <input type=text name=other value=decoy>
+      <input type=email id=u name=email>
+      <input type=password id=p name=password>
+      <button type=submit>Sign in</button>
+    </form>
+    <script>
+      // Stand in for a React-style controlled input: the component state only follows the
+      // native value setter plus an input event, never a bare .value assignment.
+      var state = { u: '', p: '' };
+      document.getElementById('u').addEventListener('input', function (e) { state.u = e.target.value; });
+      document.getElementById('p').addEventListener('input', function (e) { state.p = e.target.value; });
+      document.getElementById('f').addEventListener('submit', function (e) { e.preventDefault(); });
+      window.__state = function () { return JSON.stringify(state); };
+    </script></body>
+    """
+
+    /// `--pure` stops before anything that needs a keychain ACL or a window server, so the
+    /// logic can be proved on a headless CI box. The rest still runs locally, where a real
+    /// signed bundle is what makes the keychain assertions meaningful.
+    static func run(pureOnly: Bool = false) -> Never {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool) {
+            print((ok ? "  ok    " : "  FAIL  ") + name)
+            if !ok { failures += 1 }
+        }
+        // Print the tally, take this run's own defaults suite with it, and go. `TIMO_DATA_DIR`
+        // gets a suite of its own (see `UserDefaults.timo`), and a check run is not a user
+        // whose preferences should outlive it. Only here: the app itself must never delete
+        // that suite, because a real instance on a data dir wants its settings back next launch.
+        func finish(_ label: String) -> Never {
+            print(failures == 0 ? "\n\(label)" : "\n\(failures) FAILED")
+            if let dir = Store.overrideDirectory {
+                UserDefaults.dropScratchSuite(UserDefaults.suiteName(forDataDir: dir))
+            }
+            UserDefaults.sweepScratchSuites()
+            exit(failures == 0 ? 0 : 1)
+        }
+
+        print("store")
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("timo-selfcheck-\(ProcessInfo.processInfo.processIdentifier).db")
+        try? FileManager.default.removeItem(at: dir)
+        let store = Store(path: dir.path)
+        let urlA = URL(string: "https://example.com/a")!
+        let urlB = URL(string: "https://example.com/b")!
+        store.record(urlA, title: "")
+        store.retitle(urlA, title: "Alpha")
+        store.record(urlA, title: "Alpha")
+        store.record(urlB, title: "Beta")
+        check("visits collapse to one row per url", store.recent().count == 2)
+        check("title backfills onto an untitled visit", store.recent().first { $0.url == urlA.absoluteString }?.title == "Alpha")
+        check("suggest ranks the more-visited url first", store.suggest("example").first?.url == urlA.absoluteString)
+        check("a one-character query suggests nothing", store.suggest("e").isEmpty)
+        check("bookmark toggles on", store.toggleBookmark(urlB, title: "Beta") == true)
+        check("bookmark reads back", store.isBookmarked(urlB))
+        check("bookmarked url sorts above history", store.suggest("example").first?.bookmarked == true)
+        check("bookmarked url is not also listed as history", store.suggest("example").count == 2)
+        check("bookmark toggles off", store.toggleBookmark(urlB, title: "Beta") == false)
+        // A literal % in a stored title must not turn the query into a match-everything wildcard.
+        store.record(URL(string: "https://example.com/pct")!, title: "100% pure")
+        check("LIKE wildcards in the query are escaped", store.suggest("100%").count == 1)
+        // Bulk path: real timestamps, not insertion order. Clear first — the rows above are
+        // stamped Date.now and would outrank any fixture date.
+        store.clearHistory()
+        let old = Date(timeIntervalSince1970: 1_000_000)
+        let new = Date(timeIntervalSince1970: 2_000_000)
+        store.record([(URL(string: "https://old.example")!, "Old", old),
+                      (URL(string: "https://new.example")!, "New", new)])
+        let ordered = store.recent().prefix(2).map(\.url)
+        check("bulk insert keeps real visit dates, not insertion order",
+              ordered.first == "https://new.example")
+
+        check("bulk bookmarks add", store.addBookmarks([(urlA, "Alpha"), (urlB, "Beta")]) == 2)
+        check("re-importing bookmarks adds nothing and deletes nothing",
+              store.addBookmarks([(urlA, "Alpha"), (urlB, "Beta")]) == 0 && store.bookmarks().count == 2)
+
+        // Guards the transaction. Per-row inserts are one fsync each; 20k of them took
+        // minutes, which is why the importer used to cap at 5000 pages.
+        let many = (0..<20_000).map {
+            (URL(string: "https://bulk.example/\($0)")!, "Page \($0)", Date.now)
+        }
+        let began = Date.now
+        store.record(many)
+        let elapsed = Date.now.timeIntervalSince(began)
+        check("20k visits insert in one transaction (took \(String(format: "%.2f", elapsed))s)",
+              elapsed < 5 && store.recent(limit: 30_000).count > 20_000)
+
+        // What the History window reads: every visit with its own time, searchable, and a
+        // single line deletable without taking the other visits to that page with it.
+        store.clearHistory()
+        let day = Date(timeIntervalSince1970: 1_700_000_000)
+        store.record([(URL(string: "https://swift.org/blog")!, "Swift Blog", day),
+                      (URL(string: "https://swift.org/blog")!, "Swift Blog", day - 86_400),
+                      (URL(string: "https://apple.com")!, "Apple", day - 90_000)])
+        let visits = store.history()
+        check("history lists every visit, not one row per url", visits.count == 3)
+        check("history comes back newest first",
+              visits.first?.title == "Swift Blog" && visits.map(\.at) == visits.map(\.at).sorted(by: >))
+        check("history search matches a title", store.history(matching: "apple").count == 1)
+        check("history search matches a url", store.history(matching: "swift.org").count == 2)
+        check("history search is case-insensitive", store.history(matching: "SWIFT").count == 2)
+        check("history search escapes LIKE wildcards", store.history(matching: "%").isEmpty)
+        check("history search matching nothing comes back empty", store.history(matching: "zzzz").isEmpty)
+        if let newest = store.history(matching: "swift.org").first {
+            store.deleteVisit(newest.id)
+            check("deleting one visit leaves that page's other visits alone",
+                  store.history(matching: "swift.org").count == 1)
+        } else {
+            check("deleting one visit leaves that page's other visits alone", false)
+        }
+
+        // ⌥⌘⌫ on a command bar suggestion: the bar rolls a page's visits into one row, so
+        // forgetting that row has to take every visit to it — and leave the other pages be.
+        store.record([(URL(string: "https://swift.org/blog")!, "Swift Blog", day - 172_800)])
+        store.forget(url: "https://swift.org/blog")
+        check("forgetting a suggestion takes every visit to that page with it",
+              store.history(matching: "swift.org").isEmpty)
+        check("…and leaves the other pages alone", store.history(matching: "apple").count == 1)
+
+        check("clearHistory empties visits", { store.clearHistory(); return store.recent().isEmpty }())
+        try? FileManager.default.removeItem(at: dir)
+
+        for (label, block) in [("window chrome", Look.check), ("sidebar motion", Motion.check),
+                               ("interaction sounds", InteractionSounds.check), ("tab archive", Archive.check),
+                               ("content blocker", Blocker.check), ("browser import", BrowserImport.check),
+                               ("import from arc", ArcImport.check),
+                               ("bookmark manager", BookmarkManager.check),
+                               ("favicons + tabs", Favicons.check), ("url handling", URLHandling.check),
+                               ("error pages", ErrorPage.check), ("site permissions", SitePermissions.check),
+                               ("site control center", SiteControl.check),
+                               ("developer mode", DeveloperMode.check),
+                               ("erase everything", EraseEverything.check),
+                               ("theme editor", ThemeEditor.check),
+                               ("links that open another app", ExternalApps.check),
+                               ("extensions", ExtensionHost.check),
+                               ("pinned extension actions", ExtensionPins.check),
+                               ("profiles + spaces", ProfileManager.check),
+                               ("spaces", Spaces.check),
+                               ("search engines", Search.check),
+                               ("search suggestions", SearchSuggestions.check),
+                               ("instant links", InstantLinks.check),
+                               ("ai chat", AIChat.check),
+                               ("certificate trust", CertificateTrust.check),
+                               ("crash recovery", Crash.check),
+                               ("reader", Reader.check),
+                               ("command palette", Palette.check),
+                               ("find in page", Find.check),
+                               ("clear browsing data", BrowsingData.check),
+                               ("tab suspension", Suspension.check),
+                               ("battery saver", BatterySaver.check),
+                               ("keybindings", Keybindings.check),
+                               ("standard mac shortcuts", Standard.check),
+                               ("shortcuts pane", ShortcutsPane.check),
+                               ("history window", HistoryWindow.check),
+                               ("library", Library.check),
+                               ("easels", EaselChecks.check),
+                               ("downloads", Downloads.check),
+                               ("on-device ai", AppleAI.check),
+                               ("cloud ai", CloudAI.check),
+                               ("picture in picture", PictureInPicture.check),
+                               ("tidy downloads", TidyDownloads.check),
+                               ("tab row glyph", TabRowGlyph.check),
+                               ("tidy tabs", TidyTabs.check),
+                               ("tidy titles", TidyTitles.check),
+                               ("link previews", Previews.check),
+                               ("per-site zoom", Zoom.check),
+                               ("export", Export.check),
+                               ("tab audio", TabAudio.check),
+                               ("https-only", HTTPSOnly.check),
+                               ("bangs", Bangs.check),
+                               ("sidebar width", SidebarWidth.check),
+                               ("peeked window chrome", TimoWindow.check),
+                               ("little arc", LittleArc.check),
+                               ("air traffic control", AirTraffic.check),
+                               ("which window a key acts on", Windows.check),
+                               ("peek", Peek.check),
+                               ("link gestures", TabActions.check),
+                               ("recent tab switcher", TabSwitcher.check),
+                               ("toasts", Toasts.check),
+                               ("self-update", Release.check),
+                               ("bundle replacement", BundleReplacement.check),
+                               ("pinned folders", Pins.check),
+                               ("the pages the card holds", WebHost.check),
+                               ("split view", Split.check),
+                               ("mini audio player", MediaTray.check),
+                               ("multi-select", Selection.check),
+                               ("⌘Q asks before quitting", QuitAsk.check),
+                               ("local files", Files.check),
+                               ("saved passwords", Passwords.check),
+                               ("passwords pane", PasswordsPane.check),
+                               ("password chooser", PasswordChooser.check),
+                               ("back/forward history menu", NavHistory.check),
+                               ("drag landing", Landing.check),
+                               ("window.open popups", Popup.check),
+                               ("app icon", AppIcon.check),
+                               ("live folders", GitHub.check)] {
+            print(label)
+            for (name, ok) in block() { check(name, ok) }
+        }
+
+        print("csv import")
+        // Chrome's header, a password holding a comma and escaped quotes, and CRLF.
+        let chrome = "name,url,username,password,note\r\n"
+            + "GitHub,https://github.com/login,ada,\"pa,ss\"\"word\",\r\n"
+        if let r = try? PasswordImport.parse(chrome) {
+            check("chrome export parses", r.entries.count == 1)
+            check("host is taken from the url", r.entries.first?.host == "github.com")
+            check("comma and escaped quote survive", r.entries.first?.password == "pa,ss\"word")
+        } else { check("chrome export parses", false) }
+
+        // Safari's header capitalisation, a bare host, and a newline inside a password.
+        let safari = "Title,URL,Username,Password,Notes\n"
+            + "Bank,bank.example.com,ada@example.com,\"two\nlines\",\n"
+            + "Empty,https://nope.example.com,ada,,\n"
+        if let r = try? PasswordImport.parse(safari) {
+            check("safari export parses", r.entries.count == 1)
+            check("bare host without a scheme resolves", r.entries.first?.host == "bank.example.com")
+            check("newline inside a quoted password survives", r.entries.first?.password == "two\nlines")
+            check("row with no password is skipped, not imported blank", r.skipped == 1)
+        } else { check("safari export parses", false) }
+
+        // Firefox quotes every header cell; the field names still match.
+        let firefox = "\"url\",\"username\",\"password\",\"httpRealm\"\n"
+            + "\"https://mozilla.org\",\"ada\",\"hunter2\",\"\"\n"
+        check("firefox export parses", (try? PasswordImport.parse(firefox))?.entries.count == 1)
+
+        var rejected = false
+        do { _ = try PasswordImport.parse("a,b,c\n1,2,3\n") } catch { rejected = true }
+        check("a file with no password column is rejected, not half-imported", rejected)
+
+        let importFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("timo-import-check-\(UUID().uuidString).csv")
+        defer { try? FileManager.default.removeItem(at: importFile) }
+        do {
+            try ("url,username,password\n"
+                + "https://saved.example,ada,first\n"
+                + "https://blocked.example,ada,second\n")
+                .write(to: importFile, atomically: true, encoding: .utf8)
+            let result = try PasswordImport.importFile(importFile, save: { entry in
+                entry.host != "blocked.example"
+            })
+            check("password import counts only credentials actually stored",
+                  result.imported == 1 && result.failed == 1 && result.skipped == 0)
+        } catch {
+            check("password import counts only credentials actually stored", false)
+        }
+
+        for (name, ok) in LinkContextWebView.check() { check(name, ok) }
+
+        if pureOnly { finish("PASS (pure)") }
+
+        print("window controls")
+        for (name, ok) in TrafficLightRest.checkControls() { check(name, ok) }
+
+        for (name, ok) in LinkContextWebView.checkMenu() { check(name, ok) }
+
+        // Not pure: `buildMenu` is the app's own menu bar, and building it needs `NSApp`.
+        // No window is opened — the whole point is to read the bar the user gets and prove
+        // every standard chord is on it exactly once, with the selector the table names.
+        // Built against a throwaway suite for the same reason `Standard.check` is: the bar
+        // takes its key equivalents from the live registry, so somebody who has moved ⌘T off
+        // New Tab would otherwise fail a check about the table this app ships.
+        print("the menu bar that ships")
+        let rows = Keybindings.withScratchDefaults("menubar") {
+            Standard.installed(buildMenu(), windows: NSApp.windowsMenu, help: NSApp.helpMenu,
+                               services: NSApp.servicesMenu)
+        } ?? [("scratch defaults suite is available", false)]
+        for (name, ok) in rows { check(name, ok) }
+
+        // Not pure: it reads the running bundle's Info.plist, and the bare binary out of
+        // .build has none. Two lists of the same UTIs — make-app.sh's CFBundleDocumentTypes
+        // and Files.types — are exactly the pair that drifts, and drift here is silent:
+        // Finder offers a type Timo then refuses to draw, or Timo draws one Finder never
+        // offers. Skipped rather than failed with no bundle, which is what the app runs as.
+        print("declared document types")
+        if let types = Bundle.main.object(forInfoDictionaryKey: "CFBundleDocumentTypes") as? [[String: Any]] {
+            let declared = Set(types.flatMap { $0["LSItemContentTypes"] as? [String] ?? [] })
+            check("Info.plist declares exactly what Files.opens will open",
+                  declared == Set(Files.types.map(\.identifier)))
+        } else {
+            print("  --    no bundle (running the bare binary), nothing to compare")
+        }
+
+        print("tab reordering notifications")
+        for (name, ok) in TabOrderingChecks.check() { check(name, ok) }
+
+        // Not pure: the whole claim is about `Tab` objects surviving a switch, and a pure row
+        // over ids cannot tell a tab that was kept from one that was opened again for the
+        // same url. Only on a private `TIMO_DATA_DIR` — this makes Spaces and pages, and a
+        // check run has no business writing either into somebody's real profile.
+        print("a Space kept alive across a switch")
+        if Store.overrideDirectory != nil {
+            let profileID = ProfileManager.shared.active.id
+            var here = ProfileManager.shared.createSpace(name: "Keepalive A", in: profileID)
+            var there = ProfileManager.shared.createSpace(name: "Keepalive B", in: profileID)
+            here.tabURLs = [URL(string: "https://a1.example/")!, URL(string: "https://a2.example/")!]
+            there.tabURLs = [URL(string: "https://b1.example/")!]
+            ProfileManager.shared.updateSpace(here)
+            ProfileManager.shared.updateSpace(there)
+            let store = TabStore(profileID: profileID, space: here)
+            let were = store.tabs.map(ObjectIdentifier.init)
+            let pages = store.tabs.map { ObjectIdentifier($0.web) }
+            check("a Space opens with its own tabs", were.count == 2)
+            // Wound back so the stamping is the only thing that can move them: the tab being
+            // read is stamped as the Space is put away, so its idle clock starts at the swipe
+            // rather than at whenever it was selected.
+            let opened = Date(timeIntervalSince1970: 1_000_000)
+            let read = store.current
+            store.tabs.forEach { $0.lastActive = opened }
+            store.switchTo(space: there)
+            check("the page you were reading starts its idle clock as the Space is put away",
+                  store.everyTab.first { $0.id == read }.map { $0.lastActive > opened } == true)
+            check("…and the pages behind it keep the clock they already had",
+                  store.everyTab.filter { $0.id != read && were.contains(ObjectIdentifier($0)) }
+                      .allSatisfy { $0.lastActive == opened })
+            check("switching shows the Space being entered", store.tabs.count == 1)
+            check("…and keeps the one being left alive behind it", store.everyTab.count == 3)
+            check("the idle sweep still counts the tabs a window is holding for a Space",
+                  Suspension.allTabs.filter { were.contains(ObjectIdentifier($0)) }.count == 2)
+            store.switchTo(space: here)
+            check("switching back brings the very same tabs, in the same order",
+                  store.tabs.map(ObjectIdentifier.init) == were)
+            check("…on the very same pages, so not one of them reloaded",
+                  store.tabs.map { ObjectIdentifier($0.web) } == pages)
+            store.switchTo(space: there)
+            let held = store.everyTab.count
+            Spaces.delete(here.id, in: profileID)
+            check("deleting a Space lets go of the tabs a window was keeping alive for it",
+                  held == 3 && store.everyTab.count == 1)
+            store.tabs.forEach { $0.tearDown() }
+            store.dropStashes()
+            TabStore.all.removeAll { $0 === store }
+            ProfileManager.shared.deleteSpace(there.id, in: profileID)
+        } else {
+            print("  --    no private TIMO_DATA_DIR, nothing to switch")
+        }
+
+        // Not pure: the claim is about a real `Tab` being sent back to a real url, and about
+        // what a Space holds on disk afterwards — neither of which a row over values can
+        // say. Only on a private `TIMO_DATA_DIR`; this writes a Space and reads it back.
+        // Almost no page is loaded: a pinned row comes up parked, and `park` is also how a
+        // wander is staged. The one exception is the last row, which makes the wandered row
+        // current to see what the Space remembers on the way out; that starts a load of a
+        // reserved `.example` name, which resolves nowhere and is asserted on by nothing.
+        print("a pinned row browsed away from the page it was pinned at")
+        if Store.overrideDirectory != nil {
+            let profileID = ProfileManager.shared.active.id
+            let home = URL(string: "https://home.example/")!
+            let away = URL(string: "https://away.example/x")!
+            var space = ProfileManager.shared.createSpace(name: "Pin Home", in: profileID)
+            space.pinnedTabURLs = [home]
+            ProfileManager.shared.updateSpace(space)
+            let store = TabStore(profileID: profileID, space: space)
+            if let row = store.tabs.first(where: { $0.kind == .pinned }) {
+                check("a row restored from disk stands for the url the saved list held",
+                      row.homeURL == home)
+                // The wander, staged: a page, a title and a back/forward list of its own.
+                let wander = Data("the wander's back/forward list".utf8)
+                row.park(url: away, Parked(title: "Away", state: wander))
+                check("browsing it elsewhere leaves its home where it was",
+                      row.homeURL == home && row.currentURL == away)
+                check("…and a live folder still knows the row by the pull request it stands for",
+                      store.rowURL(row.id.uuidString) == home.absoluteString)
+                check("…and its × offers to send it home rather than to take the pin off",
+                      TabRowGlyph.decide(kind: row.kind, suspended: row.suspended,
+                                         pane: false, atHome: row.atHome) == .unload)
+                store.savePins()
+                check("the Space holds the page it was pinned at, not the one it wandered to",
+                      ProfileManager.shared.spaces(for: profileID)
+                          .first { $0.id == space.id }?.pinnedTabURLs == [home])
+                // What a relaunch brings up, measured rather than reasoned about: the quit
+                // writes the Space and the sidecar, and a second store reads both back.
+                store.saveCurrentSpace()
+                if let saved = ProfileManager.shared.spaces(for: profileID).first(where: { $0.id == space.id }) {
+                    check("quitting writes the same page down, so both writers agree",
+                          saved.pinnedTabURLs == [home])
+                    // Simulate a new process; a second live window now shares this row.
+                    TabStore.all.removeAll { $0 === store }
+                    defer { TabStore.all.append(store) }
+                    let relaunched = TabStore(profileID: profileID, space: saved)
+                    let back = relaunched.tabs.first { $0.kind == .pinned }
+                    check("the next launch keeps the page the pinned row wandered to",
+                          back?.homeURL == home && back?.currentURL == away)
+                    check("…parked, with the wander's back/forward state",
+                          back?.suspended == true && back?.snapshot.state == wander)
+                    check("…and keeps the page's title until it is sent home",
+                          back?.title == "Away")
+                    relaunched.tabs.forEach { $0.tearDown() }
+                    TabStore.all.removeAll { $0 === relaunched }
+                }
+                store.close(row.id)
+                check("its × puts it back on its own page", row.currentURL == home)
+                check("…leaves it pinned, exactly where it was in the section",
+                      row.kind == .pinned && store.tabs.contains { $0 === row })
+                check("…throws the wander's back/forward list away with it",
+                      row.snapshot.state != wander)
+                check("…and stops calling itself by the name of a page it is not on",
+                      row.title == "home.example")
+                check("…so the press after that is the one that takes the pin off",
+                      TabRowGlyph.decide(kind: row.kind, suspended: row.suspended,
+                                         pane: false, atHome: row.atHome) == .unpin)
+                // The grid keeps the same promise. A favourite's × never reads as an
+                // unload — the tile closes — so this is the other arm of `close`.
+                let tile = store.restore([home], as: .favourite, parked: [:])[0]
+                tile.park(url: away, Parked(title: "Away", state: wander))
+                store.close(tile.id)
+                check("a favourite browsed elsewhere is put back on its own page too",
+                      tile.currentURL == home && tile.kind == .favourite)
+                // Last, because making it current wakes it: the row is wandered again and
+                // looked at, and the Space is left. It identifies the row by its home even
+                // though the sidecar restores the page it wandered to.
+                row.park(url: away, Parked(title: "Away", state: wander))
+                store.current = row.id
+                store.saveCurrentSpace()
+                check("leaving the Space on a wandered row remembers it by its home",
+                      row.homeURL == home && Spaces.lastTab(in: space.id) == home.absoluteString)
+            } else {
+                check("the Space came up with its pinned row", false)
+            }
+            store.tabs.forEach { $0.tearDown() }
+            store.dropStashes()
+            TabStore.all.removeAll { $0 === store }
+            ProfileManager.shared.deleteSpace(space.id, in: profileID)
+        } else {
+            print("  --    no private TIMO_DATA_DIR, nothing to pin")
+        }
+
+        print("closing a selected pinned page")
+        if Store.overrideDirectory != nil {
+            let store = TabStore(isPrivate: true)
+            let home = URL(string: "https://pin.example/")!
+            let away = URL(string: "https://pin.example/away")!
+            let row = store.newBlankTab(focus: false, as: .pinned)
+            row.park(url: home, Parked(title: "Pin"))
+            store.current = row.id
+            let today = store.newBlankTab(focus: false)
+            today.park(url: away, Parked(title: "Today"))
+            // Real committed pages exercise suspend, rather than a value-only close rule.
+            func load(_ url: URL) -> Bool {
+                row.web.loadSimulatedRequest(URLRequest(url: url), responseHTML: "<p>Pin</p>")
+                let deadline = Date().addingTimeInterval(5)
+                while (row.web.url != url || row.loading), Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+                }
+                return row.web.url == url && !row.loading
+            }
+            check("the selected pin has a live page at home", load(home))
+            store.close(row.id)
+            check("closing the selected pin clears its sidebar selection",
+                  store.current == nil && store.active == nil)
+            check("closing keeps the pin parked and does not wake a Today tab",
+                  row.kind == .pinned && row.suspended && today.suspended
+                  && store.tabs.contains { $0 === row })
+            store.current = row.id
+            check("clicking the closed pin selects and resumes it",
+                  store.current == row.id && !row.suspended)
+            check("the selected pin can browse away from home", load(away))
+            store.close(row.id)
+            check("sending a selected pin home clears its sidebar selection too",
+                  store.current == nil && row.suspended && row.currentURL == home)
+            store.current = row.id
+            check("the reopened pin has a live page", load(home))
+            let other = store.newBlankTab()
+            store.close(row.id)
+            check("closing a background pin leaves the selected tab alone",
+                  store.current == other.id && row.suspended)
+            store.tabs.forEach { $0.tearDown() }
+            TabStore.all.removeAll { $0 === store }
+        } else {
+            print("  --    no private TIMO_DATA_DIR, nothing to close")
+        }
+
+        print("keychain round-trip")
+        Passwords.delete(host: host, account: user)
+        Passwords.save(host: host, account: user, password: pass)
+        let hit = Passwords.lookup(host: host)
+        check("stored credential reads back", hit?.account == user && hit?.password == pass)
+        Passwords.save(host: host, account: user, password: pass + "2")
+        check("re-saving updates instead of duplicating", Passwords.lookup(host: host)?.password == pass + "2")
+        check("delete removes it", Passwords.delete(host: host, account: user))
+        check("lookup after delete is nil", Passwords.lookup(host: host) == nil)
+
+        print("autofill script")
+        let cfg = Tab.configuration()
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: Autofill.script, injectionTime: .atDocumentEnd,
+                         forMainFrameOnly: true, in: Autofill.world))
+        let b = Bridge()
+        bridge = b
+        cfg.userContentController.add(b, contentWorld: Autofill.world, name: "timopw")
+        let w = WKWebView(frame: .init(x: 0, y: 0, width: 600, height: 400), configuration: cfg)
+        w.navigationDelegate = b
+        web = w
+        let win = NSWindow(contentRect: w.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        win.contentView = w
+        win.setFrameOrigin(NSPoint(x: -4000, y: -4000))
+        win.orderFront(nil)
+        holder = win
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            print("  FAIL  timed out (a keychain access prompt will do this — re-run and allow)")
+            exit(1)
+        }
+
+        b.onLoaded = {
+            // In the script's own world, like the app does it — the page world has no
+            // `__timoFill` at all any more, which is the point of the world.
+            w.evaluateJavaScript("document.getElementById('u').focus()") { _, _ in
+                w.evaluateJavaScript(Autofill.fillJS(account: user, password: pass),
+                                     in: nil, in: Autofill.world) { result in
+                    let filled = try? result.get()
+                    check("fill reports a form was found", (filled as? Bool) == true)
+                    w.evaluateJavaScript("window.__state()") { state, _ in
+                        let s = (state as? String) ?? ""
+                        check("username reached component state", s.contains(user))
+                        check("password reached component state", s.contains(pass))
+                        check("decoy text field was not mistaken for the username", !s.contains("decoy"))
+                        w.evaluateJavaScript("document.getElementById('signupPass').value") { value, _ in
+                            check("fill leaves another form's password alone",
+                                  (value as? String) == "signup-secret")
+                        }
+                        // The page's own world cannot replace the isolated fill hook.
+                        w.evaluateJavaScript("typeof window.__timoFill + \" \" + typeof window.__timoAnchor") { kinds, _ in
+                            check("the page's own world cannot see the autofill hooks",
+                                  (kinds as? String) == "undefined undefined")
+                        }
+                        w.evaluateJavaScript("""
+                            document.getElementById('signupUser').value = 'signup@example.com';
+                            document.getElementById('signupPass').value = 'signup-secret';
+                            document.getElementById('signupUser').focus();
+                            document.getElementById('f').dispatchEvent(new Event('submit', {bubbles:true}));
+                            window.dispatchEvent(new Event('pagehide'));
+                            """) { _, _ in
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                                check("pagehide keeps the submitted login credential despite signup focus",
+                                      b.offered?.0 == user && b.offered?.1 == pass)
+                                b.offered = nil
+                                w.evaluateJavaScript("""
+                                    document.getElementById('p').value = '';
+                                    document.getElementById('signupUser').focus();
+                                    document.getElementById('f').dispatchEvent(new Event('submit', {bubbles:true}));
+                                    window.dispatchEvent(new Event('pagehide'));
+                                    """) { _, _ in
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                        check("empty login submit cannot offer signup on pagehide",
+                                              b.offered == nil)
+                                        // A single-page app may replace just the username
+                                        // node after focus, leaving the password node in place.
+                                        w.evaluateJavaScript("""
+                                            document.getElementById('u').focus();
+                                            var oldUser = document.getElementById('u');
+                                            var newUser = document.createElement('input');
+                                            newUser.id = 'u';
+                                            newUser.type = 'email';
+                                            oldUser.replaceWith(newUser);
+                                            """) { _, _ in
+                                            w.evaluateJavaScript(
+                                                Autofill.fillJS(account: "new@example.com", password: "new-secret"),
+                                                in: nil, in: Autofill.world) { _ in
+                                                w.evaluateJavaScript("""
+                                                    JSON.stringify([document.getElementById('u').value,
+                                                                    document.getElementById('p').value])
+                                                    """) { values, _ in
+                                                    check("fill uses the replacement username node",
+                                                          (values as? String) == "[\"new@example.com\",\"new-secret\"]")
+                                                    b.offered = nil
+                                                    w.evaluateJavaScript("""
+                                                        document.getElementById('u').value = 'login@example.com';
+                                                        document.getElementById('p').value = 'login-secret';
+                                                        document.getElementById('p').dispatchEvent(new Event('input', {bubbles:true}));
+                                                        document.getElementById('f').dispatchEvent(new Event('submit', {bubbles:true}));
+                                                        document.getElementById('signupUser').value = 'signup@example.com';
+                                                        document.getElementById('signupPass').value = 'signup-secret';
+                                                        document.getElementById('signupUser').dispatchEvent(new Event('input', {bubbles:true}));
+                                                        document.getElementById('signupUser').focus();
+                                                        window.dispatchEvent(new Event('pagehide'));
+                                                        """) { _, _ in
+                                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                                            check("editing another form cannot replace a submitted login offer",
+                                                                  b.offered?.0 == "login@example.com"
+                                                                    && b.offered?.1 == "login-secret")
+                                                            b.offered = nil
+                                                            w.evaluateJavaScript("""
+                                                                var oldLogin = document.getElementById('f');
+                                                                var loginParent = oldLogin.parentNode;
+                                                                var loginNext = oldLogin.nextSibling;
+                                                                oldLogin.remove();
+                                                                document.getElementById('signupUser').dispatchEvent(new Event('input', {bubbles:true}));
+                                                                document.getElementById('signupUser').focus();
+                                                                window.dispatchEvent(new Event('pagehide'));
+                                                                """) { _, _ in
+                                                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                                                    check("editing preexisting signup after login removal keeps its offer",
+                                                                          b.offered == nil)
+                                                                    b.offered = nil
+                                                                    w.evaluateJavaScript("""
+                                                                        var replacement = document.createElement('form');
+                                                                        replacement.id = 'retry';
+                                                                        replacement.innerHTML = '<input id="retryUser" type="email"><input id="retryPass" type="password">';
+                                                                        loginParent.insertBefore(replacement, loginNext);
+                                                                        document.getElementById('retryUser').value = 'retry@example.com';
+                                                                        document.getElementById('retryPass').value = 'retry-secret';
+                                                                        document.getElementById('retryPass').dispatchEvent(new Event('input', {bubbles:true}));
+                                                                        document.getElementById('retryUser').focus();
+                                                                        window.dispatchEvent(new Event('pagehide'));
+                                                                        """) { _, _ in
+                                                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                                                            check("edited replacement form offers its fetch login on pagehide",
+                                                                                  b.offered?.0 == "retry@example.com"
+                                                                                    && b.offered?.1 == "retry-secret")
+                                                                            print("window.open against a real page")
+                                                                            popupRows { rows in
+                                                                                for (name, ok) in rows { check(name, ok) }
+                                                                                finish("PASS")
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        w.loadSimulatedRequest(URLRequest(url: URL(string: "https://\(host)/login")!), responseHTML: page)
+        NSApplication.shared.run()
+        fatalError("unreachable")
+    }
+
+    private static var popupWeb: WKWebView?
+    private static var popupHolder: NSWindow?
+    private static var popupProbe: PopupProbe?
+
+    /// The one thing `--pure` cannot prove: `Popup.userInitiated` asked about a
+    /// `WKNavigationAction` WebKit actually made.
+    ///
+    /// Worth a stage of its own because the version of that function which read the gesture
+    /// flag with `value(forKey: "userInitiated")` passed every pure row there is and then
+    /// raised `NSUnknownKeyException` — an Objective-C exception, so a hard abort, not a
+    /// catchable error — on the *first real popup*, every time. Nothing short of a real page
+    /// calling `window.open` and a real delegate call finds that.
+    ///
+    /// So: an off-screen page in a simulated https origin calls `window.open`, and the
+    /// delegate asks the same three questions `Tab.webView(_:createWebViewWith:…)` asks.
+    /// Nothing is opened — the popup is refused with nil, which is the delegate's own way of
+    /// saying "no window" and leaves no tab and no floating window behind.
+    private static func popupRows(_ done: @escaping @MainActor ([(String, Bool)]) -> Void) {
+        let cfg = Tab.configuration()
+        // The app leaves this false — which is exactly why a gesture-less popup never gets
+        // this far in the app. Turned on here so the delegate *is* reached, because the
+        // delegate is what is under test.
+        cfg.preferences.javaScriptCanOpenWindowsAutomatically = true
+        let w = WKWebView(frame: .init(x: 0, y: 0, width: 480, height: 320), configuration: cfg)
+        let probe = PopupProbe()
+        w.uiDelegate = probe
+        w.navigationDelegate = probe
+        popupWeb = w
+        popupProbe = probe
+        let win = NSWindow(contentRect: w.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        win.contentView = w
+        win.setFrameOrigin(NSPoint(x: -4000, y: -4000))
+        win.orderFront(nil)
+        popupHolder = win
+
+        probe.onLoaded = {
+            w.evaluateJavaScript("window.open('about:blank', '_blank', 'width=451,height=600')") { _, _ in
+                // The delegate call is synchronous inside window.open, so it has already
+                // happened; the hop is only to get off WebKit's own stack before asserting.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    let said = probe.gesture.map { $0 ? "yes" : "no" } ?? "nothing — it raised or was never asked"
+                    done([
+                        ("a page's window.open reaches createWebViewWith", probe.asked),
+                        ("Popup.userInitiated survives a real WKNavigationAction, and said \(said)",
+                         probe.gesture != nil),
+                        // The row above is green on the no-SPI fallback too — `userInitiated`
+                        // answers "yes" and returns a non-nil Bool when the accessor is not
+                        // there at all. This is the row that goes red the day WebKit renames
+                        // it, which is the day Timo silently stops reading the gesture and
+                        // starts taking every popup at its word.
+                        ("WKNavigationAction still declares the gesture accessor it reads",
+                         WKNavigationAction.instancesRespond(to: NSSelectorFromString("_isUserInitiated"))),
+                        ("the size the page asked for arrives in WKWindowFeatures",
+                         probe.width == 451 && probe.height == 600),
+                        ("…and the placement is the one the pure table gives for that row",
+                         probe.placement == Popup.placement(width: probe.width, height: probe.height,
+                                                            toolbars: nil,
+                                                            userInitiated: probe.gesture ?? true)),
+                    ])
+                }
+            }
+        }
+        w.loadSimulatedRequest(URLRequest(url: URL(string: "https://\(host)/opener")!),
+                               responseHTML: "<!doctype html><meta charset=utf-8><body>opener")
+    }
+
+    /// A page that really calls `window.open`, answered by a delegate that asks Popups.swift
+    /// the same questions the browser does and then refuses the window.
+    private final class PopupProbe: NSObject, WKUIDelegate, WKNavigationDelegate {
+        var onLoaded: (() -> Void)?
+        var asked = false
+        var gesture: Bool?
+        var width: Double?
+        var height: Double?
+        var placement: Popup.Placement?
+
+        func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) { onLoaded?() }
+
+        func webView(_ w: WKWebView, createWebViewWith cfg: WKWebViewConfiguration,
+                     for action: WKNavigationAction,
+                     windowFeatures: WKWindowFeatures) -> WKWebView? {
+            asked = true
+            let initiated = Popup.userInitiated(action)   // the line that used to abort here
+            gesture = initiated
+            width = windowFeatures.width?.doubleValue
+            height = windowFeatures.height?.doubleValue
+            placement = Popup.placement(features: windowFeatures, userInitiated: initiated)
+            return nil
+        }
+    }
+
+    private final class Bridge: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+        var offered: (String, String)?
+        var onLoaded: (() -> Void)?
+        func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) { onLoaded?() }
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+            // The same handler now carries focus and dismiss notices. Only an offer has a
+            // password in it, and only an offer is what this check is watching for.
+            guard let b = m.body as? [String: Any], b["focus"] == nil, b["dismiss"] == nil,
+                  let password = b["password"] as? String else { return }
+            offered = ((b["account"] as? String) ?? "", password)
+        }
+    }
+}

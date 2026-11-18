@@ -1,0 +1,253 @@
+import AppKit
+import SwiftUI
+
+extension Prefs {
+    /// Arc's Auto Archive. A Today tab nobody has looked at for this long is archived: it
+    /// leaves the sidebar, and stays reachable from the Library. Arc's default is 12 hours,
+    /// with 24 hours, 7 days and 30 days offered beside it; 0 is "never", which is a real
+    /// answer and so is stored rather than falling back to the default.
+    static var archiveAfter: TimeInterval {
+        get { UserDefaults.timo.object(forKey: "archiveAfter") as? Double ?? 12 * 3600 }
+        set { UserDefaults.timo.set(newValue, forKey: "archiveAfter") }
+    }
+
+    /// What the setting offers, in Arc's order. ponytail: a fixed list, not a duration
+    /// field — "13 hours" is not a thing anyone wants, and a free field needs parsing,
+    /// validation and a unit picker to say the same four things.
+    static let archiveChoices: [(name: String, after: TimeInterval)] = [
+        ("After 12 hours", 12 * 3600),
+        ("After 24 hours", 24 * 3600),
+        ("After 7 days", 7 * 86_400),
+        ("After 30 days", 30 * 86_400),
+        ("Never", 0),
+    ]
+}
+
+/// Arc's archive: where a Today tab goes when it is closed or auto-archived, so closing a
+/// tab is never destructive. Favourites and pinned tabs never come here — they stay in the
+/// sidebar, which is the whole point of them.
+///
+/// ponytail: a capped list of url/title/date in UserDefaults, one per profile, not a table
+/// in the history database. Two hundred entries is ~30 KB, the only queries are "newest
+/// first" and "drop this one", and history already records every one of these pages
+/// anyway — the archive's job is to remember that the tab *was open*, not to be a second
+/// history. Ceiling: no full-text search over it, and no per-space archive.
+@MainActor final class Archive: ObservableObject {
+    /// One archived tab. Identified by url, so re-archiving the same page moves the
+    /// existing entry to the top instead of listing it twice.
+    struct Entry: Codable, Equatable, Identifiable, Sendable {
+        var url: String
+        var title: String
+        var at: Date
+        /// The Space the tab was in when it left, so Restore puts it back there rather than
+        /// into whatever Space the window happens to be showing (Arc v1.17).
+        ///
+        /// Optional — and `littleArc` with it — because that is what keeps an entry written
+        /// by an older build readable: a synthesised decoder gives an Optional property
+        /// `decodeIfPresent` for free, and applies no default to a non-optional one.
+        var space: UUID?
+        /// Archived out of a Little Timo window (Arc's Little Arc), which is what the
+        /// Library's "Little Timo only" filter sorts on.
+        var littleArc: Bool?
+        var id: String { url }
+        var isLittleArc: Bool { littleArc == true }
+    }
+
+    /// Older entries fall off the end. Arc keeps every archived tab.
+    /// ponytail: two thousand rather than all of them. The list is one JSON blob in
+    /// UserDefaults, read whole the first time a profile's archive is touched; 2000 entries
+    /// is ~300 KB and better than a year of closing five tabs a day, which is far enough
+    /// down a list nobody scrolls. Ceiling: the two-thousand-and-first close drops the
+    /// oldest entry. The upgrade is a table in the history database beside `visits`.
+    static let limit = 2000
+
+    private static var caches: [UUID: Archive] = [:]
+    static func shared(for profileID: UUID) -> Archive {
+        if let a = caches[profileID] { return a }
+        let a = Archive(profileID: profileID)
+        caches[profileID] = a
+        return a
+    }
+
+    static func forget(_ profileID: UUID) {
+        caches.removeValue(forKey: profileID)?.entries = []
+        UserDefaults.timo.removeObject(forKey: ProfileManager.defaultsKey("archivedTabs", profileID))
+    }
+
+    private let profileID: UUID
+    @Published private(set) var entries: [Entry] = []
+
+    private init(profileID: UUID) {
+        self.profileID = profileID
+        guard profileID != Profile.incognito.id else { return }
+        let key = ProfileManager.defaultsKey("archivedTabs", profileID)
+        entries = (UserDefaults.timo.data(forKey: key))
+            .flatMap { try? JSONDecoder().decode([Entry].self, from: $0) } ?? []
+    }
+
+    private func save() {
+        guard profileID != Profile.incognito.id else { return }
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        UserDefaults.timo.set(data, forKey: ProfileManager.defaultsKey("archivedTabs", profileID))
+    }
+
+    func add(url: URL, title: String, at: Date = .now,
+             space: UUID? = nil, littleArc: Bool = false) {
+        entries = Archive.merged(entries, adding: Entry(url: url.absoluteString,
+                                                        title: title.isEmpty ? url.absoluteString : title,
+                                                        at: at,
+                                                        space: space,
+                                                        littleArc: littleArc ? true : nil),
+                                 limit: Archive.limit)
+        save()
+    }
+
+    /// Equivalent to adding each entry in order, with one publication and encode.
+    func add(_ additions: [Entry]) {
+        guard !additions.isEmpty else { return }
+        var seen = Set<String>()
+        var merged: [Entry] = []
+        for entry in Array(additions.reversed()) + entries {
+            if seen.insert(entry.url).inserted { merged.append(entry) }
+            if merged.count == Self.limit { break }
+        }
+        entries = merged
+        save()
+    }
+
+    /// Taking a tab back out: the entry goes, because it is open again.
+    func remove(_ id: Entry.ID) {
+        entries.removeAll { $0.id == id }
+        save()
+    }
+
+    func clear() {
+        entries = []
+        save()
+    }
+
+    // MARK: The rules, as pure functions
+
+    /// Newest first, one entry per url, capped. Pure so `selfcheck --pure` can drive it.
+    nonisolated static func merged(_ existing: [Entry], adding new: Entry, limit: Int) -> [Entry] {
+        var out = existing.filter { $0.url != new.url }
+        out.insert(new, at: 0)
+        return Array(out.prefix(limit))
+    }
+
+    /// Whether the auto-archive sweep takes this tab. Only Today tabs, only idle ones, never
+    /// the tab someone is looking at, and never a tab with nothing loaded — an empty tab has
+    /// no page to remember, so archiving it would silently delete it.
+    /// `after` of 0 or less is "never".
+    ///
+    /// `playing` is Arc's media exemption (v0.75): a tab with media running is never taken,
+    /// whether or not it is muted — the page you left playing is the one page you are most
+    /// obviously still using, and it is the one whose idle clock never advances on its own.
+    nonisolated static func due(kind: TabKind, idle: TimeInterval, after: TimeInterval,
+                                active: Bool, loaded: Bool, playing: Bool = false) -> Bool {
+        guard after > 0, kind == .today, loaded, !active, !playing else { return false }
+        return idle >= after
+    }
+
+    /// When the idle clock starts: the later of "the user was last here" and "the sound
+    /// stopped". Without the second, a tab that played for eight hours would be archived the
+    /// moment it fell quiet, because idle has only ever meant "not clicked".
+    ///
+    /// A stamp of its own rather than re-touching `lastActive` on every sweep: that field is
+    /// the tab switcher's MRU order and the media tray's tie-break as well, and a playing tab
+    /// that kept stamping itself would float to the top of both without anyone having touched
+    /// it. `TabAudio` writes `lastQuiet` the moment playback stops; see `TabAudio.tell`.
+    nonisolated static func idle(now: Date, lastActive: Date, lastQuiet: Date) -> TimeInterval {
+        now.timeIntervalSince(max(lastActive, lastQuiet))
+    }
+
+    // MARK: Running
+
+    /// Called off `Suspension`'s one timer — see `Suspension.begin`. A minute of slop on a
+    /// twelve-hour rule is not worth a second timer.
+    static func sweep(now: Date = .now) {
+        let after = Prefs.archiveAfter
+        guard after > 0 else { return }
+        for store in TabStore.all where !store.isPrivate {
+            // `everyTab`, not `tabs`: a tab in a Space the window is keeping alive behind the
+            // one it is showing has gone past its day like any other. See `Stash`.
+            store.archiveIdleToday(now: now, after: after)
+        }
+    }
+
+    static func check() -> [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        let t0 = Date(timeIntervalSince1970: 0)
+        let a = Entry(url: "https://a.example", title: "A", at: t0)
+        let b = Entry(url: "https://b.example", title: "B", at: t0)
+        out.append(("archiving puts the newest entry first",
+                    merged([a], adding: b, limit: 10).map(\.url) == [b.url, a.url]))
+        var again = a; again.title = "A again"
+        out.append(("re-archiving a url moves it to the top instead of listing it twice",
+                    merged([a, b], adding: again, limit: 10) == [again, b]))
+        out.append(("the list is capped, oldest off the end",
+                    merged([a, b], adding: Entry(url: "https://c.example", title: "C", at: t0),
+                           limit: 2).count == 2))
+
+        // The on-disk format: an archive written before entries knew about Spaces must still
+        // decode, or upgrading would empty everybody's Library.
+        let old = Data(#"[{"url":"https://a.example","title":"A","at":0}]"#.utf8)
+        let decoded = try? JSONDecoder().decode([Entry].self, from: old)
+        out.append(("an entry written before Spaces and Little Arc existed still decodes",
+                    decoded?.count == 1 && decoded?.first?.space == nil
+                        && decoded?.first?.isLittleArc == false))
+        out.append(("a new entry round-trips its Space and its Little Arc flag", {
+            var e = a
+            e.space = UUID()
+            e.littleArc = true
+            guard let d = try? JSONEncoder().encode([e]),
+                  let back = try? JSONDecoder().decode([Entry].self, from: d) else { return false }
+            return back == [e] && back[0].isLittleArc
+        }()))
+
+        let hour: TimeInterval = 3600
+        out.append(("an idle Today tab is due after the interval",
+                    due(kind: .today, idle: 13 * hour, after: 12 * hour, active: false, loaded: true)))
+        out.append(("a Today tab inside the interval is not",
+                    !due(kind: .today, idle: 11 * hour, after: 12 * hour, active: false, loaded: true)))
+        out.append(("a pinned tab never auto-archives",
+                    !due(kind: .pinned, idle: 400 * hour, after: 12 * hour, active: false, loaded: true)))
+        out.append(("a favourite never auto-archives",
+                    !due(kind: .favourite, idle: 400 * hour, after: 12 * hour, active: false, loaded: true)))
+        out.append(("the tab being looked at never auto-archives",
+                    !due(kind: .today, idle: 400 * hour, after: 12 * hour, active: true, loaded: true)))
+        out.append(("a tab with nothing loaded is not archived out from under the user",
+                    !due(kind: .today, idle: 400 * hour, after: 12 * hour, active: false, loaded: false)))
+        out.append(("\"Never\" means never",
+                    !due(kind: .today, idle: 4000 * hour, after: 0, active: false, loaded: true)))
+
+        // The media exemption, driven off a stand-in for `TabAudio.playingIDs`.
+        let noisy = UUID(), quiet = UUID()
+        let playing: Set<UUID> = [noisy]
+        func sweepable(_ id: UUID, idle: TimeInterval) -> Bool {
+            due(kind: .today, idle: idle, after: 12 * hour, active: false, loaded: true,
+                playing: playing.contains(id))
+        }
+        out.append(("a tab playing media is never auto-archived", !sweepable(noisy, idle: 400 * hour)))
+        out.append(("the tab beside it still is", sweepable(quiet, idle: 400 * hour)))
+
+        // Where the idle clock starts. `lastQuiet` is what stops eight hours of playback
+        // being read as eight hours of idling the moment the sound stops.
+        let clicked = t0, stopped = t0.addingTimeInterval(8 * hour)
+        out.append(("the clock runs from the last click when nothing ever played",
+                    idle(now: stopped, lastActive: clicked, lastQuiet: .distantPast) == 8 * hour))
+        out.append(("…and from the moment the sound stopped when it did",
+                    idle(now: stopped, lastActive: clicked, lastQuiet: stopped) == 0))
+        out.append(("a tab that has just gone quiet is not archived on the next sweep",
+                    !due(kind: .today,
+                         idle: idle(now: stopped, lastActive: clicked, lastQuiet: stopped),
+                         after: 12 * hour, active: false, loaded: true)))
+        out.append(("a click after the sound stopped still wins",
+                    idle(now: stopped.addingTimeInterval(hour), lastActive: stopped.addingTimeInterval(hour),
+                         lastQuiet: stopped) == 0))
+        out.append(("every offered interval but Never is a real duration",
+                    Prefs.archiveChoices.filter { $0.after > 0 }.count == 4
+                        && Prefs.archiveChoices.last?.after == 0))
+        return out
+    }
+}
